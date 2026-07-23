@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "repository": "https://github.com/hanselime/paqet",
+    "version": "v1.0.0-alpha.20",
+    "commit": "f8ee6c130b6d44664e737419e99f7f677a6cf03a",
+    "publishedAt": "2026-06-28T07:30:35Z",
+    "stability": "alpha",
+    "protocolCompatibility": "Not backward compatible with earlier releases"
+  },
+  "windowsAmd64Artifact": {
+    "releaseUrl": "https://github.com/hanselime/paqet/releases/tag/v1.0.0-alpha.20",
+    "downloadUrl": "https://github.com/hanselime/paqet/releases/download/v1.0.0-alpha.20/paqet-windows-amd64-v1.0.0-alpha.20.zip",
+    "archiveName": "paqet-windows-amd64-v1.0.0-alpha.20.zip",
+    "archiveSize": 3555676,
+    "archiveSha256": "2a59fec9d486d0d910f423cd33701adfc9de7ab9642565da7e05639ba9c18780",
+    "executableName": "paqet_windows_amd64.exe",
+    "executableSize": 9775616,
+    "executableSha256": "49b377270473c223534ac1c2846d15c287863318e6fe6ee3c123f36ab97b441c",
+    "authenticodeSigned": false
+  },
+  "launch": {
+    "arguments": ["run", "-c", "config.yaml"],
+    "defaultConfigArgument": "config.yaml"
+  },
+  "applicationDefaults": {
+    "role": "client",
+    "logLevel": "info",
+    "socks5Listen": "127.0.0.1:1080",
+    "transportProtocol": "kcp",
+    "clientAddressPort": 0
+  },
+  "acceptedValues": {
+    "logLevels": ["none", "debug", "info", "warn", "error", "fatal"],
+    "transportProtocols": ["kcp"],
+    "kcpModes": ["normal", "fast", "fast2", "fast3", "manual"],
+    "kcpBlocks": [
+      "aes",
+      "aes-128",
+      "aes-128-gcm",
+      "aes-192",
+      "salsa20",
+      "blowfish",
+      "twofish",
+      "cast5",
+      "3des",
+      "tea",
+      "xtea",
+      "xor",
+      "sm4",
+      "none",
+      "null"
+    ],
+    "tcpFlagCharacters": ["F", "S", "R", "P", "A", "U", "E", "C", "N"]
+  },
+  "fixtures": [
+    {
+      "file": "tests/fixtures/paqet-v1.0.0-alpha.20/startup-success.stdout.log",
+      "stream": "stdout",
+      "classification": "connected",
+      "match": "contains: Client started:"
+    },
+    {
+      "file": "tests/fixtures/paqet-v1.0.0-alpha.20/connection-lost.stdout.log",
+      "stream": "stdout",
+      "classification": "connection-lost",
+      "match": "contains: connection lost, retrying...."
+    },
+    {
+      "file": "tests/fixtures/paqet-v1.0.0-alpha.20/config-failure.stderr.log",
+      "stream": "stderr",
+      "classification": "fatal",
+      "match": "contains: Failed to load configuration:"
+    },
+    {
+      "file": "tests/fixtures/paqet-v1.0.0-alpha.20/client-failure.stdout.log",
+      "stream": "stdout",
+      "classification": "fatal",
+      "match": "contains: [FATAL] Client encountered an error:"
+    },
+    {
+      "file": "tests/fixtures/paqet-v1.0.0-alpha.20/shutdown.stdout.log",
+      "stream": "stdout",
+      "classification": "shutdown-requested",
+      "match": "exact: Shutdown signal received, shutting down..."
+    }
+  ]
+}

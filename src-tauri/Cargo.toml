@@ -1,0 +1,27 @@
+[package]
+name = "paqet-gui"
+version = "0.1.0"
+description = "A lightweight Windows desktop client for paqet"
+authors = ["paqet-gui contributors"]
+edition = "2024"
+rust-version = "1.97.0"
+
+[lib]
+name = "paqet_gui_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.5", features = [] }
+
+[dev-dependencies]
+serde_json = "=1.0.151"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,2 @@
+2026-07-23 12:00:00.000 [ERROR] failed to create connection 1: failed to create send handle on Ethernet: example failure
+2026-07-23 12:00:00.001 [FATAL] Client encountered an error: failed to create send handle on Ethernet: example failure

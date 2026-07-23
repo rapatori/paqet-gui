@@ -1,0 +1,10 @@
+dist
+node_modules
+src-tauri/target
+src-tauri/gen
+package-lock.json
+.ai
+.kilo
+.git
+AGENTS.md
+README.md

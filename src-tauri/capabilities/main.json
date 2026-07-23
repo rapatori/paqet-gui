@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "main",
+  "description": "Empty baseline capability for the local paqet main window.",
+  "windows": ["main"],
+  "platforms": ["windows"],
+  "permissions": []
+}
