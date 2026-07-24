@@ -2045,9 +2045,12 @@ dependencies = [
 name = "paqet-gui"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "tauri",
  "tauri-build",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

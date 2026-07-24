@@ -1,3 +1,5 @@
+pub mod profiles;
+
 pub const APP_NAME: &str = "paqet";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
