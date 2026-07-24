@@ -1,3 +1,4 @@
+pub mod network;
 pub mod profiles;
 
 pub const APP_NAME: &str = "paqet";

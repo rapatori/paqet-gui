@@ -21,7 +21,13 @@ tauri = { version = "=2.11.5", features = [] }
 uuid = { version = "=1.24.0", features = ["serde", "v4"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_Networking_WinSock",
+  "Win32_Storage_FileSystem",
+] }
 
 [profile.release]
 codegen-units = 1

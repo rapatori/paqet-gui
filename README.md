@@ -8,7 +8,7 @@ This project is not affiliated with or endorsed by the upstream paqet project.
 
 ## Project Status
 
-`paqet-gui` is in early development. The repository currently contains the validated Tauri/Svelte application scaffold, the pinned paqet compatibility contract, and the native profile validation and persistence layer. Profile UI and IPC integration, network discovery, configuration generation, process control, the production interface, and release packaging are not implemented yet.
+`paqet-gui` is in early development. The repository currently contains the validated Tauri/Svelte application scaffold, the pinned paqet compatibility contract, native profile validation and persistence, and typed Windows network-interface discovery. Profile UI and IPC integration, configuration generation, process control, the production interface, and release packaging are not implemented yet.
 
 There are no supported binaries or installers. Do not treat the current application shell as a functional paqet client.
 
