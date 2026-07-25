@@ -26,6 +26,10 @@ fn pinned_release_contract_is_complete_and_consistent() {
         false
     );
     assert_eq!(contract["applicationDefaults"]["logLevel"], "info");
+    assert_eq!(
+        contract["applicationAcceptedValues"]["logLevels"],
+        json_array(&["debug", "info"])
+    );
     assert_eq!(contract["applicationDefaults"]["transportProtocol"], "kcp");
     assert_eq!(
         contract["launch"]["arguments"],

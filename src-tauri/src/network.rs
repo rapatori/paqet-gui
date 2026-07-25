@@ -146,7 +146,7 @@ fn select_interface(
             InterfaceType::Ethernet | InterfaceType::WiFi
         )
         || adapter.friendly_name.is_empty()
-        || adapter.friendly_name.chars().count() > 15
+        || adapter.friendly_name.len() > 15
     {
         return None;
     }
@@ -640,9 +640,17 @@ mod tests {
         down.is_up = false;
         let mut tunnel = adapter("Tunnel");
         tunnel.interface_type = InterfaceType::Other;
+        let unicode_over_bytes = adapter("éééééééé");
+        assert_eq!(unicode_over_bytes.friendly_name.chars().count(), 8);
+        assert_eq!(unicode_over_bytes.friendly_name.len(), 16);
 
         let selected = select_interfaces(
-            &[down, tunnel, adapter("Interface name is too long")],
+            &[
+                down,
+                tunnel,
+                adapter("Interface name is too long"),
+                unicode_over_bytes,
+            ],
             &[route(10, gateway)],
             &[neighbor(gateway, NeighborState::Reachable)],
         );

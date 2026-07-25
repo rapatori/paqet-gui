@@ -48,7 +48,7 @@ transport:
     key: <profile-key>
 ```
 
-`kcp` is the application-selected protocol default and is always emitted because it is the only supported protocol. Tagged source rejects an omitted protocol rather than assigning one. `info` is the application-selected log default and is always emitted because upstream's native omission default is `none`, which would suppress the lifecycle markers used by the GUI. Users may override the log level in Advanced settings.
+`kcp` is the application-selected protocol default and is always emitted because it is the only supported protocol. Tagged source rejects an omitted protocol rather than assigning one. `info` is the application-selected log default and is always emitted because upstream's native omission default is `none`, which would suppress the lifecycle markers used by the GUI. Advanced logging may select `debug` or `info`; higher thresholds and `none` are intentionally unavailable because the pinned client emits required lifecycle markers at INFO.
 
 The client address uses port `0`, allowing paqet to select an ephemeral port. This also permits more than one configured KCP connection; tagged validation rejects `transport.conn > 1` when the client address contains an explicit nonzero port.
 
@@ -59,7 +59,7 @@ The client address uses port `0`, allowing paqet to select an ephemeral port. Th
 | YAML path                    | Type                 | Upstream default and validation                                                                                  | Application behavior                                             |
 | ---------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | `role`                       | string               | Required; exactly `client` or `server`                                                                           | Always emit `client`                                             |
-| `log.level`                  | string               | Omission becomes `none`; one of `none`, `debug`, `info`, `warn`, `error`, `fatal`                                | Emit `info`; Advanced supports all accepted values               |
+| `log.level`                  | string               | Omission becomes `none`; one of `none`, `debug`, `info`, `warn`, `error`, `fatal`                                | Emit `info`; Advanced supports `debug` and `info`                |
 | `listen.addr`                | string               | Required only for server role                                                                                    | Server-only; omit                                                |
 | `socks5`                     | sequence             | Client warns when both SOCKS5 and forwarding are absent                                                          | Emit one local SOCKS5 endpoint                                   |
 | `socks5[].listen`            | address string       | Required; port `1–65535`                                                                                         | Fixed V1 default `127.0.0.1:1080`                                |
@@ -69,7 +69,7 @@ The client address uses port `0`, allowing paqet to select an ephemeral port. Th
 | `forward[].listen`           | address string       | Required; port `1–65535`                                                                                         | Deferred with `forward`                                          |
 | `forward[].target`           | host/port string     | Required; port `1–65535`                                                                                         | Deferred with `forward`                                          |
 | `forward[].protocol`         | string               | Runtime supports `tcp` or `udp`; config validation does not reject other values                                  | Deferred with `forward`                                          |
-| `network.interface`          | string               | Required, maximum 15 characters, and must resolve through `net.InterfaceByName`                                  | Derived from the selected Windows interface                      |
+| `network.interface`          | string               | Required, maximum 15 UTF-8 bytes, and must resolve through `net.InterfaceByName`                                 | Derived from the selected Windows interface                      |
 | `network.guid`               | string               | Required on Windows                                                                                              | Derived Npcap device name in `\Device\NPF_{GUID}` form           |
 | `network.ipv4.addr`          | address string       | At least one address family required; port may be `0`                                                            | Derived local IPv4 with port `0`                                 |
 | `network.ipv4.router_mac`    | MAC string           | Required for a configured family and parsed by `net.ParseMAC`                                                    | Derived gateway MAC                                              |
@@ -86,7 +86,7 @@ The client address uses port `0`, allowing paqet to select an ephemeral port. Th
 | `transport.kcp`              | mapping              | Required for KCP; tagged code dereferences it during defaulting and validation                                   | Always emit mapping                                              |
 | `transport.kcp.mode`         | string               | Default `fast`; one of `normal`, `fast`, `fast2`, `fast3`, `manual`                                              | Optional Advanced override                                       |
 | `transport.kcp.nodelay`      | integer              | Used only by `manual`; example documents `0` or `1`; source performs no range validation                         | Conditional manual-mode Advanced override                        |
-| `transport.kcp.interval`     | integer milliseconds | Used only by `manual`; example documents `10–5000`; source performs no range validation                          | Conditional manual-mode Advanced override using documented range |
+| `transport.kcp.interval`     | integer milliseconds | Used only by `manual`; example documents `10–5000`; KCP runtime clamps to that range                             | Conditional manual-mode Advanced override using documented range |
 | `transport.kcp.resend`       | integer              | Used only by `manual`; example documents `0–2`; source performs no range validation                              | Conditional manual-mode Advanced override using documented range |
 | `transport.kcp.nocongestion` | integer              | Used only by `manual`; example documents `0` or `1`; source performs no range validation                         | Conditional manual-mode Advanced override                        |
 | `transport.kcp.wdelay`       | boolean              | Used only by `manual`; Go zero value `false`                                                                     | Conditional manual-mode Advanced override                        |
@@ -98,14 +98,18 @@ The client address uses port `0`, allowing paqet to select an ephemeral port. Th
 | `transport.kcp.pshard`       | integer              | Go zero value `0`; same tagged-source ambiguity as `dshard`                                                      | Deferred pending explicit FEC support decision                   |
 | `transport.kcp.block`        | string               | Default `aes`; accepted values listed below                                                                      | Optional Advanced override                                       |
 | `transport.kcp.key`          | string               | Required unless block is `none` or `null`                                                                        | Generated from selected profile; never logged                    |
-| `transport.kcp.smuxbuf`      | integer bytes        | Default `4194304`; minimum `1024`                                                                                | Optional Advanced override                                       |
-| `transport.kcp.streambuf`    | integer bytes        | Default `2097152`; minimum `1024`                                                                                | Optional Advanced override                                       |
-| `transport.kcp.smuxkalive`   | integer seconds      | Default `2`; converted to duration; no tagged range validation                                                   | Optional Advanced override with positive application validation  |
-| `transport.kcp.smuxktimeout` | integer seconds      | Default `8`; converted to duration; no tagged range validation                                                   | Optional Advanced override with positive application validation  |
+| `transport.kcp.smuxbuf`      | integer bytes        | Default `4194304`; tagged minimum `1024`; SMUX runtime maximum signed 32-bit                                     | Optional Advanced override with runtime-compatible validation    |
+| `transport.kcp.streambuf`    | integer bytes        | Default `2097152`; tagged minimum `1024`; must not exceed `smuxbuf` or signed 32-bit maximum                     | Optional Advanced override with runtime-compatible validation    |
+| `transport.kcp.smuxkalive`   | integer seconds      | Default `2`; converted to duration; SMUX runtime requires a positive value                                       | Optional Advanced override with positive application validation  |
+| `transport.kcp.smuxktimeout` | integer seconds      | Default `8`; converted to duration; SMUX runtime requires a value at least `smuxkalive`                          | Optional Advanced override with relationship validation          |
 
 Accepted KCP block values are `aes`, `aes-128`, `aes-128-gcm`, `aes-192`, `salsa20`, `blowfish`, `twofish`, `cast5`, `3des`, `tea`, `xtea`, `xor`, `sm4`, `none`, and `null`. The `none` and `null` modes disable encryption/authentication and require explicit warning treatment when implemented.
 
 For fields where `0` triggers an upstream default, omission is the canonical “no override” representation. The application does not preserve arbitrary unknown YAML fields or expose raw YAML editing.
+
+Generated configuration is serialized from a closed Rust model. The application validates both the tagged paqet rules and the runtime buffer/keepalive relationships above before writing `config.yaml`; disabled overrides and their otherwise-empty parent mappings are omitted. Manual KCP values are emitted only with `mode: manual`. TCP flag overrides require 1–64 nonempty combinations containing only the tagged flag characters.
+
+The generated file is replaced atomically under the current user's local application data directory. It contains the profile key in plaintext because paqet requires it; diagnostics do not include generated YAML or secret values.
 
 ## Output Contract
 

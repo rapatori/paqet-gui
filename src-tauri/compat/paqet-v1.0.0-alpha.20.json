@@ -30,6 +30,9 @@
     "transportProtocol": "kcp",
     "clientAddressPort": 0
   },
+  "applicationAcceptedValues": {
+    "logLevels": ["debug", "info"]
+  },
   "acceptedValues": {
     "logLevels": ["none", "debug", "info", "warn", "error", "fatal"],
     "transportProtocols": ["kcp"],

@@ -2,6 +2,7 @@ dist
 node_modules
 src-tauri/target
 src-tauri/gen
+src-tauri/tests/fixtures/**/config-*.yaml
 package-lock.json
 .ai
 .kilo

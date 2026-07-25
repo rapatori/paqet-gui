@@ -1,0 +1,43 @@
+role: client
+log:
+  level: debug
+socks5:
+- listen: 127.0.0.1:1080
+network:
+  interface: Ethernet
+  guid: \Device\NPF_{12345678-1234-1234-1234-123456789ABC}
+  ipv4:
+    addr: 192.0.2.10:0
+    router_mac: 00:11:22:AA:BB:CC
+  pcap:
+    sockbuf: 8388608
+  tcp:
+    local_flag:
+    - PA
+    - S
+    remote_flag:
+    - RA
+server:
+  addr: 198.51.100.10:9999
+transport:
+  protocol: kcp
+  conn: 4
+  tcpbuf: 16384
+  udpbuf: 8192
+  kcp:
+    mode: manual
+    nodelay: 1
+    interval: 20
+    resend: 2
+    nocongestion: 1
+    wdelay: false
+    acknodelay: true
+    mtu: 1400
+    rcvwnd: 1024
+    sndwnd: 1024
+    block: 'null'
+    key: fixture-key-not-used-by-a-real-server
+    smuxbuf: 8388608
+    streambuf: 4194304
+    smuxkalive: 5
+    smuxktimeout: 15

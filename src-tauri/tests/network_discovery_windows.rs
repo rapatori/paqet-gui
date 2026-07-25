@@ -9,7 +9,7 @@ fn live_windows_discovery_returns_only_complete_sorted_interfaces() {
     for interface in &interfaces {
         assert!(!interface.friendly_name.is_empty());
         assert_eq!(interface.interface_name, interface.friendly_name);
-        assert!(interface.interface_name.chars().count() <= 15);
+        assert!(interface.interface_name.len() <= 15);
         assert!(interface.guid.starts_with("\\Device\\NPF_{"));
         assert!(interface.guid.ends_with('}'));
         assert!(!interface.local_address.is_unspecified());

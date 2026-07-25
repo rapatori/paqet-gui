@@ -1,0 +1,17 @@
+role: client
+log:
+  level: info
+socks5:
+- listen: 127.0.0.1:1080
+network:
+  interface: Ethernet
+  guid: \Device\NPF_{12345678-1234-1234-1234-123456789ABC}
+  ipv4:
+    addr: 192.0.2.10:0
+    router_mac: 00:11:22:AA:BB:CC
+server:
+  addr: 198.51.100.10:9999
+transport:
+  protocol: kcp
+  kcp:
+    key: fixture-key-not-used-by-a-real-server
