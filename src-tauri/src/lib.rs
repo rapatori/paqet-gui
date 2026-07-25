@@ -1,5 +1,6 @@
 pub mod config;
 pub mod network;
+pub mod process;
 pub mod profiles;
 
 pub const APP_NAME: &str = "paqet";
