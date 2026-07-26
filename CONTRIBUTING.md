@@ -33,7 +33,9 @@ Run the desktop development shell with:
 npm.cmd run tauri -- dev
 ```
 
-The current shell is a development scaffold and is not yet a working paqet client. Npcap is an end-user prerequisite for the completed client but is not required for the existing scaffold tests.
+The visible shell is a development scaffold and is not yet a working paqet client. The native Windows process supervisor is tested with a local helper executable; Npcap and the upstream paqet binary are not required for the deterministic development test suite.
+
+Release-sidecar builds use `npm.cmd run tauri:sidecar`. That command requires the exact pinned executable at `src-tauri/binaries/paqet_windows_amd64-x86_64-pc-windows-msvc.exe`, verifies its byte length and SHA-256, and then applies `src-tauri/tauri.sidecar.conf.json`. The upstream binary remains untracked and must not be included in contributions.
 
 ## Engineering Expectations
 
@@ -55,10 +57,13 @@ npm.cmd run format:check
 npm.cmd run lint
 npm.cmd run check
 npm.cmd run test:run
+npm.cmd run test:sidecar
 npm.cmd run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo test --manifest-path src-tauri/Cargo.toml --locked
-cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --locked --features process-test-support --test process_supervision_windows
+cargo test --manifest-path src-tauri/Cargo.toml --locked --release --features process-test-support --test process_supervision_windows
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --features process-test-support -- -D warnings
 npm.cmd run tauri -- build --debug --no-bundle
 ```
 

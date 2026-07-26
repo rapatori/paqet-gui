@@ -18,7 +18,9 @@
     "format:check": "prettier --check .",
     "test": "vitest",
     "test:run": "vitest run",
-    "tauri": "tauri"
+    "test:sidecar": "node --test scripts/build-sidecar.test.mjs",
+    "tauri": "tauri",
+    "tauri:sidecar": "node scripts/build-sidecar.mjs"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

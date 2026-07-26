@@ -1,10 +1,33 @@
-use std::{collections::VecDeque, fmt};
+use std::{
+    collections::VecDeque,
+    fmt, fs,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tauri::{
+    Runtime,
+    path::{BaseDirectory, PathResolver},
+};
+
+#[cfg(windows)]
+mod windows;
+
+#[cfg(windows)]
+pub use windows::{ProcessTreeExit, SupervisedPaqet, SupervisorEvent};
 
 pub const MAX_SESSION_LOG_RECORDS: usize = 2_000;
 pub const MAX_SESSION_LOG_BYTES: usize = 512 * 1024;
 pub const MAX_LOG_RECORD_BYTES: usize = 16 * 1024;
+pub const PAQET_EXECUTABLE_NAME: &str = "paqet_windows_amd64.exe";
+pub const PAQET_EXECUTABLE_SIZE: u64 = 9_775_616;
+pub const PAQET_EXECUTABLE_SHA256: &str =
+    "49b377270473c223534ac1c2846d15c287863318e6fe6ee3c123f36ab97b441c";
+pub const PAQET_RUN_SUBCOMMAND: &str = "run";
+pub const PAQET_CONFIG_FLAG: &str = "-c";
 
 const TRUNCATION_SUFFIX: &str = "... [truncated]";
 const CONNECTED_MARKER: &str = "Client started:";
@@ -12,6 +35,203 @@ const CONNECTION_LOST_MARKER: &str = "connection lost, retrying....";
 const CONFIGURATION_FATAL_MARKER: &str = "Failed to load configuration:";
 const CLIENT_FATAL_MARKER: &str = "[FATAL] Client encountered an error:";
 const SHUTDOWN_MARKER: &str = "Shutdown signal received, shutting down...";
+
+#[derive(Debug)]
+pub enum ProcessError {
+    ResolveResource(tauri::Error),
+    InvalidExecutable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    ExecutableIsNotFile(PathBuf),
+    ExecutableIdentityMismatch {
+        path: PathBuf,
+        expected_size: u64,
+        actual_size: u64,
+        expected_sha256: &'static str,
+        actual_sha256: String,
+    },
+    InvalidConfigPath(PathBuf),
+    InvalidWindowsPath {
+        field: &'static str,
+        path: PathBuf,
+    },
+    Platform {
+        operation: &'static str,
+        source: std::io::Error,
+    },
+    OutputReader {
+        stream: OutputStream,
+        source: std::io::Error,
+    },
+    OutputReaderPanicked(OutputStream),
+    SupervisorPanicked,
+    AlreadyFinished,
+}
+
+impl fmt::Display for ProcessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ResolveResource(error) => {
+                write!(
+                    formatter,
+                    "failed to resolve the bundled paqet executable: {error}"
+                )
+            }
+            Self::InvalidExecutable { path, source } => write!(
+                formatter,
+                "cannot use the bundled paqet executable at {}: {source}",
+                path.display()
+            ),
+            Self::ExecutableIsNotFile(path) => write!(
+                formatter,
+                "the bundled paqet executable is not a file: {}",
+                path.display()
+            ),
+            Self::ExecutableIdentityMismatch {
+                path,
+                expected_size,
+                actual_size,
+                expected_sha256,
+                actual_sha256,
+            } => write!(
+                formatter,
+                "the bundled paqet executable at {} does not match the pinned artifact (size {actual_size}/{expected_size}, SHA-256 {actual_sha256}/{expected_sha256})",
+                path.display()
+            ),
+            Self::InvalidConfigPath(path) => write!(
+                formatter,
+                "the paqet configuration path must be absolute: {}",
+                path.display()
+            ),
+            Self::InvalidWindowsPath { field, path } => write!(
+                formatter,
+                "the paqet {field} path contains a null character: {}",
+                path.display()
+            ),
+            Self::Platform { operation, source } => {
+                write!(formatter, "failed to {operation}: {source}")
+            }
+            Self::OutputReader { stream, source } => {
+                write!(formatter, "failed to read paqet {stream}: {source}")
+            }
+            Self::OutputReaderPanicked(stream) => {
+                write!(formatter, "the paqet {stream} reader stopped unexpectedly")
+            }
+            Self::SupervisorPanicked => {
+                formatter.write_str("the paqet process supervisor stopped unexpectedly")
+            }
+            Self::AlreadyFinished => formatter.write_str("the paqet process has already finished"),
+        }
+    }
+}
+
+impl std::error::Error for ProcessError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ResolveResource(error) => Some(error),
+            Self::InvalidExecutable { source, .. }
+            | Self::Platform { source, .. }
+            | Self::OutputReader { source, .. } => Some(source),
+            Self::ExecutableIsNotFile(_)
+            | Self::ExecutableIdentityMismatch { .. }
+            | Self::InvalidConfigPath(_)
+            | Self::InvalidWindowsPath { .. }
+            | Self::OutputReaderPanicked(_)
+            | Self::SupervisorPanicked
+            | Self::AlreadyFinished => None,
+        }
+    }
+}
+
+pub fn resolve_paqet_executable<R: Runtime>(
+    paths: &PathResolver<R>,
+) -> Result<PathBuf, ProcessError> {
+    paths
+        .resolve(PAQET_EXECUTABLE_NAME, BaseDirectory::Resource)
+        .map_err(ProcessError::ResolveResource)
+}
+
+pub fn validate_paqet_executable(path: &Path) -> Result<(), ProcessError> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let metadata =
+        fs::symlink_metadata(path).map_err(|source| ProcessError::InvalidExecutable {
+            path: path.to_owned(),
+            source,
+        })?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProcessError::ExecutableIsNotFile(path.to_owned()));
+    }
+    Ok(())
+}
+
+pub fn validate_pinned_paqet_executable(path: &Path) -> Result<(), ProcessError> {
+    open_pinned_paqet_executable(path).map(|_| ())
+}
+
+pub(crate) fn open_pinned_paqet_executable(path: &Path) -> Result<File, ProcessError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+    };
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| ProcessError::InvalidExecutable {
+            path: path.to_owned(),
+            source,
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|source| ProcessError::InvalidExecutable {
+            path: path.to_owned(),
+            source,
+        })?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProcessError::ExecutableIsNotFile(path.to_owned()));
+    }
+    let actual_size = metadata.len();
+    if actual_size != PAQET_EXECUTABLE_SIZE {
+        return Err(ProcessError::ExecutableIdentityMismatch {
+            path: path.to_owned(),
+            expected_size: PAQET_EXECUTABLE_SIZE,
+            actual_size,
+            expected_sha256: PAQET_EXECUTABLE_SHA256,
+            actual_sha256: "not calculated because size differed".to_owned(),
+        });
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|source| ProcessError::InvalidExecutable {
+                path: path.to_owned(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if actual_sha256 != PAQET_EXECUTABLE_SHA256 {
+        return Err(ProcessError::ExecutableIdentityMismatch {
+            path: path.to_owned(),
+            expected_size: PAQET_EXECUTABLE_SIZE,
+            actual_size,
+            expected_sha256: PAQET_EXECUTABLE_SHA256,
+            actual_sha256,
+        });
+    }
+    Ok(file)
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -274,6 +494,15 @@ pub enum OutputStream {
     Stderr,
 }
 
+impl fmt::Display for OutputStream {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FatalKind {
@@ -343,9 +572,28 @@ impl Default for SessionLog {
 
 impl SessionLog {
     pub fn push(&mut self, stream: OutputStream, text: &str) -> LogRecord {
+        self.push_captured(stream, text, false)
+    }
+
+    pub(super) fn push_captured(
+        &mut self,
+        stream: OutputStream,
+        text: &str,
+        externally_truncated: bool,
+    ) -> LogRecord {
         let normalized = text.trim_end_matches(['\r', '\n']);
         let classification = classify_output(stream, normalized);
-        let (text, truncated) = truncate_record(normalized, MAX_LOG_RECORD_BYTES);
+        let (mut text, mut truncated) = truncate_record(normalized, MAX_LOG_RECORD_BYTES);
+        if externally_truncated && !truncated {
+            let maximum_prefix = MAX_LOG_RECORD_BYTES.saturating_sub(TRUNCATION_SUFFIX.len());
+            let mut prefix_end = maximum_prefix.min(text.len());
+            while !text.is_char_boundary(prefix_end) {
+                prefix_end -= 1;
+            }
+            text.truncate(prefix_end);
+            text.push_str(TRUNCATION_SUFFIX);
+            truncated = true;
+        }
         let record = LogRecord {
             sequence: self.next_sequence,
             stream,

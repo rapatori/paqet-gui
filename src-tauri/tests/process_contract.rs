@@ -1,7 +1,11 @@
-use paqet_gui_lib::process::{FatalKind, LogClassification, OutputStream, classify_output};
+use paqet_gui_lib::process::{
+    FatalKind, LogClassification, OutputStream, PAQET_CONFIG_FLAG, PAQET_EXECUTABLE_NAME,
+    PAQET_EXECUTABLE_SHA256, PAQET_EXECUTABLE_SIZE, PAQET_RUN_SUBCOMMAND, classify_output,
+};
 use serde_json::Value;
 
 const CONTRACT: &str = include_str!("../compat/paqet-v1.0.0-alpha.20.json");
+const SIDECAR_CONFIG: &str = include_str!("../tauri.sidecar.conf.json");
 const STARTUP_SUCCESS: &str =
     include_str!("fixtures/paqet-v1.0.0-alpha.20/startup-success.stdout.log");
 const CONNECTION_LOST: &str =
@@ -11,6 +15,40 @@ const CONFIG_FAILURE: &str =
 const CLIENT_FAILURE: &str =
     include_str!("fixtures/paqet-v1.0.0-alpha.20/client-failure.stdout.log");
 const SHUTDOWN: &str = include_str!("fixtures/paqet-v1.0.0-alpha.20/shutdown.stdout.log");
+
+#[test]
+fn sidecar_resource_and_launch_contract_match_the_pinned_manifest() {
+    let contract: Value = serde_json::from_str(CONTRACT).expect("contract must be valid JSON");
+    let sidecar: Value =
+        serde_json::from_str(SIDECAR_CONFIG).expect("sidecar config must be valid JSON");
+    let external_binaries = sidecar["bundle"]["externalBin"]
+        .as_array()
+        .expect("externalBin must be an array");
+    let artifact = &contract["windowsAmd64Artifact"];
+    let sidecar_stem = artifact["tauriSidecarStem"]
+        .as_str()
+        .expect("sidecar stem must be text");
+    let target_triple = artifact["targetTriple"]
+        .as_str()
+        .expect("target triple must be text");
+
+    assert_eq!(external_binaries, &[Value::String(sidecar_stem.to_owned())]);
+    assert_eq!(
+        format!("{sidecar_stem}-{target_triple}.exe"),
+        "binaries/paqet_windows_amd64-x86_64-pc-windows-msvc.exe"
+    );
+    assert_eq!(artifact["executableName"], PAQET_EXECUTABLE_NAME);
+    assert_eq!(artifact["executableSize"], PAQET_EXECUTABLE_SIZE);
+    assert_eq!(artifact["executableSha256"], PAQET_EXECUTABLE_SHA256);
+    assert_eq!(
+        contract["launch"]["arguments"],
+        serde_json::json!([
+            PAQET_RUN_SUBCOMMAND,
+            PAQET_CONFIG_FLAG,
+            contract["launch"]["defaultConfigArgument"]
+        ])
+    );
+}
 
 #[test]
 fn pinned_fixture_classifications_match_the_machine_contract() {

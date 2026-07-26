@@ -8,7 +8,7 @@ This project is not affiliated with or endorsed by the upstream paqet project.
 
 ## Project Status
 
-`paqet-gui` is in early development. The repository currently contains the validated Tauri/Svelte application scaffold, the pinned paqet compatibility contract, native profile validation and persistence, typed Windows network-interface discovery, deterministic paqet configuration generation with atomic runtime storage, and native lifecycle/log classification. Profile UI and IPC integration, executable supervision, the production interface, and release packaging are not implemented yet.
+`paqet-gui` is in early development. The repository currently contains the validated Tauri/Svelte application scaffold, the pinned paqet compatibility contract, native profile validation and persistence, typed Windows network-interface discovery, deterministic paqet configuration generation with atomic runtime storage, lifecycle/log classification, and Windows process-tree supervision. Profile UI and IPC integration, the production interface, and release packaging are not implemented yet.
 
 There are no supported binaries or installers. Do not treat the current application shell as a functional paqet client.
 
@@ -73,7 +73,9 @@ Start the current development shell:
 npm.cmd run tauri -- dev
 ```
 
-The shell is a development placeholder and does not yet launch paqet.
+The visible shell is a development placeholder and is not yet wired through IPC to the native paqet supervisor.
+
+Release maintainers stage the checksum-pinned upstream executable separately and run `npm.cmd run tauri:sidecar`. Routine development and CI remain networkless and do not download or commit the upstream artifact.
 
 ## Validation
 
@@ -85,10 +87,13 @@ npm.cmd run format:check
 npm.cmd run lint
 npm.cmd run check
 npm.cmd run test:run
+npm.cmd run test:sidecar
 npm.cmd run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo test --manifest-path src-tauri/Cargo.toml --locked
-cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path src-tauri/Cargo.toml --locked --features process-test-support --test process_supervision_windows
+cargo test --manifest-path src-tauri/Cargo.toml --locked --release --features process-test-support --test process_supervision_windows
+cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --features process-test-support -- -D warnings
 npm.cmd run tauri -- build --debug --no-bundle
 ```
 

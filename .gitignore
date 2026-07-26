@@ -1,5 +1,6 @@
 /dist/
 /node_modules/
+/src-tauri/binaries/paqet_windows_amd64-x86_64-pc-windows-msvc.exe
 /src-tauri/target/
 *.log
 !src-tauri/tests/fixtures/**/*.log

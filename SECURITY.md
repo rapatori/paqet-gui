@@ -26,7 +26,7 @@ Maintainers will acknowledge reports when practical, coordinate investigation pr
 
 ## Security Boundary
 
-The planned application controls a local packet-tunnel process and handles sensitive connection details. Its security boundary includes Rust-owned validation and state, deny-by-default Tauri capabilities, fixed paqet executable and argument selection, supervised child-process cleanup, and secret-safe diagnostics.
+The native process-control boundary is implemented in Rust but is not yet wired to the development shell. It uses fixed trusted-resource and argument selection, creation-time Windows Job Object supervision of the complete paqet process tree, deny-by-default Tauri capabilities, and secret-safe diagnostics. The webview has no arbitrary shell or executable access.
 
 Profiles and generated paqet configuration are intentionally stored as plaintext under the current user's Windows application-data directories. Anyone or any process able to read those files can read their connection details. This is accepted product behavior, not an encryption-at-rest claim.
 

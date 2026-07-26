@@ -17,6 +17,8 @@
     "executableName": "paqet_windows_amd64.exe",
     "executableSize": 9775616,
     "executableSha256": "49b377270473c223534ac1c2846d15c287863318e6fe6ee3c123f36ab97b441c",
+    "targetTriple": "x86_64-pc-windows-msvc",
+    "tauriSidecarStem": "binaries/paqet_windows_amd64",
     "authenticodeSigned": false
   },
   "launch": {

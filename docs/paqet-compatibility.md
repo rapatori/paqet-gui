@@ -17,6 +17,9 @@ The machine-readable counterpart to this document is [`src-tauri/compat/paqet-v1
 | Archive SHA-256     | `2a59fec9d486d0d910f423cd33701adfc9de7ab9642565da7e05639ba9c18780`                                                               |
 | Executable          | `paqet_windows_amd64.exe`, 9,775,616 bytes                                                                                       |
 | Executable SHA-256  | `49b377270473c223534ac1c2846d15c287863318e6fe6ee3c123f36ab97b441c`                                                               |
+| Sidecar input       | `src-tauri/binaries/paqet_windows_amd64-x86_64-pc-windows-msvc.exe`                                                              |
+| Rust target         | `x86_64-pc-windows-msvc`                                                                                                         |
+| Tauri sidecar stem  | `binaries/paqet_windows_amd64` in the manifest and `src-tauri/tauri.sidecar.conf.json`                                           |
 | Launch contract     | `paqet_windows_amd64.exe run -c config.yaml`                                                                                     |
 | License             | MIT, preserved in [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)                                                          |
 
