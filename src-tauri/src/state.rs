@@ -53,6 +53,7 @@ impl From<LifecycleState> for LifecycleSnapshot {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppSnapshot {
+    #[serde(with = "decimal_u64")]
     pub revision: u64,
     pub profiles: Vec<ProfileSummary>,
     pub selected_profile: Option<Profile>,
@@ -60,6 +61,26 @@ pub struct AppSnapshot {
     pub selected_interface_guid: Option<String>,
     pub advanced_settings: AdvancedSettings,
     pub lifecycle: LifecycleSnapshot,
+}
+
+mod decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug)]

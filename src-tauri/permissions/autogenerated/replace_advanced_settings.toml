@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-replace-advanced-settings"
+description = "Enables the replace_advanced_settings command without any pre-configured scope."
+commands.allow = ["replace_advanced_settings"]
+
+[[permission]]
+identifier = "deny-replace-advanced-settings"
+description = "Denies the replace_advanced_settings command without any pre-configured scope."
+commands.deny = ["replace_advanced_settings"]

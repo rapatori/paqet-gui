@@ -1,0 +1,5 @@
+{
+  "kind": "profileValidation",
+  "field": "serverHost",
+  "issue": "invalidFormat"
+}

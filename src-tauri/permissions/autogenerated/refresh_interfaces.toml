@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-refresh-interfaces"
+description = "Enables the refresh_interfaces command without any pre-configured scope."
+commands.allow = ["refresh_interfaces"]
+
+[[permission]]
+identifier = "deny-refresh-interfaces"
+description = "Denies the refresh_interfaces command without any pre-configured scope."
+commands.deny = ["refresh_interfaces"]

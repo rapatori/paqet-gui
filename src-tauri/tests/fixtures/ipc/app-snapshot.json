@@ -1,0 +1,67 @@
+{
+  "revision": "12",
+  "profiles": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "name": "Primary",
+      "serverHost": "198.51.100.10",
+      "port": 9999
+    },
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "name": "Backup",
+      "serverHost": "203.0.113.20",
+      "port": 443
+    }
+  ],
+  "selectedProfile": {
+    "id": "11111111-1111-4111-8111-111111111111",
+    "name": "Primary",
+    "serverHost": "198.51.100.10",
+    "port": 9999,
+    "encryptionKey": "representative-test-key"
+  },
+  "interfaces": [
+    {
+      "friendlyName": "Ethernet",
+      "interfaceName": "Ethernet",
+      "guid": "\\Device\\NPF_{AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE}",
+      "localAddress": "192.0.2.20",
+      "gatewayAddress": "192.0.2.1",
+      "gatewayMac": "00:11:22:33:44:55"
+    }
+  ],
+  "selectedInterfaceGuid": "\\Device\\NPF_{AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE}",
+  "advancedSettings": {
+    "logLevel": "debug",
+    "pcapSocketBuffer": 1048576,
+    "localTcpFlags": ["S", "SA"],
+    "remoteTcpFlags": ["PA"],
+    "connectionCount": 3,
+    "tcpBuffer": "9007199254740993",
+    "udpBuffer": "8192",
+    "kcpMode": "manual",
+    "manualKcp": {
+      "noDelay": 1,
+      "interval": 20,
+      "resend": 2,
+      "noCongestion": 1,
+      "writeDelay": false,
+      "ackNoDelay": true
+    },
+    "kcpMtu": 1350,
+    "kcpReceiveWindow": 1024,
+    "kcpSendWindow": 1024,
+    "kcpBlock": "aes-128-gcm",
+    "smuxBuffer": 4194304,
+    "streamBuffer": 2097152,
+    "smuxKeepalive": 2,
+    "smuxTimeout": 8
+  },
+  "lifecycle": {
+    "status": "disconnected",
+    "process": "absent",
+    "failure": null,
+    "settingsEditable": true
+  }
+}

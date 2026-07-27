@@ -95,7 +95,9 @@ pub struct AdvancedSettings {
     pub local_tcp_flags: Option<Vec<String>>,
     pub remote_tcp_flags: Option<Vec<String>>,
     pub connection_count: Option<u16>,
+    #[serde(with = "optional_decimal_u64")]
     pub tcp_buffer: Option<u64>,
+    #[serde(with = "optional_decimal_u64")]
     pub udp_buffer: Option<u64>,
     pub kcp_mode: Option<KcpMode>,
     pub manual_kcp: ManualKcpSettings,
@@ -107,6 +109,26 @@ pub struct AdvancedSettings {
     pub stream_buffer: Option<u32>,
     pub smux_keepalive: Option<u32>,
     pub smux_timeout: Option<u32>,
+}
+
+mod optional_decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(value: &Option<u64>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.map(|value| value.to_string()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| value.parse().map_err(serde::de::Error::custom))
+            .transpose()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
