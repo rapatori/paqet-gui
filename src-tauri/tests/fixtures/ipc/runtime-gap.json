@@ -1,0 +1,13 @@
+{
+  "kind": "gap",
+  "revision": "22",
+  "sessionId": "3",
+  "firstMissing": "1",
+  "nextAvailable": "7",
+  "lifecycle": {
+    "status": "connected",
+    "process": "running",
+    "failure": null,
+    "settingsEditable": false
+  }
+}

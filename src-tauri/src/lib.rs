@@ -29,6 +29,9 @@ pub fn run() {
             ipc::refresh_interfaces,
             ipc::select_interface,
             ipc::replace_advanced_settings,
+            ipc::connect,
+            ipc::disconnect,
+            ipc::subscribe_runtime_events,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run paqet");

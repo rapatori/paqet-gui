@@ -1,19 +1,36 @@
-import { invoke } from '@tauri-apps/api/core';
+import { Channel, invoke } from '@tauri-apps/api/core';
 import snapshotFixture from '../../../src-tauri/tests/fixtures/ipc/app-snapshot.json';
+import configErrorFixture from '../../../src-tauri/tests/fixtures/ipc/error-config-validation.json';
 import errorFixture from '../../../src-tauri/tests/fixtures/ipc/error-profile-validation.json';
+import bootstrapFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-bootstrap.json';
+import gapFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-gap.json';
+import outputFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-output.json';
 import {
+  connect,
   createProfile,
   deleteProfile,
+  disconnect,
   getAppSnapshot,
   refreshInterfaces,
   replaceAdvancedSettings,
   selectInterface,
   selectProfile,
+  subscribeRuntimeEvents,
   updateProfile,
 } from './index';
-import type { AppSnapshot, IpcError, ProfileDraft } from './types';
+import type {
+  AppSnapshot,
+  IpcError,
+  ProfileDraft,
+  RuntimeEvent,
+} from './types';
 
 vi.mock('@tauri-apps/api/core', () => ({
+  Channel: vi.fn(
+    class MockChannel<T> {
+      constructor(public onmessage: (event: T) => void) {}
+    },
+  ),
   invoke: vi.fn(),
 }));
 
@@ -41,6 +58,10 @@ describe('disconnected Tauri API', () => {
     await refreshInterfaces();
     await selectInterface('interface-guid');
     await replaceAdvancedSettings(snapshot.advancedSettings);
+    await connect();
+    await disconnect();
+    const onEvent = vi.fn();
+    await subscribeRuntimeEvents(onEvent);
 
     expect(invokeMock.mock.calls).toEqual([
       ['get_app_snapshot'],
@@ -51,7 +72,18 @@ describe('disconnected Tauri API', () => {
       ['refresh_interfaces'],
       ['select_interface', { guid: 'interface-guid' }],
       ['replace_advanced_settings', { settings: snapshot.advancedSettings }],
+      ['connect'],
+      ['disconnect'],
+      [
+        'subscribe_runtime_events',
+        { onEvent: expect.any(Channel) as Channel<RuntimeEvent> },
+      ],
     ]);
+    const channel = (
+      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    ).onEvent as Channel<RuntimeEvent>;
+    channel.onmessage(outputFixture as RuntimeEvent);
+    expect(onEvent).toHaveBeenCalledWith(outputFixture);
   });
 
   it('pins representative snapshot details shared with Rust', () => {
@@ -77,5 +109,58 @@ describe('disconnected Tauri API', () => {
       field: 'serverHost',
       issue: 'invalidFormat',
     });
+    expect(configErrorFixture as IpcError).toEqual({
+      kind: 'configValidation',
+      field: 'streamBuffer',
+      issue: 'invalidCombination',
+    });
+  });
+
+  it('pins representative ordered runtime events shared with Rust', () => {
+    const events = [
+      bootstrapFixture,
+      outputFixture,
+      gapFixture,
+    ] as RuntimeEvent[];
+
+    expect(events.map((event) => event.kind)).toEqual([
+      'bootstrap',
+      'output',
+      'gap',
+    ]);
+    expect(events[0]).toMatchObject({
+      revision: '20',
+      sessionId: '3',
+      gap: { firstMissing: '1', nextAvailable: '7' },
+      records: [{ sequence: '7' }],
+    });
+    expect(events[1]).toMatchObject({
+      revision: '21',
+      record: { sequence: '8', classification: { kind: 'connectionLost' } },
+    });
+    expect(events[2]).toMatchObject({
+      firstMissing: '1',
+      nextAvailable: '7',
+      lifecycle: { status: 'connected' },
+    });
+  });
+
+  it('ignores in-flight events from a replaced runtime subscription', async () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    await subscribeRuntimeEvents(first);
+    const firstChannel = (
+      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    ).onEvent as Channel<RuntimeEvent>;
+    await subscribeRuntimeEvents(second);
+    const secondChannel = (
+      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    ).onEvent as Channel<RuntimeEvent>;
+
+    firstChannel.onmessage(outputFixture as RuntimeEvent);
+    secondChannel.onmessage(bootstrapFixture as RuntimeEvent);
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledWith(bootstrapFixture);
   });
 });

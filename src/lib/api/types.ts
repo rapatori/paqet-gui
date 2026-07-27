@@ -92,6 +92,59 @@ export interface LifecycleSnapshot {
   settingsEditable: boolean;
 }
 
+export type OutputStream = 'stdout' | 'stderr';
+export type FatalKind = 'configuration' | 'client';
+export type LogClassification =
+  | { kind: 'display' }
+  | { kind: 'connected' }
+  | { kind: 'connectionLost' }
+  | { kind: 'fatal'; fatalKind: FatalKind }
+  | { kind: 'shutdownRequested' };
+
+export interface LogRecord {
+  sequence: string;
+  stream: OutputStream;
+  text: string;
+  classification: LogClassification;
+  truncated: boolean;
+}
+
+export interface RuntimeGap {
+  firstMissing: string;
+  nextAvailable: string;
+}
+
+export type RuntimeEvent =
+  | {
+      kind: 'bootstrap';
+      revision: string;
+      sessionId: string | null;
+      lifecycle: LifecycleSnapshot;
+      gap: RuntimeGap | null;
+      records: LogRecord[];
+    }
+  | {
+      kind: 'lifecycle';
+      revision: string;
+      sessionId: string | null;
+      lifecycle: LifecycleSnapshot;
+    }
+  | {
+      kind: 'output';
+      revision: string;
+      sessionId: string;
+      lifecycle: LifecycleSnapshot;
+      record: LogRecord;
+    }
+  | {
+      kind: 'gap';
+      revision: string;
+      sessionId: string;
+      firstMissing: string;
+      nextAvailable: string;
+      lifecycle: LifecycleSnapshot;
+    };
+
 export interface AppSnapshot {
   revision: string;
   profiles: ProfileSummary[];
@@ -104,11 +157,43 @@ export interface AppSnapshot {
 
 export type ProfileFieldName = 'name' | 'serverHost' | 'port' | 'encryptionKey';
 export type ValidationIssue =
-  'required' | 'invalidFormat' | 'outOfRange' | 'containsControlCharacters';
+  | 'required'
+  | 'invalidFormat'
+  | 'outOfRange'
+  | 'containsControlCharacters'
+  | 'invalidCombination';
+export type ConfigFieldName =
+  | 'interfaceName'
+  | 'interfaceGuid'
+  | 'localAddress'
+  | 'gatewayMac'
+  | 'serverAddress'
+  | 'encryptionKey'
+  | 'pcapSocketBuffer'
+  | 'localTcpFlags'
+  | 'remoteTcpFlags'
+  | 'connectionCount'
+  | 'tcpBuffer'
+  | 'udpBuffer'
+  | 'kcpMode'
+  | 'kcpNoDelay'
+  | 'kcpInterval'
+  | 'kcpResend'
+  | 'kcpNoCongestion'
+  | 'kcpMtu'
+  | 'kcpReceiveWindow'
+  | 'kcpSendWindow'
+  | 'smuxBuffer'
+  | 'streamBuffer'
+  | 'smuxKeepalive'
+  | 'smuxTimeout';
 
 export type IpcError =
   | { kind: 'settingsLocked' }
   | { kind: 'interfaceNotFound' }
+  | { kind: 'profileNotSelected' }
+  | { kind: 'interfaceNotSelected' }
+  | { kind: 'commandConflict' }
   | {
       kind: 'profileValidation';
       field: ProfileFieldName;
@@ -120,4 +205,13 @@ export type IpcError =
   | { kind: 'profileDataInvalid' }
   | { kind: 'profileStorage' }
   | { kind: 'networkDiscovery' }
+  | {
+      kind: 'configValidation';
+      field: ConfigFieldName;
+      issue: ValidationIssue;
+    }
+  | { kind: 'configGeneration' }
+  | { kind: 'configStorage' }
+  | { kind: 'processLaunch' }
+  | { kind: 'runtimeSubscription' }
   | { kind: 'stateUnavailable' };

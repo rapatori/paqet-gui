@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     ffi::{OsStr, c_void},
     io::{self, BufRead, BufReader},
     mem::{MaybeUninit, size_of, size_of_val},
@@ -40,8 +41,8 @@ use windows_sys::Win32::{
 };
 
 use super::{
-    LifecycleState, LogRecord, MAX_LOG_RECORD_BYTES, OutputStream, PAQET_CONFIG_FLAG,
-    PAQET_RUN_SUBCOMMAND, ProcessError, ProcessPresence, SessionLog, open_pinned_paqet_executable,
+    LogClassification, LogRecord, MAX_LOG_RECORD_BYTES, OutputStream, PAQET_CONFIG_FLAG,
+    PAQET_RUN_SUBCOMMAND, ProcessError, SessionLog, open_pinned_paqet_executable,
     resolve_paqet_executable, validate_paqet_executable,
 };
 
@@ -62,6 +63,7 @@ pub enum SupervisorEvent {
     Gap {
         first_missing: u64,
         next_available: u64,
+        classification: Option<LogClassification>,
     },
     Exited(ProcessTreeExit),
 }
@@ -102,26 +104,13 @@ struct SharedState {
     changed: Condvar,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct EventState {
     log: SessionLog,
-    lifecycle: LifecycleState,
+    significant: VecDeque<(u64, LogClassification)>,
+    evicted_summary: Option<LogClassification>,
     terminal_ready: bool,
     revision: u64,
-}
-
-impl Default for EventState {
-    fn default() -> Self {
-        let mut lifecycle = LifecycleState::default();
-        lifecycle.begin_connect().unwrap();
-        lifecycle.mark_process_spawned().unwrap();
-        Self {
-            log: SessionLog::default(),
-            lifecycle,
-            terminal_ready: false,
-            revision: 0,
-        }
-    }
 }
 
 impl SupervisedPaqet {
@@ -132,6 +121,14 @@ impl SupervisedPaqet {
         let executable = resolve_paqet_executable(paths)?;
         let verified_executable = open_pinned_paqet_executable(&executable)?;
         Self::launch_executable(&executable, config_path, Some(verified_executable))
+    }
+
+    pub(crate) fn launch_pinned_executable(
+        executable: &Path,
+        config_path: &Path,
+    ) -> Result<Self, ProcessError> {
+        let verified_executable = open_pinned_paqet_executable(executable)?;
+        Self::launch_executable(executable, config_path, Some(verified_executable))
     }
 
     #[doc(hidden)]
@@ -261,14 +258,6 @@ impl SupervisedPaqet {
             .collect()
     }
 
-    pub fn lifecycle(&self) -> LifecycleState {
-        self.shared
-            .state
-            .lock()
-            .expect("supervisor event state lock must not be poisoned")
-            .lifecycle
-    }
-
     pub fn disconnect(&mut self) -> Result<ProcessTreeExit, ProcessError> {
         self.ensure_running()?;
         let deadline = Instant::now() + TREE_EXIT_TIMEOUT;
@@ -298,7 +287,6 @@ impl SupervisedPaqet {
                 .is_some_and(|worker| worker.join().is_err());
             self.finished = true;
             self.job.take();
-            self.observe_terminal_cleanup();
             if worker_panicked {
                 return Err(ProcessError::SupervisorPanicked);
             }
@@ -318,7 +306,6 @@ impl SupervisedPaqet {
             .take()
             .unwrap_or(Err(ProcessError::SupervisorPanicked));
         self.job.take();
-        self.observe_terminal_cleanup();
         match terminal {
             Ok(exit) => {
                 self.terminal = Some(Ok(exit));
@@ -329,31 +316,41 @@ impl SupervisedPaqet {
     }
 
     fn next_available_event(&mut self) -> Result<(Option<SupervisorEvent>, u64), ProcessError> {
-        let state = self
+        let mut state = self
             .shared
             .state
             .lock()
             .expect("supervisor event state lock must not be poisoned");
-        if let Some(first) = state.log.records().next()
-            && self.next_event_sequence < first.sequence
+        let first_retained = state.log.records().next().map(|record| record.sequence);
+        if let Some(first_retained) = first_retained
+            && self.next_event_sequence < first_retained
         {
             let first_missing = self.next_event_sequence;
-            self.next_event_sequence = first.sequence;
+            self.next_event_sequence = first_retained;
+            let classification = state.evicted_summary.take();
             let revision = state.revision;
             return Ok((
                 Some(SupervisorEvent::Gap {
                     first_missing,
-                    next_available: first.sequence,
+                    next_available: first_retained,
+                    classification,
                 }),
                 revision,
             ));
         }
-        if let Some(record) = state
+        let record = state
             .log
             .records()
             .find(|record| record.sequence == self.next_event_sequence)
-            .cloned()
-        {
+            .cloned();
+        if let Some(record) = record {
+            if state
+                .significant
+                .front()
+                .is_some_and(|(sequence, _)| *sequence == record.sequence)
+            {
+                state.significant.pop_front();
+            }
             self.next_event_sequence += 1;
             let revision = state.revision;
             return Ok((Some(SupervisorEvent::Output(record)), revision));
@@ -420,17 +417,6 @@ impl SupervisedPaqet {
             Ok(())
         }
     }
-
-    fn observe_terminal_cleanup(&self) {
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .expect("supervisor event state lock must not be poisoned");
-        if state.lifecycle.process() == ProcessPresence::Running {
-            state.lifecycle.observe_process_exit(None).unwrap();
-        }
-    }
 }
 
 impl Drop for SupervisedPaqet {
@@ -495,16 +481,6 @@ fn supervise_process_tree(
         }
     };
     let reader_result = drain_reader_output(&raw_receiver, &shared, &mut readers, deadline);
-    {
-        let mut state = shared
-            .state
-            .lock()
-            .expect("supervisor event state lock must not be poisoned");
-        state
-            .lifecycle
-            .observe_process_exit(Some(exit.code))
-            .unwrap();
-    }
     reader_result?;
     Ok(exit)
 }
@@ -518,22 +494,15 @@ fn supervise_running_process(
     let mut disconnect_requested = false;
     let mut shutdown_deadline = None;
     let code = loop {
+        if process_has_exited(&running.process)? {
+            break process_exit_code(&running.process)?;
+        }
         if let Ok(Control::Disconnect { deadline }) = control_receiver.try_recv()
             && !disconnect_requested
         {
             disconnect_requested = true;
             shutdown_deadline = Some(deadline);
-            shared
-                .state
-                .lock()
-                .expect("supervisor event state lock must not be poisoned")
-                .lifecycle
-                .begin_disconnect()
-                .unwrap();
             terminate_job(&running.job)?;
-        }
-        if process_has_exited(&running.process)? {
-            break process_exit_code(&running.process)?;
         }
         match raw_receiver.recv_timeout(SUPERVISOR_POLL_INTERVAL) {
             Ok(raw) => sequence_output(raw, shared),
@@ -573,10 +542,51 @@ fn sequence_output(raw: RawOutput, shared: &SharedState) {
     let record = state
         .log
         .push_captured(raw.stream, &raw.text, raw.truncated);
-    state.lifecycle.observe_output(record.classification);
+    if lifecycle_affecting(record.classification) {
+        state
+            .significant
+            .push_back((record.sequence, record.classification));
+    }
+    let first_retained = state.log.records().next().map(|record| record.sequence);
+    if let Some(first_retained) = first_retained {
+        while state
+            .significant
+            .front()
+            .is_some_and(|(sequence, _)| *sequence < first_retained)
+        {
+            let (_, classification) = state.significant.pop_front().unwrap();
+            state.evicted_summary = summarize_classification(state.evicted_summary, classification);
+        }
+    }
     state.revision = state.revision.wrapping_add(1);
     drop(state);
     shared.changed.notify_all();
+}
+
+fn lifecycle_affecting(classification: LogClassification) -> bool {
+    matches!(
+        classification,
+        LogClassification::Connected
+            | LogClassification::ConnectionLost
+            | LogClassification::Fatal { .. }
+    )
+}
+
+fn summarize_classification(
+    current: Option<LogClassification>,
+    next: LogClassification,
+) -> Option<LogClassification> {
+    match (current, next) {
+        (
+            Some(LogClassification::ConnectionLost | LogClassification::Fatal { .. }),
+            next @ (LogClassification::ConnectionLost | LogClassification::Fatal { .. }),
+        ) => Some(next),
+        (
+            Some(failure @ (LogClassification::ConnectionLost | LogClassification::Fatal { .. })),
+            _,
+        ) => Some(failure),
+        (_, next) => Some(next),
+    }
 }
 
 fn wait_for_empty_job_and_drain(

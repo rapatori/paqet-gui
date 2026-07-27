@@ -1,0 +1,18 @@
+{
+  "kind": "output",
+  "revision": "21",
+  "sessionId": "3",
+  "lifecycle": {
+    "status": "failed",
+    "process": "running",
+    "failure": { "kind": "connectionLost" },
+    "settingsEditable": false
+  },
+  "record": {
+    "sequence": "8",
+    "stream": "stdout",
+    "text": "2026-07-27 [INFO] connection lost, retrying....",
+    "classification": { "kind": "connectionLost" },
+    "truncated": false
+  }
+}

@@ -1,12 +1,12 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{State, ipc::Channel};
 
 use crate::{
-    config::AdvancedSettings,
+    config::{AdvancedSettings, ConfigError, ConfigField, ConfigValidationKind},
     profiles::{ProfileDraft, ProfileError, ProfileField, ProfileId, ValidationKind},
-    state::{AppSnapshot, AppState, StateError},
+    state::{AppSnapshot, AppState, RuntimeEvent, StateError},
 };
 
 pub type ManagedAppState = Result<AppState, IpcError>;
@@ -70,6 +70,67 @@ pub enum ValidationIssue {
     InvalidFormat,
     OutOfRange,
     ContainsControlCharacters,
+    InvalidCombination,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfigFieldName {
+    InterfaceName,
+    InterfaceGuid,
+    LocalAddress,
+    GatewayMac,
+    ServerAddress,
+    EncryptionKey,
+    PcapSocketBuffer,
+    LocalTcpFlags,
+    RemoteTcpFlags,
+    ConnectionCount,
+    TcpBuffer,
+    UdpBuffer,
+    KcpMode,
+    KcpNoDelay,
+    KcpInterval,
+    KcpResend,
+    KcpNoCongestion,
+    KcpMtu,
+    KcpReceiveWindow,
+    KcpSendWindow,
+    SmuxBuffer,
+    StreamBuffer,
+    SmuxKeepalive,
+    SmuxTimeout,
+}
+
+impl From<ConfigField> for ConfigFieldName {
+    fn from(field: ConfigField) -> Self {
+        match field {
+            ConfigField::InterfaceName => Self::InterfaceName,
+            ConfigField::InterfaceGuid => Self::InterfaceGuid,
+            ConfigField::LocalAddress => Self::LocalAddress,
+            ConfigField::GatewayMac => Self::GatewayMac,
+            ConfigField::ServerAddress => Self::ServerAddress,
+            ConfigField::EncryptionKey => Self::EncryptionKey,
+            ConfigField::PcapSocketBuffer => Self::PcapSocketBuffer,
+            ConfigField::LocalTcpFlags => Self::LocalTcpFlags,
+            ConfigField::RemoteTcpFlags => Self::RemoteTcpFlags,
+            ConfigField::ConnectionCount => Self::ConnectionCount,
+            ConfigField::TcpBuffer => Self::TcpBuffer,
+            ConfigField::UdpBuffer => Self::UdpBuffer,
+            ConfigField::KcpMode => Self::KcpMode,
+            ConfigField::KcpNoDelay => Self::KcpNoDelay,
+            ConfigField::KcpInterval => Self::KcpInterval,
+            ConfigField::KcpResend => Self::KcpResend,
+            ConfigField::KcpNoCongestion => Self::KcpNoCongestion,
+            ConfigField::KcpMtu => Self::KcpMtu,
+            ConfigField::KcpReceiveWindow => Self::KcpReceiveWindow,
+            ConfigField::KcpSendWindow => Self::KcpSendWindow,
+            ConfigField::SmuxBuffer => Self::SmuxBuffer,
+            ConfigField::StreamBuffer => Self::StreamBuffer,
+            ConfigField::SmuxKeepalive => Self::SmuxKeepalive,
+            ConfigField::SmuxTimeout => Self::SmuxTimeout,
+        }
+    }
 }
 
 impl From<ValidationKind> for ValidationIssue {
@@ -88,6 +149,9 @@ impl From<ValidationKind> for ValidationIssue {
 pub enum IpcError {
     SettingsLocked,
     InterfaceNotFound,
+    ProfileNotSelected,
+    InterfaceNotSelected,
+    CommandConflict,
     ProfileValidation {
         field: ProfileFieldName,
         issue: ValidationIssue,
@@ -100,6 +164,14 @@ pub enum IpcError {
     ProfileDataInvalid,
     ProfileStorage,
     NetworkDiscovery,
+    ConfigValidation {
+        field: ConfigFieldName,
+        issue: ValidationIssue,
+    },
+    ConfigGeneration,
+    ConfigStorage,
+    ProcessLaunch,
+    RuntimeSubscription,
     StateUnavailable,
 }
 
@@ -108,9 +180,33 @@ impl From<StateError> for IpcError {
         match error {
             StateError::Locked => Self::SettingsLocked,
             StateError::InterfaceNotFound => Self::InterfaceNotFound,
+            StateError::ProfileNotSelected => Self::ProfileNotSelected,
+            StateError::InterfaceNotSelected => Self::InterfaceNotSelected,
+            StateError::CommandConflict => Self::CommandConflict,
             StateError::Profile(error) => Self::from(error),
             StateError::Network(_) => Self::NetworkDiscovery,
+            StateError::Config(error) => Self::from(error),
+            StateError::Process(_) => Self::ProcessLaunch,
+            StateError::Subscription => Self::RuntimeSubscription,
             StateError::Unavailable => Self::StateUnavailable,
+        }
+    }
+}
+
+impl From<ConfigError> for IpcError {
+    fn from(error: ConfigError) -> Self {
+        match error {
+            ConfigError::Validation { field, kind } => Self::ConfigValidation {
+                field: field.into(),
+                issue: match kind {
+                    ConfigValidationKind::Required => ValidationIssue::Required,
+                    ConfigValidationKind::InvalidFormat => ValidationIssue::InvalidFormat,
+                    ConfigValidationKind::OutOfRange => ValidationIssue::OutOfRange,
+                    ConfigValidationKind::InvalidCombination => ValidationIssue::InvalidCombination,
+                },
+            },
+            ConfigError::Serialization => Self::ConfigGeneration,
+            ConfigError::Io { .. } => Self::ConfigStorage,
         }
     }
 }
@@ -202,13 +298,41 @@ pub fn replace_advanced_settings(
         .map_err(Into::into)
 }
 
+#[tauri::command]
+pub async fn connect(state: State<'_, ManagedAppState>) -> Result<AppSnapshot, IpcError> {
+    let state = app_state(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || state.connect())
+        .await
+        .map_err(|_| IpcError::StateUnavailable)?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn disconnect(state: State<'_, ManagedAppState>) -> Result<AppSnapshot, IpcError> {
+    let state = app_state(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || state.disconnect())
+        .await
+        .map_err(|_| IpcError::StateUnavailable)?
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn subscribe_runtime_events(
+    state: State<'_, ManagedAppState>,
+    on_event: Channel<RuntimeEvent>,
+) -> Result<(), IpcError> {
+    app_state(&state)?
+        .subscribe_runtime_events(on_event)
+        .map_err(Into::into)
+}
+
 fn app_state<'a>(state: &'a State<'_, ManagedAppState>) -> Result<&'a AppState, IpcError> {
     state.as_ref().map_err(Clone::clone)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::{io, path::PathBuf};
 
     use super::*;
 
@@ -275,6 +399,31 @@ mod tests {
         assert_eq!(
             state.as_ref().unwrap_err().clone(),
             IpcError::NetworkDiscovery
+        );
+    }
+
+    #[test]
+    fn runtime_storage_and_process_errors_are_secret_safe_categories() {
+        let config = IpcError::from(StateError::Config(ConfigError::Io {
+            operation: "write secret-value configuration",
+            source: io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                r"secret-value at C:\Users\Example\config.yaml",
+            ),
+        }));
+        let process = IpcError::from(StateError::Process(
+            crate::process::ProcessError::ExecutableIsNotFile(PathBuf::from(
+                r"C:\secret-value\paqet.exe",
+            )),
+        ));
+
+        assert_eq!(
+            serde_json::to_string(&config).unwrap(),
+            r#"{"kind":"configStorage"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&process).unwrap(),
+            r#"{"kind":"processLaunch"}"#
         );
     }
 }

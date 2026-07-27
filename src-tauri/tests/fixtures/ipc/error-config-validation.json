@@ -1,0 +1,5 @@
+{
+  "kind": "configValidation",
+  "field": "streamBuffer",
+  "issue": "invalidCombination"
+}

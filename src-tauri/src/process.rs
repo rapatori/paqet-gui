@@ -456,16 +456,26 @@ impl LifecycleState {
         &mut self,
         code: Option<i32>,
     ) -> Result<(), LifecycleTransitionError> {
+        self.observe_process_exit_requested(code, self.phase == LifecyclePhase::Disconnecting)
+    }
+
+    pub fn observe_process_exit_requested(
+        &mut self,
+        code: Option<i32>,
+        requested: bool,
+    ) -> Result<(), LifecycleTransitionError> {
         if self.process != ProcessPresence::Running {
             return Err(self.transition_error(LifecycleAction::ObserveProcessExit));
         }
         self.process = ProcessPresence::Absent;
         match self.phase {
-            LifecyclePhase::Disconnecting => {
+            LifecyclePhase::Disconnecting if requested => {
                 self.phase = LifecyclePhase::Disconnected;
                 self.failure = None;
             }
-            LifecyclePhase::Connecting | LifecyclePhase::Connected => {
+            LifecyclePhase::Connecting
+            | LifecyclePhase::Connected
+            | LifecyclePhase::Disconnecting => {
                 self.phase = LifecyclePhase::Disconnected;
                 if self.failure.is_none() {
                     self.failure = Some(FailureReason::UnexpectedExit { code });
@@ -546,11 +556,32 @@ pub fn classify_output(stream: OutputStream, text: &str) -> LogClassification {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LogRecord {
+    #[serde(with = "decimal_u64")]
     pub sequence: u64,
     pub stream: OutputStream,
     pub text: String,
     pub classification: LogClassification,
     pub truncated: bool,
+}
+
+mod decimal_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug)]
@@ -942,7 +973,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(record).unwrap(),
             serde_json::json!({
-                "sequence": 7,
+                "sequence": "7",
                 "stream": "stdout",
                 "text": "failure",
                 "classification": {

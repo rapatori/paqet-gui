@@ -18,9 +18,9 @@ mod windows_test {
     };
 
     use paqet_gui_lib::process::{
-        FailureReason, LifecycleStatus, OutputStream, PAQET_EXECUTABLE_SHA256,
-        PAQET_EXECUTABLE_SIZE, ProcessError, ProcessPresence, SupervisedPaqet, SupervisorEvent,
-        validate_paqet_executable, validate_pinned_paqet_executable,
+        LogClassification, OutputStream, PAQET_EXECUTABLE_SHA256, PAQET_EXECUTABLE_SIZE,
+        ProcessError, SupervisedPaqet, SupervisorEvent, validate_paqet_executable,
+        validate_pinned_paqet_executable,
     };
     use windows_sys::Win32::{
         Foundation::{GetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT},
@@ -153,18 +153,6 @@ mod windows_test {
         {
             return Err("wait did not preserve the ordered terminal event".to_owned());
         }
-        let lifecycle = supervisor.lifecycle();
-        if lifecycle.status() != LifecycleStatus::Disconnected
-            || lifecycle.process() != ProcessPresence::Absent
-            || lifecycle.failure()
-                != Some(FailureReason::UnexpectedExit {
-                    code: Some(ROOT_EXIT_CODE),
-                })
-        {
-            return Err(format!(
-                "natural wait did not leave the expected terminal lifecycle: {lifecycle:?}"
-            ));
-        }
         Ok(())
     }
 
@@ -204,12 +192,11 @@ mod windows_test {
             .map_err(|error| error.to_string())?
         {
             Some(SupervisorEvent::Gap {
-                first_missing: 1, ..
+                first_missing: 1,
+                classification: Some(LogClassification::Connected),
+                ..
             }) => {}
             event => return Err(format!("expected an explicit replay gap, got {event:?}")),
-        }
-        if supervisor.lifecycle().status() != LifecycleStatus::Connected {
-            return Err("evicted connected marker did not update native lifecycle".to_owned());
         }
         supervisor.disconnect().map_err(|error| error.to_string())?;
         Ok(())

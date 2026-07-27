@@ -685,7 +685,7 @@ struct KcpConfig<'a> {
     smuxktimeout: Option<u32>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct RuntimeConfigStore {
     path: PathBuf,
 }

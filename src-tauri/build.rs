@@ -9,6 +9,9 @@ fn main() {
             "refresh_interfaces",
             "select_interface",
             "replace_advanced_settings",
+            "connect",
+            "disconnect",
+            "subscribe_runtime_events",
         ]),
     ))
     .expect("failed to build paqet");

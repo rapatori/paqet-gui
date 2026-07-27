@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-subscribe-runtime-events"
+description = "Enables the subscribe_runtime_events command without any pre-configured scope."
+commands.allow = ["subscribe_runtime_events"]
+
+[[permission]]
+identifier = "deny-subscribe-runtime-events"
+description = "Denies the subscribe_runtime_events command without any pre-configured scope."
+commands.deny = ["subscribe_runtime_events"]

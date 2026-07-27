@@ -1,0 +1,24 @@
+{
+  "kind": "bootstrap",
+  "revision": "20",
+  "sessionId": "3",
+  "lifecycle": {
+    "status": "connected",
+    "process": "running",
+    "failure": null,
+    "settingsEditable": false
+  },
+  "gap": {
+    "firstMissing": "1",
+    "nextAvailable": "7"
+  },
+  "records": [
+    {
+      "sequence": "7",
+      "stream": "stdout",
+      "text": "2026-07-27 [INFO] Client started: representative",
+      "classification": { "kind": "connected" },
+      "truncated": false
+    }
+  ]
+}
