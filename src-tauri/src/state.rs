@@ -1496,7 +1496,7 @@ mod tests {
         );
         assert_eq!(
             state.request_window_close().unwrap(),
-            WindowCloseDecision::Allow
+            WindowCloseDecision::Shutdown
         );
     }
 
