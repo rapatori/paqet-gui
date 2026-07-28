@@ -7,7 +7,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -148,6 +148,27 @@ pub struct RuntimeGap {
     pub first_missing: u64,
     #[serde(with = "decimal_u64")]
     pub next_available: u64,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WindowCloseRequest {
+    #[serde(with = "decimal_u64")]
+    pub request_id: u64,
+    pub lifecycle: LifecycleSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowCloseDecision {
+    Allow,
+    Confirm(WindowCloseRequest),
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationExitDecision {
+    Allow,
+    Shutdown,
 }
 
 mod optional_decimal_u64 {
@@ -297,6 +318,11 @@ struct StateData {
     runtime_records: VecDeque<LogRecord>,
     runtime_record_bytes: usize,
     subscriber: Option<Channel<RuntimeEvent>>,
+    next_close_request_id: u64,
+    pending_close_request_id: Option<u64>,
+    close_confirmation_in_progress: bool,
+    close_subscriber: Option<Channel<WindowCloseRequest>>,
+    shutdown_requested: bool,
 }
 
 impl StateData {
@@ -499,6 +525,11 @@ impl AppState {
                 runtime_records: VecDeque::new(),
                 runtime_record_bytes: 0,
                 subscriber: None,
+                next_close_request_id: 1,
+                pending_close_request_id: None,
+                close_confirmation_in_progress: false,
+                close_subscriber: None,
+                shutdown_requested: false,
             })),
             config_store,
             launcher,
@@ -594,7 +625,7 @@ impl AppState {
     pub fn connect(&self) -> Result<AppSnapshot, StateError> {
         let (session_id, profile, interface, settings) = {
             let mut state = self.lock()?;
-            if !state.lifecycle.can_connect() {
+            if state.shutdown_requested || !state.lifecycle.can_connect() {
                 return Err(StateError::CommandConflict);
             }
             let profile = state
@@ -633,6 +664,9 @@ impl AppState {
         self.config_store
             .write(&generated)
             .map_err(|error| self.fail_connect(session_id, error.into()))?;
+        if self.lock()?.shutdown_requested {
+            return Err(self.fail_connect(session_id, StateError::CommandConflict));
+        }
         let process = (self.launcher)(self.config_store.path())
             .map_err(|error| self.fail_connect(session_id, error.into()))?;
         let (control, requests) = mpsc::channel();
@@ -641,9 +675,11 @@ impl AppState {
             if state.latest_session_id != Some(session_id)
                 || state.active_session.is_some()
                 || state.lifecycle.mark_process_spawned().is_err()
+                || state.shutdown_requested
             {
                 drop(process);
-                return Err(StateError::CommandConflict);
+                drop(state);
+                return Err(self.fail_connect(session_id, StateError::CommandConflict));
             }
             state.active_session = Some(RuntimeSession {
                 id: session_id,
@@ -669,12 +705,145 @@ impl AppState {
     }
 
     pub fn disconnect(&self) -> Result<AppSnapshot, StateError> {
+        self.stop_runtime(false)
+    }
+
+    pub fn shutdown(&self) -> Result<AppSnapshot, StateError> {
+        {
+            let mut state = self.lock()?;
+            state.shutdown_requested = true;
+            if state.lifecycle.settings_editable() {
+                return Ok(state.snapshot());
+            }
+            if state.lifecycle.process() == ProcessPresence::Absent {
+                drop(state);
+                return self.wait_for_shutdown();
+            }
+        }
+        self.stop_runtime(true)
+    }
+
+    pub fn request_window_close(&self) -> Result<WindowCloseDecision, StateError> {
+        let mut state = self.lock()?;
+        if state.shutdown_requested {
+            return Ok(WindowCloseDecision::Shutdown);
+        }
+        if state.lifecycle.settings_editable() {
+            state.shutdown_requested = true;
+            state.pending_close_request_id = None;
+            return Ok(WindowCloseDecision::Allow);
+        }
+        let request_id = match state.pending_close_request_id {
+            Some(request_id) => request_id,
+            None => {
+                let request_id = state.next_close_request_id;
+                state.next_close_request_id = state
+                    .next_close_request_id
+                    .checked_add(1)
+                    .expect("window close request identifier exhausted");
+                state.pending_close_request_id = Some(request_id);
+                request_id
+            }
+        };
+        let request = WindowCloseRequest {
+            request_id,
+            lifecycle: state.lifecycle.into(),
+        };
+        let Some(channel) = state.close_subscriber.clone() else {
+            state.shutdown_requested = true;
+            return Ok(WindowCloseDecision::Shutdown);
+        };
+        if channel.send(request).is_err() {
+            state.close_subscriber = None;
+            state.shutdown_requested = true;
+            return Ok(WindowCloseDecision::Shutdown);
+        }
+        Ok(WindowCloseDecision::Confirm(request))
+    }
+
+    pub fn subscribe_window_close_requests(
+        &self,
+        channel: Channel<WindowCloseRequest>,
+    ) -> Result<(), StateError> {
+        let mut state = self.lock()?;
+        state.close_subscriber = Some(channel.clone());
+        if state.shutdown_requested {
+            return Ok(());
+        }
+        let Some(request_id) = state.pending_close_request_id else {
+            return Ok(());
+        };
+        let request = WindowCloseRequest {
+            request_id,
+            lifecycle: state.lifecycle.into(),
+        };
+        if channel.send(request).is_err() {
+            state.close_subscriber = None;
+            return Err(StateError::Subscription);
+        }
+        Ok(())
+    }
+
+    pub fn begin_application_exit(&self) -> Result<ApplicationExitDecision, StateError> {
+        let mut state = self.lock()?;
+        state.shutdown_requested = true;
+        Ok(if state.lifecycle.settings_editable() {
+            ApplicationExitDecision::Allow
+        } else {
+            ApplicationExitDecision::Shutdown
+        })
+    }
+
+    pub fn cancel_window_close(&self, request_id: u64) -> Result<(), StateError> {
+        let mut state = self.lock()?;
+        if state.pending_close_request_id != Some(request_id)
+            || state.close_confirmation_in_progress
+            || state.shutdown_requested
+        {
+            return Err(StateError::CommandConflict);
+        }
+        state.pending_close_request_id = None;
+        Ok(())
+    }
+
+    pub fn confirm_window_close(&self, request_id: u64) -> Result<(), StateError> {
+        {
+            let mut state = self.lock()?;
+            if state.pending_close_request_id != Some(request_id)
+                || state.close_confirmation_in_progress
+            {
+                return Err(StateError::CommandConflict);
+            }
+            state.close_confirmation_in_progress = true;
+        }
+        if let Err(error) = self.shutdown() {
+            self.lock()?.close_confirmation_in_progress = false;
+            return Err(error);
+        }
+        let mut state = self.lock()?;
+        state.close_confirmation_in_progress = false;
+        if state.pending_close_request_id == Some(request_id) {
+            state.pending_close_request_id = None;
+        }
+        Ok(())
+    }
+
+    fn stop_runtime(&self, join_existing: bool) -> Result<AppSnapshot, StateError> {
         let (response, result) = mpsc::channel();
         {
             let mut state = self.lock()?;
-            if !matches!(state.lifecycle.process(), ProcessPresence::Running)
-                || matches!(state.lifecycle.status(), LifecycleStatus::Disconnecting)
-            {
+            if state.lifecycle.process() == ProcessPresence::Absent {
+                return if join_existing {
+                    Ok(state.snapshot())
+                } else {
+                    Err(StateError::CommandConflict)
+                };
+            }
+            if state.lifecycle.status() == LifecycleStatus::Disconnecting {
+                if join_existing {
+                    drop(state);
+                    return self.wait_for_shutdown();
+                }
                 return Err(StateError::CommandConflict);
             }
             let control = state
@@ -696,11 +865,27 @@ impl AppState {
         result.recv().map_err(|_| StateError::Unavailable)?
     }
 
+    fn wait_for_shutdown(&self) -> Result<AppSnapshot, StateError> {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let snapshot = self.snapshot()?;
+            if snapshot.lifecycle.settings_editable {
+                return Ok(snapshot);
+            }
+            if Instant::now() >= deadline {
+                return Err(StateError::Unavailable);
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     fn fail_connect(&self, session_id: u64, error: StateError) -> StateError {
         if let Ok(mut state) = self.lock()
             && state.latest_session_id == Some(session_id)
             && state.lifecycle.fail_launch().is_ok()
         {
+            state.pending_close_request_id = None;
+            state.close_confirmation_in_progress = false;
             state.advance_revision();
             let event = state.lifecycle_event(Some(session_id));
             state.publish(event);
@@ -717,6 +902,8 @@ impl AppState {
         {
             state.active_session = None;
             let _ = state.lifecycle.observe_process_exit(None);
+            state.pending_close_request_id = None;
+            state.close_confirmation_in_progress = false;
             state.advance_revision();
             let event = state.lifecycle_event(Some(session_id));
             state.publish(event);
@@ -746,6 +933,7 @@ fn coordinate_runtime(
                     }
                     Ok(None) => break,
                     Err(error) => {
+                        drop(process);
                         let _ = response.send(Err(fail_runtime(&inner, session_id, error)));
                         return;
                     }
@@ -757,7 +945,10 @@ fn coordinate_runtime(
                         apply_supervisor_event(&inner, session_id, SupervisorEvent::Exited(exit))
                     })
                     .ok_or(StateError::Unavailable),
-                Err(error) => Err(fail_runtime(&inner, session_id, error)),
+                Err(error) => {
+                    drop(process);
+                    Err(fail_runtime(&inner, session_id, error))
+                }
             };
             let _ = response.send(response_result);
             return;
@@ -776,6 +967,7 @@ fn coordinate_runtime(
             }
             Ok(None) => {}
             Err(error) => {
+                drop(process);
                 fail_runtime(&inner, session_id, error);
                 return;
             }
@@ -832,6 +1024,8 @@ fn apply_supervisor_event(
             let _ = state
                 .lifecycle
                 .observe_process_exit_requested(Some(exit.code), exit.requested);
+            state.pending_close_request_id = None;
+            state.close_confirmation_in_progress = false;
             state.advance_revision();
             state.lifecycle_event(Some(session_id))
         }
@@ -849,6 +1043,8 @@ fn fail_runtime(inner: &Mutex<StateData>, session_id: u64, error: ProcessError) 
     {
         state.active_session = None;
         let _ = state.lifecycle.observe_process_exit(None);
+        state.pending_close_request_id = None;
+        state.close_confirmation_in_progress = false;
         state.advance_revision();
         let event = state.lifecycle_event(Some(session_id));
         state.publish(event);
@@ -1232,6 +1428,207 @@ mod tests {
             snapshot.lifecycle.failure,
             Some(FailureReason::UnexpectedExit { code: Some(41) })
         );
+    }
+
+    #[test]
+    fn window_close_requires_confirmation_only_while_state_is_locked() {
+        let directory = TestDirectory::new();
+        let factory = Arc::new(FakeRuntimeFactory::default());
+        let disconnected = runtime_state(&directory, vec![valid_interface()], Arc::clone(&factory));
+
+        assert_eq!(
+            disconnected.request_window_close().unwrap(),
+            WindowCloseDecision::Allow
+        );
+        assert!(matches!(
+            disconnected.connect(),
+            Err(StateError::CommandConflict)
+        ));
+
+        let second_directory = TestDirectory::new();
+        let state = runtime_state(
+            &second_directory,
+            vec![valid_interface()],
+            Arc::clone(&factory),
+        );
+        state
+            .create_profile(draft("Existing", "existing-key"))
+            .unwrap();
+        state.connect().unwrap();
+        let received = Arc::new(Mutex::new(Vec::<WindowCloseRequest>::new()));
+        let target = Arc::clone(&received);
+        state
+            .subscribe_window_close_requests(Channel::new(move |body: InvokeResponseBody| {
+                target.lock().unwrap().push(body.deserialize().unwrap());
+                Ok(())
+            }))
+            .unwrap();
+
+        let first = state.request_window_close().unwrap();
+        let repeated = state.request_window_close().unwrap();
+        assert_eq!(first, repeated);
+        let WindowCloseDecision::Confirm(request) = first else {
+            panic!("a running process must require close confirmation");
+        };
+        assert_eq!(request.request_id, 1);
+        assert_eq!(request.lifecycle.process, ProcessPresence::Running);
+        assert_eq!(received.lock().unwrap().as_slice(), &[request, request]);
+
+        state.cancel_window_close(request.request_id).unwrap();
+        assert!(matches!(
+            state.cancel_window_close(request.request_id),
+            Err(StateError::CommandConflict)
+        ));
+        let WindowCloseDecision::Confirm(retried) = state.request_window_close().unwrap() else {
+            panic!("a running process must require close confirmation");
+        };
+        assert_eq!(retried.request_id, 2);
+        assert!(matches!(
+            state.confirm_window_close(request.request_id),
+            Err(StateError::CommandConflict)
+        ));
+
+        state.confirm_window_close(retried.request_id).unwrap();
+        assert_eq!(factory.disconnects.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            state.snapshot().unwrap().lifecycle.process,
+            ProcessPresence::Absent
+        );
+        assert_eq!(
+            state.request_window_close().unwrap(),
+            WindowCloseDecision::Allow
+        );
+    }
+
+    #[test]
+    fn window_close_without_a_subscriber_falls_back_to_supervised_shutdown() {
+        let directory = TestDirectory::new();
+        let factory = Arc::new(FakeRuntimeFactory::default());
+        let state = runtime_state(&directory, vec![valid_interface()], Arc::clone(&factory));
+        state
+            .create_profile(draft("Existing", "existing-key"))
+            .unwrap();
+        state.connect().unwrap();
+
+        assert_eq!(
+            state.request_window_close().unwrap(),
+            WindowCloseDecision::Shutdown
+        );
+        assert!(matches!(state.connect(), Err(StateError::CommandConflict)));
+        state.shutdown().unwrap();
+        assert_eq!(factory.disconnects.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn application_exit_atomically_prevents_a_later_connect() {
+        let directory = TestDirectory::new();
+        let factory = Arc::new(FakeRuntimeFactory::default());
+        let state = runtime_state(&directory, vec![valid_interface()], Arc::clone(&factory));
+
+        assert_eq!(
+            state.begin_application_exit().unwrap(),
+            ApplicationExitDecision::Allow
+        );
+        assert!(matches!(state.connect(), Err(StateError::CommandConflict)));
+    }
+
+    #[test]
+    fn irreversible_application_exit_rejects_a_pending_close_cancellation() {
+        let directory = TestDirectory::new();
+        let factory = Arc::new(FakeRuntimeFactory::default());
+        let state = runtime_state(&directory, vec![valid_interface()], Arc::clone(&factory));
+        state
+            .create_profile(draft("Existing", "existing-key"))
+            .unwrap();
+        state.connect().unwrap();
+        state
+            .subscribe_window_close_requests(Channel::new(|_: InvokeResponseBody| Ok(())))
+            .unwrap();
+        let WindowCloseDecision::Confirm(request) = state.request_window_close().unwrap() else {
+            panic!("a running process must require close confirmation");
+        };
+
+        assert_eq!(
+            state.begin_application_exit().unwrap(),
+            ApplicationExitDecision::Shutdown
+        );
+        assert!(matches!(
+            state.cancel_window_close(request.request_id),
+            Err(StateError::CommandConflict)
+        ));
+        assert_eq!(
+            state.request_window_close().unwrap(),
+            WindowCloseDecision::Shutdown
+        );
+        state.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_joins_an_in_progress_disconnect() {
+        let directory = TestDirectory::new();
+        let factory = Arc::new(FakeRuntimeFactory::default());
+        let state = runtime_state(&directory, vec![valid_interface()], Arc::clone(&factory));
+        state
+            .create_profile(draft("Existing", "existing-key"))
+            .unwrap();
+        state.connect().unwrap();
+        {
+            let mut data = state.lock().unwrap();
+            data.lifecycle.begin_disconnect().unwrap();
+        }
+        let state_for_exit = state.clone();
+        let waiter = thread::spawn(move || state_for_exit.shutdown().unwrap());
+
+        factory.send(
+            0,
+            SupervisorEvent::Exited(ProcessTreeExit {
+                code: 0,
+                requested: true,
+            }),
+        );
+        let snapshot = waiter.join().unwrap();
+
+        assert_eq!(snapshot.lifecycle.status, LifecycleStatus::Disconnected);
+        assert_eq!(snapshot.lifecycle.process, ProcessPresence::Absent);
+        assert_eq!(factory.disconnects.load(Ordering::SeqCst), 0);
+        assert!(matches!(state.connect(), Err(StateError::CommandConflict)));
+    }
+
+    #[test]
+    fn natural_exit_invalidates_a_pending_close_confirmation() {
+        let directory = TestDirectory::new();
+        let factory = Arc::new(FakeRuntimeFactory::default());
+        let state = runtime_state(&directory, vec![valid_interface()], Arc::clone(&factory));
+        state
+            .create_profile(draft("Existing", "existing-key"))
+            .unwrap();
+        state.connect().unwrap();
+        state
+            .subscribe_window_close_requests(Channel::new(|_: InvokeResponseBody| Ok(())))
+            .unwrap();
+        let WindowCloseDecision::Confirm(request) = state.request_window_close().unwrap() else {
+            panic!("a running process must require close confirmation");
+        };
+
+        factory.send(
+            0,
+            SupervisorEvent::Exited(ProcessTreeExit {
+                code: 12,
+                requested: false,
+            }),
+        );
+        wait_for_snapshot(&state, |snapshot| {
+            snapshot.lifecycle.process == ProcessPresence::Absent
+        });
+
+        assert_eq!(
+            state.request_window_close().unwrap(),
+            WindowCloseDecision::Allow
+        );
+        assert!(matches!(
+            state.confirm_window_close(request.request_id),
+            Err(StateError::CommandConflict)
+        ));
     }
 
     #[test]

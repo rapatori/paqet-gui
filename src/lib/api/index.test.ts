@@ -5,12 +5,16 @@ import errorFixture from '../../../src-tauri/tests/fixtures/ipc/error-profile-va
 import bootstrapFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-bootstrap.json';
 import gapFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-gap.json';
 import outputFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-output.json';
+import closeRequestFixture from '../../../src-tauri/tests/fixtures/ipc/window-close-request.json';
 import {
   connect,
+  cancelWindowClose,
+  confirmWindowClose,
   createProfile,
   deleteProfile,
   disconnect,
   getAppSnapshot,
+  onWindowCloseRequested,
   refreshInterfaces,
   replaceAdvancedSettings,
   selectInterface,
@@ -23,6 +27,7 @@ import type {
   IpcError,
   ProfileDraft,
   RuntimeEvent,
+  WindowCloseRequest,
 } from './types';
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -48,7 +53,7 @@ beforeEach(() => {
   invokeMock.mockResolvedValue(snapshot);
 });
 
-describe('disconnected Tauri API', () => {
+describe('Tauri API', () => {
   it('uses the exact allowlisted command and argument envelopes', async () => {
     await getAppSnapshot();
     await createProfile(draft);
@@ -62,6 +67,13 @@ describe('disconnected Tauri API', () => {
     await disconnect();
     const onEvent = vi.fn();
     await subscribeRuntimeEvents(onEvent);
+    const channel = (
+      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    ).onEvent as Channel<RuntimeEvent>;
+    await cancelWindowClose('9');
+    await confirmWindowClose('9');
+    const onCloseRequest = vi.fn();
+    await onWindowCloseRequested(onCloseRequest);
 
     expect(invokeMock.mock.calls).toEqual([
       ['get_app_snapshot'],
@@ -78,12 +90,56 @@ describe('disconnected Tauri API', () => {
         'subscribe_runtime_events',
         { onEvent: expect.any(Channel) as Channel<RuntimeEvent> },
       ],
+      ['cancel_window_close', { requestId: '9' }],
+      ['confirm_window_close', { requestId: '9' }],
+      [
+        'subscribe_window_close_requests',
+        { onRequest: expect.any(Channel) as Channel<WindowCloseRequest> },
+      ],
     ]);
-    const channel = (
-      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
-    ).onEvent as Channel<RuntimeEvent>;
     channel.onmessage(outputFixture as RuntimeEvent);
     expect(onEvent).toHaveBeenCalledWith(outputFixture);
+  });
+
+  it('subscribes to the backend close-confirmation event payload', async () => {
+    const onRequest = vi.fn();
+    await onWindowCloseRequested(onRequest);
+    const channel = (
+      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    ).onRequest as Channel<WindowCloseRequest>;
+    const closeRequest = closeRequestFixture as WindowCloseRequest;
+    channel.onmessage(closeRequest);
+
+    expect(onRequest).toHaveBeenCalledWith(closeRequest);
+    expect(closeRequest).toEqual({
+      requestId: '9',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+  });
+
+  it('ignores in-flight close requests from a replaced subscription', async () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    await onWindowCloseRequested(first);
+    const firstChannel = (
+      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    ).onRequest as Channel<WindowCloseRequest>;
+    await onWindowCloseRequested(second);
+    const secondChannel = (
+      invokeMock.mock.calls.at(-1)?.[1] as Record<string, unknown>
+    ).onRequest as Channel<WindowCloseRequest>;
+    const closeRequest = closeRequestFixture as WindowCloseRequest;
+
+    firstChannel.onmessage(closeRequest);
+    secondChannel.onmessage(closeRequest);
+
+    expect(first).not.toHaveBeenCalled();
+    expect(second).toHaveBeenCalledWith(closeRequest);
   });
 
   it('pins representative snapshot details shared with Rust', () => {

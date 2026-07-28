@@ -155,6 +155,11 @@ export interface AppSnapshot {
   lifecycle: LifecycleSnapshot;
 }
 
+export interface WindowCloseRequest {
+  requestId: string;
+  lifecycle: LifecycleSnapshot;
+}
+
 export type ProfileFieldName = 'name' | 'serverHost' | 'port' | 'encryptionKey';
 export type ValidationIssue =
   | 'required'

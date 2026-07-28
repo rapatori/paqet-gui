@@ -5,11 +5,13 @@ import type {
   ProfileDraft,
   ProfileId,
   RuntimeEvent,
+  WindowCloseRequest,
 } from './types';
 
 export type * from './types';
 
 let runtimeSubscriptionGeneration = 0;
+let closeSubscriptionGeneration = 0;
 
 export function getAppSnapshot(): Promise<AppSnapshot> {
   return invoke<AppSnapshot>('get_app_snapshot');
@@ -66,4 +68,26 @@ export function subscribeRuntimeEvents(
     }
   });
   return invoke<void>('subscribe_runtime_events', { onEvent: channel });
+}
+
+export function onWindowCloseRequested(
+  onRequest: (request: WindowCloseRequest) => void,
+): Promise<void> {
+  const generation = ++closeSubscriptionGeneration;
+  const channel = new Channel<WindowCloseRequest>((request) => {
+    if (generation === closeSubscriptionGeneration) {
+      onRequest(request);
+    }
+  });
+  return invoke<void>('subscribe_window_close_requests', {
+    onRequest: channel,
+  });
+}
+
+export function cancelWindowClose(requestId: string): Promise<void> {
+  return invoke<void>('cancel_window_close', { requestId });
+}
+
+export function confirmWindowClose(requestId: string): Promise<void> {
+  return invoke<void>('confirm_window_close', { requestId });
 }

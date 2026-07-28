@@ -1,6 +1,6 @@
 use paqet_gui_lib::{
     ipc::IpcError,
-    state::{AppSnapshot, RuntimeEvent},
+    state::{AppSnapshot, RuntimeEvent, WindowCloseRequest},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -11,6 +11,7 @@ const CONFIG_ERROR_FIXTURE: &str = include_str!("fixtures/ipc/error-config-valid
 const RUNTIME_BOOTSTRAP_FIXTURE: &str = include_str!("fixtures/ipc/runtime-bootstrap.json");
 const RUNTIME_OUTPUT_FIXTURE: &str = include_str!("fixtures/ipc/runtime-output.json");
 const RUNTIME_GAP_FIXTURE: &str = include_str!("fixtures/ipc/runtime-gap.json");
+const WINDOW_CLOSE_REQUEST_FIXTURE: &str = include_str!("fixtures/ipc/window-close-request.json");
 
 #[test]
 fn representative_snapshot_matches_the_rust_wire_contract() {
@@ -41,6 +42,11 @@ fn representative_runtime_events_match_the_rust_wire_contract() {
     ] {
         assert_typed_round_trip::<RuntimeEvent>(fixture);
     }
+}
+
+#[test]
+fn representative_window_close_request_matches_the_rust_wire_contract() {
+    assert_typed_round_trip::<WindowCloseRequest>(WINDOW_CLOSE_REQUEST_FIXTURE);
 }
 
 fn assert_typed_round_trip<T>(fixture: &str)

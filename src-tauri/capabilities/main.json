@@ -15,6 +15,9 @@
     "allow-replace-advanced-settings",
     "allow-connect",
     "allow-disconnect",
-    "allow-subscribe-runtime-events"
+    "allow-subscribe-runtime-events",
+    "allow-subscribe-window-close-requests",
+    "allow-cancel-window-close",
+    "allow-confirm-window-close"
   ]
 }

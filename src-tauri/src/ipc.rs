@@ -1,12 +1,12 @@
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use tauri::{State, ipc::Channel};
+use tauri::{State, Window, ipc::Channel};
 
 use crate::{
     config::{AdvancedSettings, ConfigError, ConfigField, ConfigValidationKind},
     profiles::{ProfileDraft, ProfileError, ProfileField, ProfileId, ValidationKind},
-    state::{AppSnapshot, AppState, RuntimeEvent, StateError},
+    state::{AppSnapshot, AppState, RuntimeEvent, StateError, WindowCloseRequest},
 };
 
 pub type ManagedAppState = Result<AppState, IpcError>;
@@ -326,6 +326,47 @@ pub fn subscribe_runtime_events(
         .map_err(Into::into)
 }
 
+#[tauri::command]
+pub fn cancel_window_close(
+    state: State<'_, ManagedAppState>,
+    request_id: String,
+) -> Result<(), IpcError> {
+    app_state(&state)?
+        .cancel_window_close(parse_request_id(&request_id)?)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn subscribe_window_close_requests(
+    state: State<'_, ManagedAppState>,
+    on_request: Channel<WindowCloseRequest>,
+) -> Result<(), IpcError> {
+    app_state(&state)?
+        .subscribe_window_close_requests(on_request)
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn confirm_window_close(
+    state: State<'_, ManagedAppState>,
+    window: Window,
+    request_id: String,
+) -> Result<(), IpcError> {
+    if window.label() != "main" {
+        return Err(IpcError::CommandConflict);
+    }
+    let request_id = parse_request_id(&request_id)?;
+    let state = app_state(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || state.confirm_window_close(request_id))
+        .await
+        .map_err(|_| IpcError::StateUnavailable)??;
+    window.destroy().map_err(|_| IpcError::StateUnavailable)
+}
+
+fn parse_request_id(request_id: &str) -> Result<u64, IpcError> {
+    request_id.parse().map_err(|_| IpcError::CommandConflict)
+}
+
 fn app_state<'a>(state: &'a State<'_, ManagedAppState>) -> Result<&'a AppState, IpcError> {
     state.as_ref().map_err(Clone::clone)
 }
@@ -425,5 +466,14 @@ mod tests {
             serde_json::to_string(&process).unwrap(),
             r#"{"kind":"processLaunch"}"#
         );
+    }
+
+    #[test]
+    fn close_request_ids_require_decimal_u64_strings() {
+        assert_eq!(parse_request_id("18446744073709551615"), Ok(u64::MAX));
+        assert_eq!(parse_request_id("9"), Ok(9));
+        assert_eq!(parse_request_id("9.0"), Err(IpcError::CommandConflict));
+        assert_eq!(parse_request_id("-1"), Err(IpcError::CommandConflict));
+        assert_eq!(parse_request_id(""), Err(IpcError::CommandConflict));
     }
 }

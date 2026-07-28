@@ -1,0 +1,9 @@
+{
+  "requestId": "9",
+  "lifecycle": {
+    "status": "connected",
+    "process": "running",
+    "failure": null,
+    "settingsEditable": false
+  }
+}
