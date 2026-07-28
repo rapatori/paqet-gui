@@ -2,8 +2,10 @@
   import { onMount, tick } from 'svelte';
   import * as tauriApi from './lib/api';
   import type {
+    AdvancedSettings,
     AppSnapshot,
     IpcError,
+    LogLevel,
     NetworkInterface,
     Profile,
     ProfileDraft,
@@ -19,10 +21,22 @@
     selectProfile(id: ProfileId): Promise<AppSnapshot>;
     refreshInterfaces(): Promise<AppSnapshot>;
     selectInterface(guid: string): Promise<AppSnapshot>;
+    replaceAdvancedSettings(settings: AdvancedSettings): Promise<AppSnapshot>;
   }
 
   type EditorMode = 'view' | 'create' | 'edit';
   type InterfaceOperation = 'refresh' | 'select' | null;
+  type CommonSettingField =
+    | 'logLevel'
+    | 'pcapSocketBuffer'
+    | 'localTcpFlags'
+    | 'remoteTcpFlags'
+    | 'connectionCount'
+    | 'tcpBuffer'
+    | 'udpBuffer';
+  type CommonTextField = Exclude<CommonSettingField, 'logLevel'>;
+  type CommonDraft = Record<CommonTextField, string>;
+  type CommonErrors = Partial<Record<CommonTextField, string>>;
   type ProfileInput = Omit<ProfileDraft, 'port'> & { port: string };
   type FieldErrors = Partial<Record<ProfileFieldName, string>>;
   type DialogState =
@@ -42,6 +56,13 @@
   let saving = $state(false);
   let interfaceOperation = $state<InterfaceOperation>(null);
   let interfaceMessage = $state('');
+  let settingsOperation = $state<CommonSettingField | null>(null);
+  let settingsMessage = $state('');
+  let commonDraft = $state<CommonDraft>(defaultCommonDraft());
+  let commonErrors = $state<CommonErrors>({});
+  let commonDraftVersions = $state<Record<CommonTextField, number>>(
+    initialCommonDraftVersions(),
+  );
   let revealKey = $state(false);
   let advancedExpanded = $state(false);
   let dialog = $state<DialogState>(null);
@@ -50,11 +71,15 @@
   let serverHostInput = $state<HTMLInputElement>();
   let portInput = $state<HTMLInputElement>();
   let encryptionKeyInput = $state<HTMLInputElement>();
+  let commonFieldInputs: Partial<Record<CommonTextField, HTMLInputElement>> =
+    {};
   let dialogPrimaryButton = $state<HTMLButtonElement>();
   let dialogElement = $state<HTMLDivElement>();
   let profileSelect = $state<HTMLSelectElement>();
   let newProfileButton = $state<HTMLButtonElement>();
   let dialogInvoker: HTMLElement | null = null;
+  let mutationIdleResolvers: Array<() => void> = [];
+  let settingsQueue = Promise.resolve();
 
   const selectedProfile = $derived(snapshot?.selectedProfile ?? null);
   const selectedInterface = $derived(
@@ -68,7 +93,8 @@
   );
   const editorOpen = $derived(editorMode !== 'view');
   const interfaceBusy = $derived(interfaceOperation !== null);
-  const mutationBusy = $derived(saving || interfaceBusy);
+  const settingsBusy = $derived(settingsOperation !== null);
+  const mutationBusy = $derived(saving || interfaceBusy || settingsBusy);
   const draftChanged = $derived(
     editorMode === 'create'
       ? Object.values(draft).some((value) => value.length > 0)
@@ -86,6 +112,28 @@
 
   function emptyProfileInput(): ProfileInput {
     return { name: '', serverHost: '', port: '', encryptionKey: '' };
+  }
+
+  function defaultCommonDraft(): CommonDraft {
+    return {
+      pcapSocketBuffer: '4194304',
+      localTcpFlags: 'PA',
+      remoteTcpFlags: 'PA',
+      connectionCount: '1',
+      tcpBuffer: '8192',
+      udpBuffer: '4096',
+    };
+  }
+
+  function initialCommonDraftVersions(): Record<CommonTextField, number> {
+    return {
+      pcapSocketBuffer: 0,
+      localTcpFlags: 0,
+      remoteTcpFlags: 0,
+      connectionCount: 0,
+      tcpBuffer: 0,
+      udpBuffer: 0,
+    };
   }
 
   function profileInput(profile: Profile): ProfileInput {
@@ -110,7 +158,7 @@
     loading = true;
     message = '';
     try {
-      applySnapshot(await api.getAppSnapshot(), true);
+      applySnapshot(await api.getAppSnapshot(), true, 'all');
     } catch {
       message =
         'The application state could not be loaded. Restart paqet and try again.';
@@ -122,6 +170,7 @@
   function applySnapshot(
     nextSnapshot: AppSnapshot,
     resetProfileEditor = false,
+    commonFieldToSync: CommonSettingField | 'all' | null = null,
   ): boolean {
     if (snapshot && BigInt(nextSnapshot.revision) < BigInt(snapshot.revision)) {
       return false;
@@ -136,7 +185,39 @@
         ? profileInput(nextSnapshot.selectedProfile)
         : emptyProfileInput();
     }
+    if (commonFieldToSync) {
+      syncCommonDraft(nextSnapshot.advancedSettings, commonFieldToSync);
+    }
     return true;
+  }
+
+  function syncCommonDraft(
+    settings: AdvancedSettings,
+    field: CommonSettingField | 'all',
+  ): void {
+    const defaults = defaultCommonDraft();
+    const canonicalDraft: CommonDraft = {
+      pcapSocketBuffer: String(
+        settings.pcapSocketBuffer ?? defaults.pcapSocketBuffer,
+      ),
+      localTcpFlags:
+        settings.localTcpFlags?.join(', ') ?? defaults.localTcpFlags,
+      remoteTcpFlags:
+        settings.remoteTcpFlags?.join(', ') ?? defaults.remoteTcpFlags,
+      connectionCount: String(
+        settings.connectionCount ?? defaults.connectionCount,
+      ),
+      tcpBuffer: settings.tcpBuffer ?? defaults.tcpBuffer,
+      udpBuffer: settings.udpBuffer ?? defaults.udpBuffer,
+    };
+    if (field === 'all') {
+      commonDraft = canonicalDraft;
+      commonErrors = {};
+      commonDraftVersions = initialCommonDraftVersions();
+    } else if (field !== 'logLevel') {
+      commonDraft[field] = canonicalDraft[field];
+      delete commonErrors[field];
+    }
   }
 
   function beginCreate(): void {
@@ -201,6 +282,7 @@
       message = 'The selected profile could not be opened.';
     } finally {
       saving = false;
+      resolveMutationIdle();
     }
   }
 
@@ -241,10 +323,12 @@
       applySnapshot(nextSnapshot, true);
     } catch (error) {
       saving = false;
+      resolveMutationIdle();
       await presentProfileError(error);
       return;
     }
     saving = false;
+    resolveMutationIdle();
   }
 
   async function presentProfileError(error: unknown): Promise<void> {
@@ -277,6 +361,9 @@
     dialogInvoker = null;
     if (!action) return;
 
+    await waitForMutationIdle();
+    if (!settingsEditable) return;
+
     if (action.kind === 'discardSelection') {
       cancelEdit();
       await selectProfile(action.profileId);
@@ -298,6 +385,7 @@
       message = `The profile “${action.profile.name}” could not be deleted.`;
     } finally {
       saving = false;
+      resolveMutationIdle();
     }
     await tick();
     (snapshot?.selectedProfile ? profileSelect : newProfileButton)?.focus();
@@ -504,6 +592,7 @@
       presentInterfaceError(error);
     } finally {
       interfaceOperation = null;
+      resolveMutationIdle();
     }
   }
 
@@ -527,6 +616,294 @@
 
   function interfaceOptionLabel(networkInterface: NetworkInterface): string {
     return `${networkInterface.friendlyName} · ${networkInterface.localAddress}`;
+  }
+
+  async function toggleCommonOverride(
+    field: CommonSettingField,
+    enabled: boolean,
+  ): Promise<void> {
+    await queueSettingsMutation(async () => {
+      if (!snapshot || !settingsEditable) return;
+      if (!enabled) {
+        await replaceCommonSetting(field, null);
+        return;
+      }
+
+      if (field === 'logLevel') {
+        await replaceCommonSetting(field, 'info');
+        return;
+      }
+
+      const parsed = parseCommonDraft(field, commonDraft[field]);
+      if (typeof parsed === 'string') {
+        commonErrors[field] = parsed;
+        await focusCommonField(field);
+        return;
+      }
+      delete commonErrors[field];
+      await replaceCommonSetting(field, parsed.value);
+    });
+  }
+
+  async function selectLogLevel(event: Event): Promise<void> {
+    const select = event.currentTarget as HTMLSelectElement;
+    const value = select.value as LogLevel;
+    select.value = snapshot?.advancedSettings.logLevel ?? 'info';
+    await queueSettingsMutation(() => replaceCommonSetting('logLevel', value));
+  }
+
+  function scheduleCommonDraftCommit(field: CommonTextField): void {
+    window.setTimeout(() => void commitCommonDraft(field), 0);
+  }
+
+  async function commitCommonDraft(field: CommonTextField): Promise<void> {
+    const input = commonDraft[field];
+    const draftVersion = commonDraftVersions[field];
+    await queueSettingsMutation(async () => {
+      if (
+        !snapshot ||
+        !settingsEditable ||
+        snapshot.advancedSettings[field] === null
+      ) {
+        return;
+      }
+
+      const parsed = parseCommonDraft(field, input);
+      if (typeof parsed === 'string') {
+        commonErrors[field] = parsed;
+        return;
+      }
+      delete commonErrors[field];
+      if (
+        commonSettingMatches(snapshot.advancedSettings[field], parsed.value)
+      ) {
+        if (commonDraftVersions[field] === draftVersion) {
+          commonDraft[field] = parsed.normalized;
+        }
+        return;
+      }
+      await replaceCommonSetting(field, parsed.value, draftVersion);
+    });
+  }
+
+  function handleCommonInput(field: CommonTextField): void {
+    commonDraftVersions[field] += 1;
+    delete commonErrors[field];
+    settingsMessage = '';
+  }
+
+  function handleCommonKeydown(event: KeyboardEvent): void {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    (event.currentTarget as HTMLInputElement).blur();
+  }
+
+  async function replaceCommonSetting(
+    field: CommonSettingField,
+    value: AdvancedSettings[CommonSettingField],
+    draftVersion?: number,
+  ): Promise<void> {
+    if (
+      !snapshot ||
+      !settingsEditable ||
+      saving ||
+      interfaceBusy ||
+      settingsBusy
+    ) {
+      return;
+    }
+    settingsOperation = field;
+    settingsMessage = '';
+    try {
+      applySnapshot(
+        await api.replaceAdvancedSettings({
+          ...snapshot.advancedSettings,
+          [field]: value,
+        }),
+        false,
+        draftVersion === undefined ||
+          (field !== 'logLevel' && commonDraftVersions[field] === draftVersion)
+          ? field
+          : null,
+      );
+    } catch (error) {
+      await presentSettingsError(error, field);
+    } finally {
+      settingsOperation = null;
+      resolveMutationIdle();
+    }
+  }
+
+  async function presentSettingsError(
+    error: unknown,
+    attemptedField: CommonSettingField,
+  ): Promise<void> {
+    if (
+      isIpcError(error) &&
+      error.kind === 'configValidation' &&
+      isCommonTextField(error.field)
+    ) {
+      commonErrors[error.field] = commonValidationMessage(error.field);
+      await focusCommonField(error.field);
+      return;
+    }
+    settingsMessage =
+      isIpcError(error) && error.kind === 'settingsLocked'
+        ? 'Advanced settings are locked while paqet is active.'
+        : `The ${commonSettingLabel(attemptedField)} override could not be updated.`;
+  }
+
+  function parseCommonDraft(
+    field: CommonTextField,
+    input: string,
+  ): string | { value: number | string | string[]; normalized: string } {
+    const value = input.trim();
+    if (field === 'localTcpFlags' || field === 'remoteTcpFlags') {
+      const combinations = value
+        .split(',')
+        .map((combination) => combination.trim());
+      if (
+        combinations.length === 0 ||
+        combinations.length > 64 ||
+        combinations.some((combination) => !/^[FSRPAUECN]+$/.test(combination))
+      ) {
+        return 'Enter 1–64 comma-separated uppercase combinations using F S R P A U E C N.';
+      }
+      return { value: combinations, normalized: combinations.join(', ') };
+    }
+
+    if (!/^\d+$/.test(value)) {
+      return 'Enter a whole number using decimal digits.';
+    }
+    const parsed = BigInt(value);
+    const [minimum, maximum] = commonRange(field);
+    if (parsed < minimum || parsed > maximum) {
+      return commonValidationMessage(field);
+    }
+    return {
+      value:
+        field === 'pcapSocketBuffer' || field === 'connectionCount'
+          ? Number(parsed)
+          : parsed.toString(),
+      normalized: parsed.toString(),
+    };
+  }
+
+  function commonRange(
+    field: Exclude<CommonTextField, 'localTcpFlags' | 'remoteTcpFlags'>,
+  ): [bigint, bigint] {
+    if (field === 'pcapSocketBuffer') return [1024n, 104857600n];
+    if (field === 'connectionCount') return [1n, 256n];
+    if (field === 'tcpBuffer') return [4096n, 9223372036854775807n];
+    return [2048n, 9223372036854775807n];
+  }
+
+  function commonValidationMessage(field: CommonTextField): string {
+    if (field === 'pcapSocketBuffer') {
+      return 'PCAP socket buffer must be between 1024 and 104857600 bytes.';
+    }
+    if (field === 'connectionCount') {
+      return 'Connection count must be between 1 and 256.';
+    }
+    if (field === 'tcpBuffer') {
+      return 'TCP buffer must be between 4096 and 9223372036854775807 bytes.';
+    }
+    if (field === 'udpBuffer') {
+      return 'UDP buffer must be between 2048 and 9223372036854775807 bytes.';
+    }
+    return 'Enter 1–64 comma-separated uppercase combinations using F S R P A U E C N.';
+  }
+
+  function commonSettingMatches(
+    current: AdvancedSettings[CommonTextField],
+    next: number | string | string[],
+  ): boolean {
+    return Array.isArray(current) && Array.isArray(next)
+      ? current.length === next.length &&
+          current.every((value, index) => value === next[index])
+      : current === next;
+  }
+
+  function isCommonTextField(field: string): field is CommonTextField {
+    return commonTextFields.includes(field as CommonTextField);
+  }
+
+  const commonTextFields: CommonTextField[] = [
+    'pcapSocketBuffer',
+    'localTcpFlags',
+    'remoteTcpFlags',
+    'connectionCount',
+    'tcpBuffer',
+    'udpBuffer',
+  ];
+
+  const flagFields = ['localTcpFlags', 'remoteTcpFlags'] as const;
+  const numericFields = [
+    {
+      field: 'connectionCount' as const,
+      title: 'connection count',
+      label: 'Connection count',
+      defaultValue: '1',
+      hint: '1–256 connections',
+    },
+    {
+      field: 'tcpBuffer' as const,
+      title: 'TCP buffer',
+      label: 'TCP buffer',
+      defaultValue: '8192 bytes',
+      hint: '4096–9223372036854775807 bytes',
+    },
+    {
+      field: 'udpBuffer' as const,
+      title: 'UDP buffer',
+      label: 'UDP buffer',
+      defaultValue: '4096 bytes',
+      hint: '2048–9223372036854775807 bytes',
+    },
+  ];
+
+  function commonSettingLabel(field: CommonSettingField): string {
+    const labels: Record<CommonSettingField, string> = {
+      logLevel: 'log level',
+      pcapSocketBuffer: 'PCAP socket buffer',
+      localTcpFlags: 'local TCP flags',
+      remoteTcpFlags: 'remote TCP flags',
+      connectionCount: 'connection count',
+      tcpBuffer: 'TCP buffer',
+      udpBuffer: 'UDP buffer',
+    };
+    return labels[field];
+  }
+
+  async function focusCommonField(field: CommonTextField): Promise<void> {
+    await tick();
+    commonFieldInputs[field]?.focus();
+  }
+
+  function waitForMutationIdle(): Promise<void> {
+    return mutationBusy
+      ? new Promise((resolve) => mutationIdleResolvers.push(resolve))
+      : Promise.resolve();
+  }
+
+  function queueSettingsMutation(
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const queued = settingsQueue.then(async () => {
+      await waitForMutationIdle();
+      await operation();
+    });
+    settingsQueue = queued.catch(() => undefined);
+    return queued;
+  }
+
+  function resolveMutationIdle(): void {
+    if (saving || interfaceOperation !== null || settingsOperation !== null) {
+      return;
+    }
+    const resolvers = mutationIdleResolvers;
+    mutationIdleResolvers = [];
+    for (const resolve of resolvers) resolve();
   }
 </script>
 
@@ -897,10 +1274,247 @@
                   <span>Connect Ethernet or Wi-Fi, then refresh the list.</span>
                 </div>
               {/if}
+            </section>
 
-              <div class="override-preview" aria-labelledby="override-heading">
-                <h3 id="override-heading">Paqet overrides</h3>
-                <p>Optional override controls are not configured yet.</p>
+            <section
+              class="override-section"
+              aria-labelledby="override-heading"
+            >
+              <div class="advanced-section-heading">
+                <div>
+                  <h3 id="override-heading">Common overrides</h3>
+                  <p>
+                    Optional values replace paqet defaults for this session.
+                  </p>
+                </div>
+              </div>
+
+              {#if settingsOperation}
+                <p class="settings-progress" role="status" aria-live="polite">
+                  Updating {commonSettingLabel(settingsOperation)}…
+                </p>
+              {/if}
+              {#if settingsMessage}
+                <p class="inline-message" role="alert">{settingsMessage}</p>
+              {/if}
+
+              <div class="override-list">
+                <div class="override-item">
+                  <label class="override-toggle">
+                    <input
+                      type="checkbox"
+                      checked={snapshot.advancedSettings.logLevel !== null}
+                      disabled={!settingsEditable ||
+                        saving ||
+                        interfaceBusy ||
+                        settingsOperation === 'logLevel'}
+                      onchange={(event) =>
+                        toggleCommonOverride(
+                          'logLevel',
+                          (event.currentTarget as HTMLInputElement).checked,
+                        )}
+                    />
+                    <span>
+                      <strong>Override log level</strong>
+                      <small>Info remains required for connection status.</small
+                      >
+                    </span>
+                  </label>
+                  <div class="override-control">
+                    <label for="log-level">Log level</label>
+                    <select
+                      id="log-level"
+                      value={snapshot.advancedSettings.logLevel ?? 'info'}
+                      disabled={snapshot.advancedSettings.logLevel === null ||
+                        !settingsEditable ||
+                        saving ||
+                        interfaceBusy ||
+                        settingsOperation === 'logLevel'}
+                      onchange={selectLogLevel}
+                    >
+                      <option value="info">Info</option>
+                      <option value="debug">Debug</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div class="override-item">
+                  <label class="override-toggle">
+                    <input
+                      type="checkbox"
+                      checked={snapshot.advancedSettings.pcapSocketBuffer !==
+                        null}
+                      disabled={!settingsEditable ||
+                        saving ||
+                        interfaceBusy ||
+                        settingsOperation === 'pcapSocketBuffer'}
+                      onchange={(event) =>
+                        toggleCommonOverride(
+                          'pcapSocketBuffer',
+                          (event.currentTarget as HTMLInputElement).checked,
+                        )}
+                    />
+                    <span>
+                      <strong>Override PCAP socket buffer</strong>
+                      <small>Default 4194304 bytes.</small>
+                    </span>
+                  </label>
+                  <div class="override-control">
+                    <label for="pcap-socket-buffer">PCAP socket buffer</label>
+                    <input
+                      id="pcap-socket-buffer"
+                      bind:this={commonFieldInputs.pcapSocketBuffer}
+                      bind:value={commonDraft.pcapSocketBuffer}
+                      inputmode="numeric"
+                      autocomplete="off"
+                      disabled={snapshot.advancedSettings.pcapSocketBuffer ===
+                        null ||
+                        !settingsEditable ||
+                        saving ||
+                        interfaceBusy}
+                      aria-invalid={commonErrors.pcapSocketBuffer
+                        ? 'true'
+                        : undefined}
+                      aria-describedby="pcap-socket-buffer-hint{commonErrors.pcapSocketBuffer
+                        ? ' pcap-socket-buffer-error'
+                        : ''}"
+                      oninput={() => handleCommonInput('pcapSocketBuffer')}
+                      onblur={() =>
+                        scheduleCommonDraftCommit('pcapSocketBuffer')}
+                      onkeydown={handleCommonKeydown}
+                    />
+                    <p class="field-hint" id="pcap-socket-buffer-hint">
+                      1024–104857600 bytes
+                    </p>
+                    {#if commonErrors.pcapSocketBuffer}
+                      <p class="field-error" id="pcap-socket-buffer-error">
+                        {commonErrors.pcapSocketBuffer}
+                      </p>
+                    {/if}
+                  </div>
+                </div>
+
+                {#each flagFields as field (field)}
+                  {@const prefix =
+                    field === 'localTcpFlags' ? 'Local' : 'Remote'}
+                  {@const inputId =
+                    field === 'localTcpFlags'
+                      ? 'local-tcp-flags'
+                      : 'remote-tcp-flags'}
+                  <div class="override-item">
+                    <label class="override-toggle">
+                      <input
+                        type="checkbox"
+                        checked={snapshot.advancedSettings[field] !== null}
+                        disabled={!settingsEditable ||
+                          saving ||
+                          interfaceBusy ||
+                          settingsOperation === field}
+                        onchange={(event) =>
+                          toggleCommonOverride(
+                            field,
+                            (event.currentTarget as HTMLInputElement).checked,
+                          )}
+                      />
+                      <span>
+                        <strong
+                          >Override {prefix.toLowerCase()} TCP flags</strong
+                        >
+                        <small>Default PA.</small>
+                      </span>
+                    </label>
+                    <div class="override-control">
+                      <label for={inputId}>{prefix} TCP flags</label>
+                      <input
+                        id={inputId}
+                        bind:this={commonFieldInputs[field]}
+                        bind:value={commonDraft[field]}
+                        autocapitalize="characters"
+                        autocomplete="off"
+                        spellcheck="false"
+                        disabled={snapshot.advancedSettings[field] === null ||
+                          !settingsEditable ||
+                          saving ||
+                          interfaceBusy}
+                        aria-invalid={commonErrors[field] ? 'true' : undefined}
+                        aria-describedby="{inputId}-hint{commonErrors[field]
+                          ? ` ${inputId}-error`
+                          : ''}"
+                        oninput={() => handleCommonInput(field)}
+                        onblur={() => scheduleCommonDraftCommit(field)}
+                        onkeydown={handleCommonKeydown}
+                      />
+                      <p class="field-hint" id="{inputId}-hint">
+                        Comma-separated combinations, for example PA, S.
+                      </p>
+                      {#if commonErrors[field]}
+                        <p class="field-error" id="{inputId}-error">
+                          {commonErrors[field]}
+                        </p>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
+
+                {#each numericFields as item (item.field)}
+                  {@const inputId = item.field.replace(
+                    /[A-Z]/g,
+                    (letter) => `-${letter.toLowerCase()}`,
+                  )}
+                  <div class="override-item">
+                    <label class="override-toggle">
+                      <input
+                        type="checkbox"
+                        checked={snapshot.advancedSettings[item.field] !== null}
+                        disabled={!settingsEditable ||
+                          saving ||
+                          interfaceBusy ||
+                          settingsOperation === item.field}
+                        onchange={(event) =>
+                          toggleCommonOverride(
+                            item.field,
+                            (event.currentTarget as HTMLInputElement).checked,
+                          )}
+                      />
+                      <span>
+                        <strong>Override {item.title}</strong>
+                        <small>Default {item.defaultValue}.</small>
+                      </span>
+                    </label>
+                    <div class="override-control">
+                      <label for={inputId}>{item.label}</label>
+                      <input
+                        id={inputId}
+                        bind:this={commonFieldInputs[item.field]}
+                        bind:value={commonDraft[item.field]}
+                        inputmode="numeric"
+                        autocomplete="off"
+                        disabled={snapshot.advancedSettings[item.field] ===
+                          null ||
+                          !settingsEditable ||
+                          saving ||
+                          interfaceBusy}
+                        aria-invalid={commonErrors[item.field]
+                          ? 'true'
+                          : undefined}
+                        aria-describedby="{inputId}-hint{commonErrors[
+                          item.field
+                        ]
+                          ? ` ${inputId}-error`
+                          : ''}"
+                        oninput={() => handleCommonInput(item.field)}
+                        onblur={() => scheduleCommonDraftCommit(item.field)}
+                        onkeydown={handleCommonKeydown}
+                      />
+                      <p class="field-hint" id="{inputId}-hint">{item.hint}</p>
+                      {#if commonErrors[item.field]}
+                        <p class="field-error" id="{inputId}-error">
+                          {commonErrors[item.field]}
+                        </p>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
               </div>
             </section>
           </div>

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { vi } from 'vitest';
 import App, { type AppApi } from './App.svelte';
 import type {
+  AdvancedSettings,
   AppSnapshot,
   NetworkInterface,
   Profile,
@@ -111,6 +112,15 @@ function snapshot(
   };
 }
 
+function advancedSettings(
+  overrides: Partial<AdvancedSettings> = {},
+): AdvancedSettings {
+  return {
+    ...snapshot().advancedSettings,
+    ...overrides,
+  };
+}
+
 function mockApi(initialSnapshot = snapshot()): AppApi {
   return {
     getAppSnapshot: vi.fn().mockResolvedValue(initialSnapshot),
@@ -120,6 +130,7 @@ function mockApi(initialSnapshot = snapshot()): AppApi {
     selectProfile: vi.fn().mockResolvedValue(initialSnapshot),
     refreshInterfaces: vi.fn().mockResolvedValue(initialSnapshot),
     selectInterface: vi.fn().mockResolvedValue(initialSnapshot),
+    replaceAdvancedSettings: vi.fn().mockResolvedValue(initialSnapshot),
   };
 }
 
@@ -641,6 +652,510 @@ describe('application shell', () => {
     expect(screen.getByRole('combobox', { name: 'Interface' })).toHaveValue(
       ethernetInterface.guid,
     );
+  });
+
+  it('renders every common override off with its pinned starting value', async () => {
+    const { user } = await renderLoaded();
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    expect(screen.getAllByRole('checkbox')).toHaveLength(7);
+    expect(screen.getByRole('combobox', { name: 'Log level' })).toHaveValue(
+      'info',
+    );
+    expect(screen.getByLabelText('PCAP socket buffer')).toHaveValue('4194304');
+    expect(screen.getByLabelText('Local TCP flags')).toHaveValue('PA');
+    expect(screen.getByLabelText('Remote TCP flags')).toHaveValue('PA');
+    expect(screen.getByLabelText('Connection count')).toHaveValue('1');
+    expect(screen.getByLabelText('TCP buffer')).toHaveValue('8192');
+    expect(screen.getByLabelText('UDP buffer')).toHaveValue('4096');
+    for (const control of [
+      screen.getByRole('combobox', { name: 'Log level' }),
+      screen.getByLabelText('PCAP socket buffer'),
+      screen.getByLabelText('Local TCP flags'),
+      screen.getByLabelText('Remote TCP flags'),
+      screen.getByLabelText('Connection count'),
+      screen.getByLabelText('TCP buffer'),
+      screen.getByLabelText('UDP buffer'),
+    ]) {
+      expect(control).toBeDisabled();
+    }
+  });
+
+  it('enables an override immediately while preserving untouched KCP and SMUX settings', async () => {
+    const existing = advancedSettings({
+      kcpMode: 'fast3',
+      kcpMtu: 1400,
+      smuxBuffer: 4_194_304,
+    });
+    const initial = snapshot(primaryProfile, { advancedSettings: existing });
+    const updated = snapshot(primaryProfile, {
+      revision: '13',
+      advancedSettings: { ...existing, pcapSocketBuffer: 4_194_304 },
+    });
+    const api = mockApi(initial);
+    vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(updated);
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.click(
+      screen.getByRole('checkbox', {
+        name: /Override PCAP socket buffer/,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith({
+        ...existing,
+        pcapSocketBuffer: 4_194_304,
+      }),
+    );
+    expect(screen.getByLabelText('PCAP socket buffer')).toBeEnabled();
+    expect(screen.getByLabelText('PCAP socket buffer')).toHaveValue('4194304');
+  });
+
+  it('updates log level immediately and allows only info or debug', async () => {
+    const infoSettings = advancedSettings({ logLevel: 'info' });
+    const debugSettings = advancedSettings({ logLevel: 'debug' });
+    const api = mockApi();
+    vi.mocked(api.replaceAdvancedSettings)
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '13',
+          advancedSettings: infoSettings,
+        }),
+      )
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '14',
+          advancedSettings: debugSettings,
+        }),
+      );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override log level/ }),
+    );
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Log level' }),
+      'debug',
+    );
+
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenLastCalledWith(
+        debugSettings,
+      ),
+    );
+    expect(
+      within(screen.getByRole('combobox', { name: 'Log level' })).getAllByRole(
+        'option',
+      ),
+    ).toHaveLength(2);
+    expect(screen.getByRole('combobox', { name: 'Log level' })).toHaveValue(
+      'debug',
+    );
+  });
+
+  it('keeps invalid TCP flags local and commits ordered comma-separated combinations', async () => {
+    const initialSettings = advancedSettings({ localTcpFlags: ['PA'] });
+    const updatedSettings = advancedSettings({
+      localTcpFlags: ['PA', 'S', 'PA'],
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: updatedSettings,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const flags = screen.getByLabelText('Local TCP flags');
+
+    await user.clear(flags);
+    await user.type(flags, 'pa');
+    await user.tab();
+    expect(api.replaceAdvancedSettings).not.toHaveBeenCalled();
+    expect(flags).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByText(/uppercase combinations/)).toBeInTheDocument();
+
+    await user.clear(flags);
+    await user.type(flags, ' PA, S, PA ');
+    await user.keyboard('{Enter}');
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(updatedSettings),
+    );
+    expect(flags).toHaveValue('PA, S, PA');
+  });
+
+  it('validates numeric bounds and preserves decimal strings above safe integer range', async () => {
+    const initialSettings = advancedSettings({
+      connectionCount: 1,
+      tcpBuffer: '8192',
+    });
+    const preciseSettings = advancedSettings({
+      connectionCount: 1,
+      tcpBuffer: '9007199254740993',
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: preciseSettings,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    const count = screen.getByLabelText('Connection count');
+    await user.clear(count);
+    await user.type(count, '0');
+    await user.tab();
+    expect(api.replaceAdvancedSettings).not.toHaveBeenCalled();
+    expect(count).toHaveAttribute('aria-invalid', 'true');
+    expect(
+      screen.getByText('Connection count must be between 1 and 256.'),
+    ).toBeInTheDocument();
+
+    const tcpBuffer = screen.getByLabelText('TCP buffer');
+    await user.clear(tcpBuffer);
+    await user.type(tcpBuffer, '9007199254740993');
+    await user.keyboard('{Enter}');
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(preciseSettings),
+    );
+    expect(tcpBuffer).toHaveValue('9007199254740993');
+  });
+
+  it('serializes a pending settings replacement with all native mutations', async () => {
+    const pendingSettings = deferred<AppSnapshot>();
+    const api = mockApi();
+    vi.mocked(api.replaceAdvancedSettings).mockReturnValue(
+      pendingSettings.promise,
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override connection count/ }),
+    );
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Updating connection count…',
+    );
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
+    expect(
+      screen.getByRole('combobox', { name: 'Selected server profile' }),
+    ).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled();
+    const overrideCheckboxes = screen.getAllByRole('checkbox');
+    expect(
+      overrideCheckboxes.filter((control) => control.hasAttribute('disabled')),
+    ).toHaveLength(1);
+    expect(
+      screen.getByRole('checkbox', { name: /Override connection count/ }),
+    ).toBeDisabled();
+
+    pendingSettings.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: advancedSettings({ connectionCount: 1 }),
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText('Connection count')).toBeEnabled(),
+    );
+    expect(screen.queryByText('Updating connection count…')).toBeNull();
+  });
+
+  it('preserves the next click after a valid text field commits on blur', async () => {
+    const initialSettings = advancedSettings({ tcpBuffer: '8192' });
+    const logUpdated = advancedSettings({
+      logLevel: 'info',
+      tcpBuffer: '8192',
+    });
+    const bothUpdated = advancedSettings({
+      logLevel: 'info',
+      tcpBuffer: '16384',
+    });
+    const pendingLog = deferred<AppSnapshot>();
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings)
+      .mockReturnValueOnce(pendingLog.promise)
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '14',
+          advancedSettings: bothUpdated,
+        }),
+      );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const tcpBuffer = screen.getByLabelText('TCP buffer');
+
+    await user.clear(tcpBuffer);
+    await user.type(tcpBuffer, '16384');
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override log level/ }),
+    );
+
+    expect(api.replaceAdvancedSettings).toHaveBeenCalledWith({
+      ...initialSettings,
+      logLevel: 'info',
+    });
+    pendingLog.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: logUpdated,
+      }),
+    );
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledTimes(2),
+    );
+    expect(api.replaceAdvancedSettings).toHaveBeenLastCalledWith(bothUpdated);
+    expect(tcpBuffer).toHaveValue('16384');
+  });
+
+  it('preserves an invalid unrelated draft when another override succeeds', async () => {
+    const initialSettings = advancedSettings({ connectionCount: 1 });
+    const updatedSettings = advancedSettings({
+      logLevel: 'info',
+      connectionCount: 1,
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: updatedSettings,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const count = screen.getByLabelText('Connection count');
+
+    await user.clear(count);
+    await user.type(count, '0');
+    await user.tab();
+    expect(
+      await screen.findByText(/Connection count must be/),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override log level/ }),
+    );
+
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledOnce(),
+    );
+    expect(count).toHaveValue('0');
+    expect(count).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByText(/Connection count must be/)).toBeInTheDocument();
+  });
+
+  it('keeps keyboard focus on the next Advanced control while a blur commit is pending', async () => {
+    const pendingBuffer = deferred<AppSnapshot>();
+    const initialSettings = advancedSettings({
+      tcpBuffer: '8192',
+      udpBuffer: '4096',
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockReturnValue(
+      pendingBuffer.promise,
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const tcpBuffer = screen.getByLabelText('TCP buffer');
+    const udpOverride = screen.getByRole('checkbox', {
+      name: /Override UDP buffer/,
+    });
+
+    await user.clear(tcpBuffer);
+    await user.type(tcpBuffer, '16384');
+    tcpBuffer.focus();
+    await user.tab();
+    expect(udpOverride).toHaveFocus();
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledOnce(),
+    );
+    expect(udpOverride).toHaveFocus();
+    expect(udpOverride).toBeEnabled();
+
+    pendingBuffer.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: { ...initialSettings, tcpBuffer: '16384' },
+      }),
+    );
+  });
+
+  it('preserves a second edit to the same field while its first replacement is pending', async () => {
+    const firstReplacement = deferred<AppSnapshot>();
+    const initialSettings = advancedSettings({ tcpBuffer: '8192' });
+    const firstSettings = advancedSettings({ tcpBuffer: '16384' });
+    const secondSettings = advancedSettings({ tcpBuffer: '32768' });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings)
+      .mockReturnValueOnce(firstReplacement.promise)
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '14',
+          advancedSettings: secondSettings,
+        }),
+      );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const buffer = screen.getByLabelText('TCP buffer');
+
+    await user.clear(buffer);
+    await user.type(buffer, '16384');
+    await user.tab();
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(firstSettings),
+    );
+    await user.click(buffer);
+    await user.clear(buffer);
+    await user.type(buffer, '32768');
+    await user.tab();
+    expect(buffer).toHaveValue('32768');
+
+    firstReplacement.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: firstSettings,
+      }),
+    );
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledTimes(2),
+    );
+    expect(api.replaceAdvancedSettings).toHaveBeenLastCalledWith(
+      secondSettings,
+    );
+    expect(buffer).toHaveValue('32768');
+  });
+
+  it('retains a field error when disabling its override is rejected', async () => {
+    const initialSettings = advancedSettings({ connectionCount: 1 });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockRejectedValue({
+      kind: 'settingsLocked',
+    });
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const count = screen.getByLabelText('Connection count');
+
+    await user.clear(count);
+    await user.type(count, '0');
+    await user.tab();
+    expect(
+      await screen.findByText(/Connection count must be/),
+    ).toBeInTheDocument();
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override connection count/ }),
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Advanced settings are locked',
+    );
+    expect(count).toHaveValue('0');
+    expect(count).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByText(/Connection count must be/)).toBeInTheDocument();
+  });
+
+  it('waits for a pending Advanced update before confirming profile deletion', async () => {
+    const pendingSettings = deferred<AppSnapshot>();
+    const api = mockApi(
+      snapshot(primaryProfile, {
+        advancedSettings: advancedSettings({ tcpBuffer: '8192' }),
+      }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockReturnValue(
+      pendingSettings.promise,
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const buffer = screen.getByLabelText('TCP buffer');
+    await user.clear(buffer);
+    await user.type(buffer, '16384');
+    await user.click(screen.getByRole('button', { name: 'Delete profile' }));
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledOnce(),
+    );
+
+    await user.click(
+      screen.getAllByRole('button', { name: 'Delete profile' }).at(-1)!,
+    );
+    expect(api.deleteProfile).not.toHaveBeenCalled();
+    pendingSettings.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: advancedSettings({ tcpBuffer: '16384' }),
+      }),
+    );
+    await waitFor(() =>
+      expect(api.deleteProfile).toHaveBeenCalledWith(primaryProfile.id),
+    );
+  });
+
+  it('keeps common overrides inspectable but locked and maps native lock failures', async () => {
+    const api = mockApi();
+    vi.mocked(api.replaceAdvancedSettings).mockRejectedValue({
+      kind: 'settingsLocked',
+    });
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override UDP buffer/ }),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Advanced settings are locked while paqet is active.',
+    );
+    expect(screen.getByLabelText('UDP buffer')).toHaveValue('4096');
+    expect(screen.getByLabelText('UDP buffer')).toBeDisabled();
+  });
+
+  it('shows canonical common values while lifecycle locking disables every override control', async () => {
+    const locked = snapshot(primaryProfile, {
+      advancedSettings: advancedSettings({
+        logLevel: 'debug',
+        localTcpFlags: ['PA', 'S'],
+        tcpBuffer: '9007199254740993',
+      }),
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    const { user } = await renderLoaded(mockApi(locked));
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    expect(screen.getByRole('combobox', { name: 'Log level' })).toHaveValue(
+      'debug',
+    );
+    expect(screen.getByLabelText('Local TCP flags')).toHaveValue('PA, S');
+    expect(screen.getByLabelText('TCP buffer')).toHaveValue('9007199254740993');
+    expect(
+      screen
+        .getAllByRole('checkbox')
+        .every((control) => control.hasAttribute('disabled')),
+    ).toBe(true);
+    expect(screen.getByRole('combobox', { name: 'Log level' })).toBeDisabled();
+    expect(screen.getByLabelText('Local TCP flags')).toBeDisabled();
+    expect(screen.getByLabelText('TCP buffer')).toBeDisabled();
   });
 });
 
