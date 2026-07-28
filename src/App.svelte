@@ -5,7 +5,10 @@
     AdvancedSettings,
     AppSnapshot,
     IpcError,
+    KcpBlock,
+    KcpMode,
     LogLevel,
+    ManualKcpSettings,
     NetworkInterface,
     Profile,
     ProfileDraft,
@@ -37,12 +40,50 @@
   type CommonTextField = Exclude<CommonSettingField, 'logLevel'>;
   type CommonDraft = Record<CommonTextField, string>;
   type CommonErrors = Partial<Record<CommonTextField, string>>;
+  type KcpSettingField =
+    | 'kcpMode'
+    | 'kcpNoDelay'
+    | 'kcpInterval'
+    | 'kcpResend'
+    | 'kcpNoCongestion'
+    | 'kcpWriteDelay'
+    | 'kcpAckNoDelay'
+    | 'kcpMtu'
+    | 'kcpReceiveWindow'
+    | 'kcpSendWindow'
+    | 'kcpBlock'
+    | 'smuxBuffer'
+    | 'streamBuffer'
+    | 'smuxKeepalive'
+    | 'smuxTimeout';
+  type KcpTextField = Exclude<
+    KcpSettingField,
+    'kcpMode' | 'kcpWriteDelay' | 'kcpAckNoDelay' | 'kcpBlock'
+  >;
+  type IndependentKcpField =
+    | 'kcpMode'
+    | 'kcpMtu'
+    | 'kcpReceiveWindow'
+    | 'kcpSendWindow'
+    | 'kcpBlock'
+    | 'smuxBuffer'
+    | 'streamBuffer'
+    | 'smuxKeepalive'
+    | 'smuxTimeout';
+  type IndependentKcpTextField = Exclude<
+    IndependentKcpField,
+    'kcpMode' | 'kcpBlock'
+  >;
+  type SettingsField = CommonSettingField | KcpSettingField;
+  type KcpDraft = Record<KcpTextField, string>;
+  type KcpErrors = Partial<Record<KcpTextField, string>>;
   type ProfileInput = Omit<ProfileDraft, 'port'> & { port: string };
   type FieldErrors = Partial<Record<ProfileFieldName, string>>;
   type DialogState =
     | { kind: 'discardSelection'; profileId: ProfileId }
     | { kind: 'discardCreate' }
     | { kind: 'delete'; profile: Profile }
+    | { kind: 'unsafeBlock'; value: 'none' | 'null' }
     | null;
 
   let { api = tauriApi }: { api?: AppApi } = $props();
@@ -56,12 +97,19 @@
   let saving = $state(false);
   let interfaceOperation = $state<InterfaceOperation>(null);
   let interfaceMessage = $state('');
-  let settingsOperation = $state<CommonSettingField | null>(null);
+  let settingsOperation = $state<SettingsField | null>(null);
+  let kcpModeQueued = $state(false);
   let settingsMessage = $state('');
+  let transportMessage = $state('');
   let commonDraft = $state<CommonDraft>(defaultCommonDraft());
   let commonErrors = $state<CommonErrors>({});
   let commonDraftVersions = $state<Record<CommonTextField, number>>(
     initialCommonDraftVersions(),
+  );
+  let kcpDraft = $state<KcpDraft>(defaultKcpDraft());
+  let kcpErrors = $state<KcpErrors>({});
+  let kcpDraftVersions = $state<Record<KcpTextField, number>>(
+    initialKcpDraftVersions(),
   );
   let revealKey = $state(false);
   let advancedExpanded = $state(false);
@@ -73,7 +121,9 @@
   let encryptionKeyInput = $state<HTMLInputElement>();
   let commonFieldInputs: Partial<Record<CommonTextField, HTMLInputElement>> =
     {};
+  let kcpFieldInputs: Partial<Record<KcpTextField, HTMLInputElement>> = {};
   let dialogPrimaryButton = $state<HTMLButtonElement>();
+  let dialogCancelButton = $state<HTMLButtonElement>();
   let dialogElement = $state<HTMLDivElement>();
   let profileSelect = $state<HTMLSelectElement>();
   let newProfileButton = $state<HTMLButtonElement>();
@@ -136,6 +186,38 @@
     };
   }
 
+  function defaultKcpDraft(): KcpDraft {
+    return {
+      kcpNoDelay: '0',
+      kcpInterval: '30',
+      kcpResend: '2',
+      kcpNoCongestion: '1',
+      kcpMtu: '1350',
+      kcpReceiveWindow: '512',
+      kcpSendWindow: '512',
+      smuxBuffer: '4194304',
+      streamBuffer: '2097152',
+      smuxKeepalive: '2',
+      smuxTimeout: '8',
+    };
+  }
+
+  function initialKcpDraftVersions(): Record<KcpTextField, number> {
+    return {
+      kcpNoDelay: 0,
+      kcpInterval: 0,
+      kcpResend: 0,
+      kcpNoCongestion: 0,
+      kcpMtu: 0,
+      kcpReceiveWindow: 0,
+      kcpSendWindow: 0,
+      smuxBuffer: 0,
+      streamBuffer: 0,
+      smuxKeepalive: 0,
+      smuxTimeout: 0,
+    };
+  }
+
   function profileInput(profile: Profile): ProfileInput {
     return {
       name: profile.name,
@@ -170,7 +252,7 @@
   function applySnapshot(
     nextSnapshot: AppSnapshot,
     resetProfileEditor = false,
-    commonFieldToSync: CommonSettingField | 'all' | null = null,
+    fieldToSync: SettingsField | 'all' | null = null,
   ): boolean {
     if (snapshot && BigInt(nextSnapshot.revision) < BigInt(snapshot.revision)) {
       return false;
@@ -185,8 +267,13 @@
         ? profileInput(nextSnapshot.selectedProfile)
         : emptyProfileInput();
     }
-    if (commonFieldToSync) {
-      syncCommonDraft(nextSnapshot.advancedSettings, commonFieldToSync);
+    if (fieldToSync) {
+      if (fieldToSync === 'all' || isCommonSettingField(fieldToSync)) {
+        syncCommonDraft(nextSnapshot.advancedSettings, fieldToSync);
+      }
+      if (fieldToSync === 'all' || isKcpSettingField(fieldToSync)) {
+        syncKcpDraft(nextSnapshot.advancedSettings, fieldToSync);
+      }
     }
     return true;
   }
@@ -217,6 +304,45 @@
     } else if (field !== 'logLevel') {
       commonDraft[field] = canonicalDraft[field];
       delete commonErrors[field];
+    }
+  }
+
+  function syncKcpDraft(
+    settings: AdvancedSettings,
+    field: KcpSettingField | 'all',
+  ): void {
+    const defaults = defaultKcpDraft();
+    const canonicalDraft: KcpDraft = {
+      kcpNoDelay: String(settings.manualKcp.noDelay ?? defaults.kcpNoDelay),
+      kcpInterval: String(settings.manualKcp.interval ?? defaults.kcpInterval),
+      kcpResend: String(settings.manualKcp.resend ?? defaults.kcpResend),
+      kcpNoCongestion: String(
+        settings.manualKcp.noCongestion ?? defaults.kcpNoCongestion,
+      ),
+      kcpMtu: String(settings.kcpMtu ?? defaults.kcpMtu),
+      kcpReceiveWindow: String(
+        settings.kcpReceiveWindow ?? defaults.kcpReceiveWindow,
+      ),
+      kcpSendWindow: String(settings.kcpSendWindow ?? defaults.kcpSendWindow),
+      smuxBuffer: String(settings.smuxBuffer ?? defaults.smuxBuffer),
+      streamBuffer: String(settings.streamBuffer ?? defaults.streamBuffer),
+      smuxKeepalive: String(settings.smuxKeepalive ?? defaults.smuxKeepalive),
+      smuxTimeout: String(settings.smuxTimeout ?? defaults.smuxTimeout),
+    };
+    if (field === 'all') {
+      kcpDraft = canonicalDraft;
+      kcpErrors = {};
+      kcpDraftVersions = initialKcpDraftVersions();
+      return;
+    }
+    if (field === 'kcpMode') {
+      for (const manualField of manualKcpTextFields) {
+        kcpDraft[manualField] = canonicalDraft[manualField];
+        delete kcpErrors[manualField];
+      }
+    } else if (isKcpTextField(field)) {
+      kcpDraft[field] = canonicalDraft[field];
+      delete kcpErrors[field];
     }
   }
 
@@ -357,12 +483,32 @@
 
   async function confirmDialog(): Promise<void> {
     const action = dialog;
+    const returnFocus = dialogInvoker;
     dialog = null;
     dialogInvoker = null;
     if (!action) return;
 
+    if (action.kind === 'unsafeBlock') {
+      const replacement = queueSettingsMutation(async () => {
+        if (!settingsEditable) return;
+        await replaceKcpSettings(
+          'kcpBlock',
+          (settings) => ({ ...settings, kcpBlock: action.value }),
+          'kcpBlock',
+        );
+      });
+      await tick();
+      returnFocus?.focus();
+      await replacement;
+      return;
+    }
+
     await waitForMutationIdle();
-    if (!settingsEditable) return;
+    if (!settingsEditable) {
+      await tick();
+      returnFocus?.focus();
+      return;
+    }
 
     if (action.kind === 'discardSelection') {
       cancelEdit();
@@ -397,7 +543,11 @@
         ? document.activeElement
         : null;
     dialog = nextDialog;
-    void tick().then(() => dialogPrimaryButton?.focus());
+    void tick().then(() =>
+      nextDialog.kind === 'unsafeBlock'
+        ? dialogCancelButton?.focus()
+        : dialogPrimaryButton?.focus(),
+    );
   }
 
   function closeDialog(): void {
@@ -828,6 +978,10 @@
     return commonTextFields.includes(field as CommonTextField);
   }
 
+  function isCommonSettingField(field: string): field is CommonSettingField {
+    return field === 'logLevel' || isCommonTextField(field);
+  }
+
   const commonTextFields: CommonTextField[] = [
     'pcapSocketBuffer',
     'localTcpFlags',
@@ -861,6 +1015,102 @@
       hint: '2048–9223372036854775807 bytes',
     },
   ];
+  const manualKcpTextFields: KcpTextField[] = [
+    'kcpNoDelay',
+    'kcpInterval',
+    'kcpResend',
+    'kcpNoCongestion',
+  ];
+  const kcpTextFields: KcpTextField[] = [
+    ...manualKcpTextFields,
+    'kcpMtu',
+    'kcpReceiveWindow',
+    'kcpSendWindow',
+    'smuxBuffer',
+    'streamBuffer',
+    'smuxKeepalive',
+    'smuxTimeout',
+  ];
+  const kcpSettingFields: KcpSettingField[] = [
+    'kcpMode',
+    ...kcpTextFields,
+    'kcpWriteDelay',
+    'kcpAckNoDelay',
+    'kcpBlock',
+  ];
+  const kcpNumericFields = [
+    {
+      field: 'kcpMtu' as const,
+      title: 'KCP MTU',
+      label: 'KCP MTU',
+      defaultValue: '1350 bytes',
+      hint: '50–1500 bytes',
+    },
+    {
+      field: 'kcpReceiveWindow' as const,
+      title: 'KCP receive window',
+      label: 'KCP receive window',
+      defaultValue: '512',
+      hint: '1–32768',
+    },
+    {
+      field: 'kcpSendWindow' as const,
+      title: 'KCP send window',
+      label: 'KCP send window',
+      defaultValue: '512',
+      hint: '1–32768',
+    },
+    {
+      field: 'smuxBuffer' as const,
+      title: 'SMUX buffer',
+      label: 'SMUX buffer',
+      defaultValue: '4194304 bytes',
+      hint: '1024–2147483647 bytes',
+    },
+    {
+      field: 'streamBuffer' as const,
+      title: 'stream buffer',
+      label: 'Stream buffer',
+      defaultValue: '2097152 bytes',
+      hint: '1024–2147483647 bytes; no larger than SMUX buffer',
+    },
+    {
+      field: 'smuxKeepalive' as const,
+      title: 'SMUX keepalive',
+      label: 'SMUX keepalive',
+      defaultValue: '2 seconds',
+      hint: '1–4294967295 seconds; no longer than timeout',
+    },
+    {
+      field: 'smuxTimeout' as const,
+      title: 'SMUX timeout',
+      label: 'SMUX timeout',
+      defaultValue: '8 seconds',
+      hint: '1–4294967295 seconds; at least keepalive',
+    },
+  ];
+  const manualKcpFields = [
+    {
+      field: 'kcpNoDelay' as const,
+      label: 'KCP nodelay',
+      hint: '0 or 1',
+    },
+    {
+      field: 'kcpInterval' as const,
+      label: 'KCP interval',
+      hint: '10–5000 milliseconds',
+    },
+    {
+      field: 'kcpResend' as const,
+      label: 'KCP resend',
+      hint: '0–2',
+    },
+    {
+      field: 'kcpNoCongestion' as const,
+      label: 'KCP nocongestion',
+      hint: '0 or 1',
+    },
+  ];
 
   function commonSettingLabel(field: CommonSettingField): string {
     const labels: Record<CommonSettingField, string> = {
@@ -878,6 +1128,429 @@
   async function focusCommonField(field: CommonTextField): Promise<void> {
     await tick();
     commonFieldInputs[field]?.focus();
+  }
+
+  async function toggleKcpOverride(
+    field: IndependentKcpField,
+    enabled: boolean,
+  ): Promise<void> {
+    if (field === 'kcpMode') kcpModeQueued = true;
+    try {
+      await queueSettingsMutation(async () => {
+        if (!snapshot || !settingsEditable) return;
+        if (!enabled) {
+          const candidate =
+            field === 'kcpMode'
+              ? {
+                  ...snapshot.advancedSettings,
+                  kcpMode: null,
+                  manualKcp: emptyManualKcpSettings(),
+                }
+              : { ...snapshot.advancedSettings, [field]: null };
+          if (
+            field === 'smuxBuffer' ||
+            field === 'streamBuffer' ||
+            field === 'smuxKeepalive' ||
+            field === 'smuxTimeout'
+          ) {
+            const relationshipError = validateKcpRelationships(
+              candidate,
+              field,
+            );
+            if (relationshipError) {
+              transportMessage = relationshipError;
+              return;
+            }
+          }
+          await replaceKcpSettings(field, () => candidate, field);
+          return;
+        }
+        if (field === 'kcpMode') {
+          await replaceKcpSettings(
+            field,
+            (settings) => ({ ...settings, kcpMode: 'fast' }),
+            field,
+          );
+          return;
+        }
+        if (field === 'kcpBlock') {
+          await replaceKcpSettings(
+            field,
+            (settings) => ({ ...settings, kcpBlock: 'aes' }),
+            field,
+          );
+          return;
+        }
+
+        const parsed = parseKcpDraft(field, kcpDraft[field]);
+        if (typeof parsed === 'string') {
+          kcpErrors[field] = parsed;
+          await focusKcpField(field);
+          return;
+        }
+        const candidate = {
+          ...snapshot.advancedSettings,
+          [field]: parsed.value,
+        };
+        const relationshipError = validateKcpRelationships(candidate, field);
+        if (relationshipError) {
+          kcpErrors[field] = relationshipError;
+          await focusKcpField(field);
+          return;
+        }
+        delete kcpErrors[field];
+        await replaceKcpSettings(field, () => candidate, field);
+      });
+    } finally {
+      if (field === 'kcpMode') kcpModeQueued = false;
+    }
+  }
+
+  async function handleKcpOverrideToggle(
+    event: Event,
+    field: IndependentKcpField,
+  ): Promise<void> {
+    const checkbox = event.currentTarget as HTMLInputElement;
+    const enabled = checkbox.checked;
+    checkbox.checked = snapshot?.advancedSettings[field] !== null;
+    await toggleKcpOverride(field, enabled);
+  }
+
+  async function selectKcpMode(event: Event): Promise<void> {
+    const select = event.currentTarget as HTMLSelectElement;
+    const value = select.value as KcpMode;
+    select.value = snapshot?.advancedSettings.kcpMode ?? 'fast';
+    kcpModeQueued = true;
+    try {
+      await queueSettingsMutation(() =>
+        replaceKcpSettings(
+          'kcpMode',
+          (settings) => {
+            const currentMode = settings.kcpMode ?? 'fast';
+            return {
+              ...settings,
+              kcpMode: value,
+              manualKcp:
+                value === 'manual'
+                  ? manualKcpPreset(currentMode, settings.manualKcp)
+                  : emptyManualKcpSettings(),
+            };
+          },
+          'kcpMode',
+        ),
+      );
+    } finally {
+      kcpModeQueued = false;
+    }
+  }
+
+  async function toggleManualKcpBoolean(
+    field: 'kcpWriteDelay' | 'kcpAckNoDelay',
+    value: boolean,
+  ): Promise<void> {
+    const manualField = field === 'kcpWriteDelay' ? 'writeDelay' : 'ackNoDelay';
+    await queueSettingsMutation(async () => {
+      if (snapshot?.advancedSettings.kcpMode !== 'manual') return;
+      await replaceKcpSettings(
+        field,
+        (settings) => ({
+          ...settings,
+          manualKcp: { ...settings.manualKcp, [manualField]: value },
+        }),
+        field,
+      );
+    });
+  }
+
+  async function handleManualKcpBoolean(
+    event: Event,
+    field: 'kcpWriteDelay' | 'kcpAckNoDelay',
+  ): Promise<void> {
+    const checkbox = event.currentTarget as HTMLInputElement;
+    const value = checkbox.checked;
+    const manualField = field === 'kcpWriteDelay' ? 'writeDelay' : 'ackNoDelay';
+    checkbox.checked =
+      snapshot?.advancedSettings.manualKcp[manualField] ?? false;
+    await toggleManualKcpBoolean(field, value);
+  }
+
+  async function selectKcpBlock(event: Event): Promise<void> {
+    const select = event.currentTarget as HTMLSelectElement;
+    const value = select.value as KcpBlock;
+    select.value = snapshot?.advancedSettings.kcpBlock ?? 'aes';
+    if (value === 'none' || value === 'null') {
+      openDialog({ kind: 'unsafeBlock', value });
+      return;
+    }
+    await queueSettingsMutation(() =>
+      replaceKcpSettings(
+        'kcpBlock',
+        (settings) => ({ ...settings, kcpBlock: value }),
+        'kcpBlock',
+      ),
+    );
+  }
+
+  function scheduleKcpDraftCommit(field: KcpTextField): void {
+    window.setTimeout(() => void commitKcpDraft(field), 0);
+  }
+
+  async function commitKcpDraft(field: KcpTextField): Promise<void> {
+    const input = kcpDraft[field];
+    const draftVersion = kcpDraftVersions[field];
+    await queueSettingsMutation(async () => {
+      if (!snapshot || !settingsEditable || !kcpFieldEnabled(field)) return;
+      const parsed = parseKcpDraft(field, input);
+      if (typeof parsed === 'string') {
+        kcpErrors[field] = parsed;
+        return;
+      }
+      const candidate = updateKcpTextSetting(
+        snapshot.advancedSettings,
+        field,
+        parsed.value,
+      );
+      const relationshipError = validateKcpRelationships(candidate, field);
+      if (relationshipError) {
+        kcpErrors[field] = relationshipError;
+        return;
+      }
+      delete kcpErrors[field];
+      if (
+        kcpTextSettingValue(snapshot.advancedSettings, field) === parsed.value
+      ) {
+        if (kcpDraftVersions[field] === draftVersion) {
+          kcpDraft[field] = parsed.normalized;
+        }
+        return;
+      }
+      await replaceKcpSettings(field, () => candidate, field, draftVersion);
+    });
+  }
+
+  function handleKcpInput(field: KcpTextField): void {
+    kcpDraftVersions[field] += 1;
+    delete kcpErrors[field];
+    transportMessage = '';
+  }
+
+  async function replaceKcpSettings(
+    attemptedField: KcpSettingField,
+    update: (settings: AdvancedSettings) => AdvancedSettings,
+    fieldToSync: KcpSettingField,
+    draftVersion?: number,
+  ): Promise<void> {
+    if (
+      !snapshot ||
+      !settingsEditable ||
+      saving ||
+      interfaceBusy ||
+      settingsBusy
+    ) {
+      return;
+    }
+    settingsOperation = attemptedField;
+    transportMessage = '';
+    try {
+      applySnapshot(
+        await api.replaceAdvancedSettings(update(snapshot.advancedSettings)),
+        false,
+        draftVersion === undefined ||
+          !isKcpTextField(fieldToSync) ||
+          kcpDraftVersions[fieldToSync] === draftVersion
+          ? fieldToSync
+          : null,
+      );
+    } catch (error) {
+      await presentKcpSettingsError(error, attemptedField);
+    } finally {
+      settingsOperation = null;
+      resolveMutationIdle();
+    }
+  }
+
+  async function presentKcpSettingsError(
+    error: unknown,
+    attemptedField: KcpSettingField,
+  ): Promise<void> {
+    transportMessage =
+      isIpcError(error) && error.kind === 'settingsLocked'
+        ? 'Advanced settings are locked while paqet is active.'
+        : `The ${settingsFieldLabel(attemptedField)} override could not be updated.`;
+  }
+
+  function parseKcpDraft(
+    field: KcpTextField,
+    input: string,
+  ): string | { value: number; normalized: string } {
+    const value = input.trim();
+    if (!/^\d+$/.test(value)) {
+      return 'Enter a whole number using decimal digits.';
+    }
+    const parsed = BigInt(value);
+    const [minimum, maximum] = kcpRange(field);
+    if (parsed < minimum || parsed > maximum) {
+      return kcpValidationMessage(field);
+    }
+    return { value: Number(parsed), normalized: parsed.toString() };
+  }
+
+  function kcpRange(field: KcpTextField): [bigint, bigint] {
+    if (field === 'kcpNoDelay' || field === 'kcpNoCongestion') return [0n, 1n];
+    if (field === 'kcpInterval') return [10n, 5000n];
+    if (field === 'kcpResend') return [0n, 2n];
+    if (field === 'kcpMtu') return [50n, 1500n];
+    if (field === 'kcpReceiveWindow' || field === 'kcpSendWindow') {
+      return [1n, 32768n];
+    }
+    if (field === 'smuxBuffer' || field === 'streamBuffer') {
+      return [1024n, 2147483647n];
+    }
+    return [1n, 4294967295n];
+  }
+
+  function kcpValidationMessage(field: KcpTextField): string {
+    const [minimum, maximum] = kcpRange(field);
+    return `${settingsFieldLabel(field)} must be between ${minimum} and ${maximum}.`;
+  }
+
+  function validateKcpRelationships(
+    settings: AdvancedSettings,
+    attemptedField: KcpTextField,
+  ): string | undefined {
+    const smuxBuffer = settings.smuxBuffer ?? 4_194_304;
+    const streamBuffer = settings.streamBuffer ?? 2_097_152;
+    if (streamBuffer > smuxBuffer) {
+      return attemptedField === 'smuxBuffer'
+        ? 'SMUX buffer must be at least the effective stream buffer.'
+        : 'Stream buffer must not exceed the effective SMUX buffer.';
+    }
+    const keepalive = settings.smuxKeepalive ?? 2;
+    const timeout = settings.smuxTimeout ?? 8;
+    if (timeout < keepalive) {
+      return attemptedField === 'smuxKeepalive'
+        ? 'SMUX keepalive must not exceed the effective timeout.'
+        : 'SMUX timeout must be at least the effective keepalive.';
+    }
+    return undefined;
+  }
+
+  function updateKcpTextSetting(
+    settings: AdvancedSettings,
+    field: KcpTextField,
+    value: number,
+  ): AdvancedSettings {
+    const manualField = manualKcpProperty(field);
+    return manualField
+      ? {
+          ...settings,
+          manualKcp: { ...settings.manualKcp, [manualField]: value },
+        }
+      : { ...settings, [field]: value };
+  }
+
+  function kcpTextSettingValue(
+    settings: AdvancedSettings,
+    field: KcpTextField,
+  ): number | null {
+    const manualField = manualKcpProperty(field);
+    return manualField
+      ? settings.manualKcp[manualField]
+      : settings[field as IndependentKcpTextField];
+  }
+
+  function manualKcpProperty(
+    field: KcpTextField,
+  ):
+    | keyof Pick<
+        ManualKcpSettings,
+        'noDelay' | 'interval' | 'resend' | 'noCongestion'
+      >
+    | null {
+    const properties = {
+      kcpNoDelay: 'noDelay',
+      kcpInterval: 'interval',
+      kcpResend: 'resend',
+      kcpNoCongestion: 'noCongestion',
+    } as const;
+    return field in properties
+      ? properties[field as keyof typeof properties]
+      : null;
+  }
+
+  function kcpFieldEnabled(field: KcpTextField): boolean {
+    if (!snapshot) return false;
+    const manualField = manualKcpProperty(field);
+    return manualField
+      ? snapshot.advancedSettings.kcpMode === 'manual'
+      : snapshot.advancedSettings[field as IndependentKcpTextField] !== null;
+  }
+
+  function manualKcpPreset(
+    mode: KcpMode,
+    currentManual: ManualKcpSettings,
+  ): ManualKcpSettings {
+    const presets: Record<Exclude<KcpMode, 'manual'>, ManualKcpSettings> = {
+      normal: manualKcp(0, 40, 2, 1, true, false),
+      fast: manualKcp(0, 30, 2, 1, true, false),
+      fast2: manualKcp(1, 20, 2, 1, false, true),
+      fast3: manualKcp(1, 10, 2, 1, false, true),
+    };
+    return mode === 'manual' ? { ...currentManual } : presets[mode];
+  }
+
+  function manualKcp(
+    noDelay: number,
+    interval: number,
+    resend: number,
+    noCongestion: number,
+    writeDelay: boolean,
+    ackNoDelay: boolean,
+  ): ManualKcpSettings {
+    return { noDelay, interval, resend, noCongestion, writeDelay, ackNoDelay };
+  }
+
+  function emptyManualKcpSettings(): ManualKcpSettings {
+    return {
+      noDelay: null,
+      interval: null,
+      resend: null,
+      noCongestion: null,
+      writeDelay: null,
+      ackNoDelay: null,
+    };
+  }
+
+  function isKcpTextField(field: string): field is KcpTextField {
+    return kcpTextFields.includes(field as KcpTextField);
+  }
+
+  function isKcpSettingField(field: string): field is KcpSettingField {
+    return kcpSettingFields.includes(field as KcpSettingField);
+  }
+
+  function settingsFieldLabel(field: SettingsField): string {
+    if (isCommonSettingField(field)) return commonSettingLabel(field);
+    const item = kcpNumericFields.find(
+      (candidate) => candidate.field === field,
+    );
+    if (item) return item.label;
+    const labels: Partial<Record<KcpSettingField, string>> = {
+      kcpMode: 'KCP mode',
+      kcpNoDelay: 'KCP nodelay',
+      kcpInterval: 'KCP interval',
+      kcpResend: 'KCP resend',
+      kcpNoCongestion: 'KCP nocongestion',
+      kcpWriteDelay: 'KCP write delay',
+      kcpAckNoDelay: 'KCP ACK nodelay',
+      kcpBlock: 'KCP block',
+    };
+    return labels[field] ?? field;
+  }
+
+  async function focusKcpField(field: KcpTextField): Promise<void> {
+    await tick();
+    kcpFieldInputs[field]?.focus();
   }
 
   function waitForMutationIdle(): Promise<void> {
@@ -1289,9 +1962,9 @@
                 </div>
               </div>
 
-              {#if settingsOperation}
+              {#if settingsOperation && isCommonSettingField(settingsOperation)}
                 <p class="settings-progress" role="status" aria-live="polite">
-                  Updating {commonSettingLabel(settingsOperation)}…
+                  Updating {settingsFieldLabel(settingsOperation)}…
                 </p>
               {/if}
               {#if settingsMessage}
@@ -1517,6 +2190,266 @@
                 {/each}
               </div>
             </section>
+
+            <section
+              class="override-section"
+              aria-labelledby="transport-override-heading"
+            >
+              <div class="advanced-section-heading">
+                <div>
+                  <h3 id="transport-override-heading">
+                    KCP and SMUX overrides
+                  </h3>
+                  <p>Transport tuning must match the remote paqet server.</p>
+                </div>
+              </div>
+
+              {#if settingsOperation && isKcpSettingField(settingsOperation)}
+                <p class="settings-progress" role="status" aria-live="polite">
+                  Updating {settingsFieldLabel(settingsOperation)}…
+                </p>
+              {/if}
+              {#if transportMessage}
+                <p class="inline-message" role="alert">
+                  {transportMessage}
+                </p>
+              {/if}
+
+              <div class="override-list">
+                <div class="override-item">
+                  <label class="override-toggle">
+                    <input
+                      type="checkbox"
+                      checked={snapshot.advancedSettings.kcpMode !== null}
+                      disabled={!settingsEditable ||
+                        saving ||
+                        interfaceBusy ||
+                        kcpModeQueued ||
+                        settingsOperation === 'kcpMode'}
+                      onchange={(event) =>
+                        handleKcpOverrideToggle(event, 'kcpMode')}
+                    />
+                    <span>
+                      <strong>Override KCP mode</strong>
+                      <small>Default Fast.</small>
+                    </span>
+                  </label>
+                  <div class="override-control">
+                    <label for="kcp-mode">KCP mode</label>
+                    <select
+                      id="kcp-mode"
+                      value={snapshot.advancedSettings.kcpMode ?? 'fast'}
+                      disabled={snapshot.advancedSettings.kcpMode === null ||
+                        !settingsEditable ||
+                        saving ||
+                        interfaceBusy ||
+                        kcpModeQueued ||
+                        settingsOperation === 'kcpMode'}
+                      onchange={selectKcpMode}
+                    >
+                      <option value="normal">Normal</option>
+                      <option value="fast">Fast</option>
+                      <option value="fast2">Fast 2</option>
+                      <option value="fast3">Fast 3</option>
+                      <option value="manual">Manual</option>
+                    </select>
+                  </div>
+
+                  {#if snapshot.advancedSettings.kcpMode === 'manual'}
+                    <fieldset class="manual-kcp">
+                      <legend>Manual KCP tuning</legend>
+                      <p class="field-hint">
+                        Initialized from the previously effective preset.
+                      </p>
+                      <div class="manual-kcp-grid">
+                        {#each manualKcpFields as item (item.field)}
+                          {@const inputId = item.field.replace(
+                            /[A-Z]/g,
+                            (letter) => `-${letter.toLowerCase()}`,
+                          )}
+                          <div class="field">
+                            <label for={inputId}>{item.label}</label>
+                            <input
+                              id={inputId}
+                              bind:this={kcpFieldInputs[item.field]}
+                              bind:value={kcpDraft[item.field]}
+                              inputmode="numeric"
+                              autocomplete="off"
+                              disabled={!settingsEditable ||
+                                saving ||
+                                interfaceBusy ||
+                                kcpModeQueued ||
+                                settingsOperation === 'kcpMode'}
+                              aria-invalid={kcpErrors[item.field]
+                                ? 'true'
+                                : undefined}
+                              aria-describedby="{inputId}-hint{kcpErrors[
+                                item.field
+                              ]
+                                ? ` ${inputId}-error`
+                                : ''}"
+                              oninput={() => handleKcpInput(item.field)}
+                              onblur={() => scheduleKcpDraftCommit(item.field)}
+                              onkeydown={handleCommonKeydown}
+                            />
+                            <p class="field-hint" id="{inputId}-hint">
+                              {item.hint}
+                            </p>
+                            {#if kcpErrors[item.field]}
+                              <p class="field-error" id="{inputId}-error">
+                                {kcpErrors[item.field]}
+                              </p>
+                            {/if}
+                          </div>
+                        {/each}
+                      </div>
+                      <div class="manual-boolean-list">
+                        <label class="boolean-control">
+                          <input
+                            type="checkbox"
+                            checked={snapshot.advancedSettings.manualKcp
+                              .writeDelay ?? false}
+                            disabled={!settingsEditable ||
+                              saving ||
+                              interfaceBusy ||
+                              kcpModeQueued ||
+                              settingsOperation === 'kcpMode' ||
+                              settingsOperation === 'kcpWriteDelay'}
+                            onchange={(event) =>
+                              handleManualKcpBoolean(event, 'kcpWriteDelay')}
+                          />
+                          KCP write delay
+                        </label>
+                        <label class="boolean-control">
+                          <input
+                            type="checkbox"
+                            checked={snapshot.advancedSettings.manualKcp
+                              .ackNoDelay ?? false}
+                            disabled={!settingsEditable ||
+                              saving ||
+                              interfaceBusy ||
+                              kcpModeQueued ||
+                              settingsOperation === 'kcpMode' ||
+                              settingsOperation === 'kcpAckNoDelay'}
+                            onchange={(event) =>
+                              handleManualKcpBoolean(event, 'kcpAckNoDelay')}
+                          />
+                          KCP ACK nodelay
+                        </label>
+                      </div>
+                    </fieldset>
+                  {/if}
+                </div>
+
+                {#each kcpNumericFields as item (item.field)}
+                  {@const inputId = item.field.replace(
+                    /[A-Z]/g,
+                    (letter) => `-${letter.toLowerCase()}`,
+                  )}
+                  <div class="override-item">
+                    <label class="override-toggle">
+                      <input
+                        type="checkbox"
+                        checked={snapshot.advancedSettings[item.field] !== null}
+                        disabled={!settingsEditable ||
+                          saving ||
+                          interfaceBusy ||
+                          settingsOperation === item.field}
+                        onchange={(event) =>
+                          handleKcpOverrideToggle(event, item.field)}
+                      />
+                      <span>
+                        <strong>Override {item.title}</strong>
+                        <small>Default {item.defaultValue}.</small>
+                      </span>
+                    </label>
+                    <div class="override-control">
+                      <label for={inputId}>{item.label}</label>
+                      <input
+                        id={inputId}
+                        bind:this={kcpFieldInputs[item.field]}
+                        bind:value={kcpDraft[item.field]}
+                        inputmode="numeric"
+                        autocomplete="off"
+                        disabled={snapshot.advancedSettings[item.field] ===
+                          null ||
+                          !settingsEditable ||
+                          saving ||
+                          interfaceBusy}
+                        aria-invalid={kcpErrors[item.field]
+                          ? 'true'
+                          : undefined}
+                        aria-describedby="{inputId}-hint{kcpErrors[item.field]
+                          ? ` ${inputId}-error`
+                          : ''}"
+                        oninput={() => handleKcpInput(item.field)}
+                        onblur={() => scheduleKcpDraftCommit(item.field)}
+                        onkeydown={handleCommonKeydown}
+                      />
+                      <p class="field-hint" id="{inputId}-hint">
+                        {item.hint}
+                      </p>
+                      {#if kcpErrors[item.field]}
+                        <p class="field-error" id="{inputId}-error">
+                          {kcpErrors[item.field]}
+                        </p>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
+
+                <div class="override-item">
+                  <label class="override-toggle">
+                    <input
+                      type="checkbox"
+                      checked={snapshot.advancedSettings.kcpBlock !== null}
+                      disabled={!settingsEditable ||
+                        saving ||
+                        interfaceBusy ||
+                        settingsOperation === 'kcpBlock'}
+                      onchange={(event) =>
+                        handleKcpOverrideToggle(event, 'kcpBlock')}
+                    />
+                    <span>
+                      <strong>Override KCP block</strong>
+                      <small>Default AES; the server must match.</small>
+                    </span>
+                  </label>
+                  <div class="override-control">
+                    <label for="kcp-block">KCP block</label>
+                    <select
+                      id="kcp-block"
+                      value={snapshot.advancedSettings.kcpBlock ?? 'aes'}
+                      disabled={snapshot.advancedSettings.kcpBlock === null ||
+                        !settingsEditable ||
+                        saving ||
+                        interfaceBusy ||
+                        settingsOperation === 'kcpBlock'}
+                      onchange={selectKcpBlock}
+                    >
+                      <option value="aes">AES</option>
+                      <option value="aes-128-gcm">AES-128-GCM</option>
+                      <option value="aes-128">AES-128</option>
+                      <option value="aes-192">AES-192</option>
+                      <option value="salsa20">Salsa20</option>
+                      <option value="blowfish">Blowfish</option>
+                      <option value="twofish">Twofish</option>
+                      <option value="cast5">CAST5</option>
+                      <option value="3des">3DES</option>
+                      <option value="tea">TEA</option>
+                      <option value="xtea">XTEA</option>
+                      <option value="xor">XOR</option>
+                      <option value="sm4">SM4</option>
+                      <option value="none">None (insecure)</option>
+                      <option value="null">Null (insecure)</option>
+                    </select>
+                    <p class="field-hint">
+                      None and Null disable encryption and require confirmation.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </section>
           </div>
         {/if}
       </div>
@@ -1580,6 +2513,31 @@
             onclick={confirmDialog}
           >
             Delete profile
+          </button>
+        </div>
+      {:else if dialog.kind === 'unsafeBlock'}
+        <p class="eyebrow">Security warning</p>
+        <h2 id="dialog-title">
+          Use insecure “{dialog.value}” KCP block?
+        </h2>
+        <p id="dialog-description">
+          Traffic will not be encrypted or authenticated. The server must use
+          this exact value; None and Null are not interchangeable.
+        </p>
+        <div class="dialog-actions">
+          <button
+            class="text-button"
+            type="button"
+            bind:this={dialogCancelButton}
+            onclick={closeDialog}>Cancel</button
+          >
+          <button
+            class="danger-button"
+            type="button"
+            bind:this={dialogPrimaryButton}
+            onclick={confirmDialog}
+          >
+            Use insecure block
           </button>
         </div>
       {:else}

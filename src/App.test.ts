@@ -658,7 +658,7 @@ describe('application shell', () => {
     const { user } = await renderLoaded();
     await user.click(screen.getByRole('button', { name: /Advanced/ }));
 
-    expect(screen.getAllByRole('checkbox')).toHaveLength(7);
+    expect(screen.getAllByRole('checkbox')).toHaveLength(16);
     expect(screen.getByRole('combobox', { name: 'Log level' })).toHaveValue(
       'info',
     );
@@ -1156,6 +1156,596 @@ describe('application shell', () => {
     expect(screen.getByRole('combobox', { name: 'Log level' })).toBeDisabled();
     expect(screen.getByLabelText('Local TCP flags')).toBeDisabled();
     expect(screen.getByLabelText('TCP buffer')).toBeDisabled();
+  });
+
+  it('renders every KCP and SMUX override off with its pinned starting value', async () => {
+    const { user } = await renderLoaded();
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    expect(screen.getByRole('combobox', { name: 'KCP mode' })).toHaveValue(
+      'fast',
+    );
+    expect(screen.getByLabelText('KCP MTU')).toHaveValue('1350');
+    expect(screen.getByLabelText('KCP receive window')).toHaveValue('512');
+    expect(screen.getByLabelText('KCP send window')).toHaveValue('512');
+    expect(screen.getByRole('combobox', { name: 'KCP block' })).toHaveValue(
+      'aes',
+    );
+    expect(screen.getByLabelText('SMUX buffer')).toHaveValue('4194304');
+    expect(screen.getByLabelText('Stream buffer')).toHaveValue('2097152');
+    expect(screen.getByLabelText('SMUX keepalive')).toHaveValue('2');
+    expect(screen.getByLabelText('SMUX timeout')).toHaveValue('8');
+    for (const control of [
+      screen.getByRole('combobox', { name: 'KCP mode' }),
+      screen.getByLabelText('KCP MTU'),
+      screen.getByLabelText('KCP receive window'),
+      screen.getByLabelText('KCP send window'),
+      screen.getByRole('combobox', { name: 'KCP block' }),
+      screen.getByLabelText('SMUX buffer'),
+      screen.getByLabelText('Stream buffer'),
+      screen.getByLabelText('SMUX keepalive'),
+      screen.getByLabelText('SMUX timeout'),
+    ]) {
+      expect(control).toBeDisabled();
+    }
+  });
+
+  it('derives a complete Manual tuple from the effective preset and clears it on exit', async () => {
+    const fast2Settings = advancedSettings({ kcpMode: 'fast2' });
+    const manualSettings = advancedSettings({
+      kcpMode: 'manual',
+      manualKcp: {
+        noDelay: 1,
+        interval: 20,
+        resend: 2,
+        noCongestion: 1,
+        writeDelay: false,
+        ackNoDelay: true,
+      },
+    });
+    const normalSettings = advancedSettings({ kcpMode: 'normal' });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: fast2Settings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings)
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '13',
+          advancedSettings: manualSettings,
+        }),
+      )
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '14',
+          advancedSettings: normalSettings,
+        }),
+      );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'KCP mode' }),
+      'manual',
+    );
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(manualSettings),
+    );
+    expect(screen.getByLabelText('KCP nodelay')).toHaveValue('1');
+    expect(screen.getByLabelText('KCP interval')).toHaveValue('20');
+    expect(screen.getByLabelText('KCP resend')).toHaveValue('2');
+    expect(screen.getByLabelText('KCP nocongestion')).toHaveValue('1');
+    expect(screen.getByLabelText('KCP write delay')).not.toBeChecked();
+    expect(screen.getByLabelText('KCP ACK nodelay')).toBeChecked();
+
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'KCP mode' }),
+      'normal',
+    );
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenLastCalledWith(
+        normalSettings,
+      ),
+    );
+    expect(
+      screen.queryByRole('group', { name: 'Manual KCP tuning' }),
+    ).toBeNull();
+  });
+
+  it('commits valid nested Manual values and keeps invalid values local', async () => {
+    const initialSettings = advancedSettings({
+      kcpMode: 'manual',
+      manualKcp: {
+        noDelay: 0,
+        interval: 30,
+        resend: 2,
+        noCongestion: 1,
+        writeDelay: true,
+        ackNoDelay: false,
+      },
+    });
+    const updatedSettings = advancedSettings({
+      ...initialSettings,
+      manualKcp: { ...initialSettings.manualKcp, interval: 75 },
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: updatedSettings,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const interval = screen.getByLabelText('KCP interval');
+
+    await user.clear(interval);
+    await user.type(interval, '9');
+    await user.tab();
+    expect(api.replaceAdvancedSettings).not.toHaveBeenCalled();
+    expect(interval).toHaveAttribute('aria-invalid', 'true');
+    expect(
+      screen.getByText('KCP interval must be between 10 and 5000.'),
+    ).toBeInTheDocument();
+
+    await user.clear(interval);
+    await user.type(interval, '75');
+    await user.keyboard('{Enter}');
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(updatedSettings),
+    );
+    expect(interval).toHaveValue('75');
+  });
+
+  it('validates effective SMUX buffer relationships before replacement', async () => {
+    const initialSettings = advancedSettings({ streamBuffer: 2_097_152 });
+    const enabledSettings = advancedSettings({
+      smuxBuffer: 4_194_304,
+      streamBuffer: 2_097_152,
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: enabledSettings,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override SMUX buffer/ }),
+    );
+    const smuxBuffer = screen.getByLabelText('SMUX buffer');
+    await waitFor(() => expect(smuxBuffer).toBeEnabled());
+    await user.clear(smuxBuffer);
+    await user.type(smuxBuffer, '1048576');
+    await user.tab();
+
+    expect(api.replaceAdvancedSettings).toHaveBeenCalledTimes(1);
+    expect(smuxBuffer).toHaveAttribute('aria-invalid', 'true');
+    expect(
+      screen.getByText(
+        'SMUX buffer must be at least the effective stream buffer.',
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it('accepts equal SMUX keepalive and timeout but rejects a shorter timeout', async () => {
+    const initialSettings = advancedSettings({
+      smuxKeepalive: 8,
+      smuxTimeout: 8,
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const timeout = screen.getByLabelText('SMUX timeout');
+
+    await user.clear(timeout);
+    await user.type(timeout, '7');
+    await user.tab();
+    expect(api.replaceAdvancedSettings).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(
+        'SMUX timeout must be at least the effective keepalive.',
+      ),
+    ).toBeInTheDocument();
+
+    await user.clear(timeout);
+    await user.type(timeout, '8');
+    await user.keyboard('{Enter}');
+    expect(timeout).not.toHaveAttribute('aria-invalid');
+    expect(api.replaceAdvancedSettings).not.toHaveBeenCalled();
+  });
+
+  it('requires confirmation before committing each wire-distinct insecure KCP block', async () => {
+    const initialSettings = advancedSettings({ kcpBlock: 'aes' });
+    const nullSettings = advancedSettings({ kcpBlock: 'null' });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: nullSettings,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const block = screen.getByRole('combobox', { name: 'KCP block' });
+
+    await user.selectOptions(block, 'none');
+    expect(screen.getByRole('alertdialog')).toHaveTextContent(
+      'Traffic will not be encrypted or authenticated',
+    );
+    expect(screen.getByRole('alertdialog')).toHaveTextContent(
+      'None and Null are not interchangeable',
+    );
+    expect(api.replaceAdvancedSettings).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(block).toHaveFocus();
+    expect(block).toHaveValue('aes');
+
+    await user.selectOptions(block, 'null');
+    await user.click(
+      screen.getByRole('button', { name: 'Use insecure block' }),
+    );
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(nullSettings),
+    );
+    expect(block).toHaveValue('null');
+    expect(block).toHaveFocus();
+    expect(
+      within(block)
+        .getAllByRole('option')
+        .map((option) => option.getAttribute('value')),
+    ).toEqual([
+      'aes',
+      'aes-128-gcm',
+      'aes-128',
+      'aes-192',
+      'salsa20',
+      'blowfish',
+      'twofish',
+      'cast5',
+      '3des',
+      'tea',
+      'xtea',
+      'xor',
+      'sm4',
+      'none',
+      'null',
+    ]);
+  });
+
+  it.each([
+    ['normal', 0, 40, 2, 1, true, false],
+    ['fast', 0, 30, 2, 1, true, false],
+    ['fast2', 1, 20, 2, 1, false, true],
+    ['fast3', 1, 10, 2, 1, false, true],
+  ] as const)(
+    'derives the complete %s preset when entering Manual mode',
+    async (
+      mode,
+      noDelay,
+      interval,
+      resend,
+      noCongestion,
+      writeDelay,
+      ackNoDelay,
+    ) => {
+      const initialSettings = advancedSettings({ kcpMode: mode });
+      const expected = advancedSettings({
+        kcpMode: 'manual',
+        manualKcp: {
+          noDelay,
+          interval,
+          resend,
+          noCongestion,
+          writeDelay,
+          ackNoDelay,
+        },
+      });
+      const api = mockApi(
+        snapshot(primaryProfile, { advancedSettings: initialSettings }),
+      );
+      vi.mocked(api.replaceAdvancedSettings).mockResolvedValue(
+        snapshot(primaryProfile, {
+          revision: '13',
+          advancedSettings: expected,
+        }),
+      );
+      const { user } = await renderLoaded(api);
+      await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+      await user.selectOptions(
+        screen.getByRole('combobox', { name: 'KCP mode' }),
+        'manual',
+      );
+      await waitFor(() =>
+        expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(expected),
+      );
+    },
+  );
+
+  it('does not recreate Manual fields from a queued boolean after leaving Manual mode', async () => {
+    const initialSettings = advancedSettings({
+      kcpMode: 'manual',
+      manualKcp: {
+        noDelay: 0,
+        interval: 30,
+        resend: 2,
+        noCongestion: 1,
+        writeDelay: true,
+        ackNoDelay: false,
+      },
+    });
+    const normalSettings = advancedSettings({ kcpMode: 'normal' });
+    const pendingMode = deferred<AppSnapshot>();
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockReturnValue(pendingMode.promise);
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const writeDelay = screen.getByLabelText('KCP write delay');
+    const interval = screen.getByLabelText('KCP interval');
+
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'KCP mode' }),
+      'normal',
+    );
+    expect(writeDelay).toBeDisabled();
+    expect(interval).toBeDisabled();
+    await user.click(writeDelay);
+    pendingMode.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: normalSettings,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.queryByLabelText('KCP write delay')).toBeNull(),
+    );
+    expect(api.replaceAdvancedSettings).toHaveBeenCalledOnce();
+    expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(normalSettings);
+  });
+
+  it('rejects disabling an effective SMUX dependency without marking its valid value invalid', async () => {
+    const initialSettings = advancedSettings({
+      smuxBuffer: 8_388_608,
+      streamBuffer: 6_291_456,
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const smuxBuffer = screen.getByLabelText('SMUX buffer');
+
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override SMUX buffer/ }),
+    );
+
+    expect(api.replaceAdvancedSettings).not.toHaveBeenCalled();
+    expect(smuxBuffer).not.toHaveAttribute('aria-invalid');
+    const transportSection = screen
+      .getByRole('heading', { name: 'KCP and SMUX overrides' })
+      .closest('section')!;
+    expect(within(transportSection).getByRole('alert')).toHaveTextContent(
+      'SMUX buffer must be at least the effective stream buffer.',
+    );
+    expect(
+      screen.getByRole('checkbox', { name: /Override SMUX buffer/ }),
+    ).toBeChecked();
+  });
+
+  it('rebases a queued KCP replacement on the latest common settings snapshot', async () => {
+    const pendingLog = deferred<AppSnapshot>();
+    const initialSettings = advancedSettings();
+    const logSettings = advancedSettings({ logLevel: 'info' });
+    const combinedSettings = advancedSettings({
+      logLevel: 'info',
+      kcpMtu: 1350,
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings)
+      .mockReturnValueOnce(pendingLog.promise)
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '14',
+          advancedSettings: combinedSettings,
+        }),
+      );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override log level/ }),
+    );
+    await user.click(
+      screen.getByRole('checkbox', { name: /Override KCP MTU/ }),
+    );
+    expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(logSettings);
+
+    pendingLog.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: logSettings,
+      }),
+    );
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledTimes(2),
+    );
+    expect(api.replaceAdvancedSettings).toHaveBeenLastCalledWith(
+      combinedSettings,
+    );
+  });
+
+  it('orders a newer secure block selection after a confirmed insecure replacement', async () => {
+    const initialSettings = advancedSettings({ kcpBlock: 'aes' });
+    const noneSettings = advancedSettings({ kcpBlock: 'none' });
+    const secureSettings = advancedSettings({ kcpBlock: 'aes-128-gcm' });
+    const pendingInsecure = deferred<AppSnapshot>();
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings)
+      .mockReturnValueOnce(pendingInsecure.promise)
+      .mockResolvedValueOnce(
+        snapshot(primaryProfile, {
+          revision: '14',
+          advancedSettings: secureSettings,
+        }),
+      );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const block = screen.getByRole('combobox', { name: 'KCP block' });
+
+    await user.selectOptions(block, 'none');
+    await user.click(
+      screen.getByRole('button', { name: 'Use insecure block' }),
+    );
+    expect(block).toHaveFocus();
+    expect(block).toBeDisabled();
+    expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(noneSettings);
+
+    pendingInsecure.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        advancedSettings: noneSettings,
+      }),
+    );
+    await waitFor(() => expect(block).toBeEnabled());
+    await user.selectOptions(block, 'aes-128-gcm');
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledTimes(2),
+    );
+    expect(api.replaceAdvancedSettings).toHaveBeenLastCalledWith(
+      secureSettings,
+    );
+    expect(block).toHaveValue('aes-128-gcm');
+  });
+
+  it('restores a rejected Manual boolean to its canonical checked state', async () => {
+    const initialSettings = advancedSettings({
+      kcpMode: 'manual',
+      manualKcp: {
+        noDelay: 0,
+        interval: 30,
+        resend: 2,
+        noCongestion: 1,
+        writeDelay: true,
+        ackNoDelay: false,
+      },
+    });
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockRejectedValue({
+      kind: 'settingsLocked',
+    });
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    const writeDelay = screen.getByLabelText('KCP write delay');
+
+    await user.click(writeDelay);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Advanced settings are locked while paqet is active.',
+    );
+    expect(writeDelay).toBeChecked();
+  });
+
+  it('shows canonical KCP and SMUX values while lifecycle locking disables their controls', async () => {
+    const locked = snapshot(primaryProfile, {
+      advancedSettings: advancedSettings({
+        kcpMode: 'fast3',
+        kcpMtu: 1400,
+        kcpBlock: 'aes-128-gcm',
+        smuxBuffer: 8_388_608,
+        streamBuffer: 4_194_304,
+        smuxKeepalive: 4,
+        smuxTimeout: 12,
+      }),
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    const { user } = await renderLoaded(mockApi(locked));
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    expect(screen.getByRole('combobox', { name: 'KCP mode' })).toHaveValue(
+      'fast3',
+    );
+    expect(screen.getByLabelText('KCP MTU')).toHaveValue('1400');
+    expect(screen.getByRole('combobox', { name: 'KCP block' })).toHaveValue(
+      'aes-128-gcm',
+    );
+    expect(screen.getByLabelText('SMUX buffer')).toHaveValue('8388608');
+    expect(screen.getByLabelText('Stream buffer')).toHaveValue('4194304');
+    expect(screen.getByLabelText('SMUX keepalive')).toHaveValue('4');
+    expect(screen.getByLabelText('SMUX timeout')).toHaveValue('12');
+    for (const control of screen.getAllByRole('checkbox')) {
+      expect(control).toBeDisabled();
+    }
+    expect(screen.getByRole('combobox', { name: 'KCP mode' })).toBeDisabled();
+    expect(screen.getByLabelText('KCP MTU')).toBeDisabled();
+    expect(screen.getByRole('combobox', { name: 'KCP block' })).toBeDisabled();
+    expect(screen.getByLabelText('SMUX timeout')).toBeDisabled();
+  });
+
+  it('keeps a complete Manual tuple inspectable while lifecycle locking disables it', async () => {
+    const locked = snapshot(primaryProfile, {
+      advancedSettings: advancedSettings({
+        kcpMode: 'manual',
+        manualKcp: {
+          noDelay: 1,
+          interval: 10,
+          resend: 2,
+          noCongestion: 1,
+          writeDelay: false,
+          ackNoDelay: true,
+        },
+      }),
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    const { user } = await renderLoaded(mockApi(locked));
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    expect(screen.getByLabelText('KCP nodelay')).toHaveValue('1');
+    expect(screen.getByLabelText('KCP interval')).toHaveValue('10');
+    expect(screen.getByLabelText('KCP resend')).toHaveValue('2');
+    expect(screen.getByLabelText('KCP nocongestion')).toHaveValue('1');
+    expect(screen.getByLabelText('KCP write delay')).not.toBeChecked();
+    expect(screen.getByLabelText('KCP ACK nodelay')).toBeChecked();
+    for (const label of [
+      'KCP nodelay',
+      'KCP interval',
+      'KCP resend',
+      'KCP nocongestion',
+      'KCP write delay',
+      'KCP ACK nodelay',
+    ]) {
+      expect(screen.getByLabelText(label)).toBeDisabled();
+    }
   });
 });
 
