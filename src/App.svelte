@@ -4,6 +4,7 @@
   import type {
     AppSnapshot,
     IpcError,
+    NetworkInterface,
     Profile,
     ProfileDraft,
     ProfileFieldName,
@@ -16,9 +17,12 @@
     updateProfile(id: ProfileId, draft: ProfileDraft): Promise<AppSnapshot>;
     deleteProfile(id: ProfileId): Promise<AppSnapshot>;
     selectProfile(id: ProfileId): Promise<AppSnapshot>;
+    refreshInterfaces(): Promise<AppSnapshot>;
+    selectInterface(guid: string): Promise<AppSnapshot>;
   }
 
   type EditorMode = 'view' | 'create' | 'edit';
+  type InterfaceOperation = 'refresh' | 'select' | null;
   type ProfileInput = Omit<ProfileDraft, 'port'> & { port: string };
   type FieldErrors = Partial<Record<ProfileFieldName, string>>;
   type DialogState =
@@ -36,6 +40,8 @@
   let message = $state('');
   let loading = $state(true);
   let saving = $state(false);
+  let interfaceOperation = $state<InterfaceOperation>(null);
+  let interfaceMessage = $state('');
   let revealKey = $state(false);
   let advancedExpanded = $state(false);
   let dialog = $state<DialogState>(null);
@@ -51,10 +57,18 @@
   let dialogInvoker: HTMLElement | null = null;
 
   const selectedProfile = $derived(snapshot?.selectedProfile ?? null);
+  const selectedInterface = $derived(
+    snapshot?.interfaces.find(
+      (networkInterface) =>
+        networkInterface.guid === snapshot?.selectedInterfaceGuid,
+    ) ?? null,
+  );
   const settingsEditable = $derived(
     snapshot?.lifecycle.settingsEditable ?? false,
   );
   const editorOpen = $derived(editorMode !== 'view');
+  const interfaceBusy = $derived(interfaceOperation !== null);
+  const mutationBusy = $derived(saving || interfaceBusy);
   const draftChanged = $derived(
     editorMode === 'create'
       ? Object.values(draft).some((value) => value.length > 0)
@@ -96,7 +110,7 @@
     loading = true;
     message = '';
     try {
-      applySnapshot(await api.getAppSnapshot());
+      applySnapshot(await api.getAppSnapshot(), true);
     } catch {
       message =
         'The application state could not be loaded. Restart paqet and try again.';
@@ -105,18 +119,28 @@
     }
   }
 
-  function applySnapshot(nextSnapshot: AppSnapshot): void {
+  function applySnapshot(
+    nextSnapshot: AppSnapshot,
+    resetProfileEditor = false,
+  ): boolean {
+    if (snapshot && BigInt(nextSnapshot.revision) < BigInt(snapshot.revision)) {
+      return false;
+    }
+
     snapshot = nextSnapshot;
-    editorMode = 'view';
-    fieldErrors = {};
-    revealKey = false;
-    draft = nextSnapshot.selectedProfile
-      ? profileInput(nextSnapshot.selectedProfile)
-      : emptyProfileInput();
+    if (resetProfileEditor) {
+      editorMode = 'view';
+      fieldErrors = {};
+      revealKey = false;
+      draft = nextSnapshot.selectedProfile
+        ? profileInput(nextSnapshot.selectedProfile)
+        : emptyProfileInput();
+    }
+    return true;
   }
 
   function beginCreate(): void {
-    if (!settingsEditable || saving) return;
+    if (!settingsEditable || mutationBusy) return;
     if (draftChanged) {
       openDialog({ kind: 'discardCreate' });
       return;
@@ -134,7 +158,7 @@
   }
 
   function beginEdit(): void {
-    if (!selectedProfile || !settingsEditable || saving) return;
+    if (!selectedProfile || !settingsEditable || mutationBusy) return;
     editorMode = 'edit';
     draft = profileInput(selectedProfile);
     fieldErrors = {};
@@ -172,7 +196,7 @@
     saving = true;
     message = '';
     try {
-      applySnapshot(await api.selectProfile(profileId));
+      applySnapshot(await api.selectProfile(profileId), true);
     } catch {
       message = 'The selected profile could not be opened.';
     } finally {
@@ -191,7 +215,7 @@
 
   async function saveProfile(event: SubmitEvent): Promise<void> {
     event.preventDefault();
-    if (!editorOpen || !settingsEditable || saving) return;
+    if (!editorOpen || !settingsEditable || mutationBusy) return;
 
     fieldErrors = validateProfile(draft);
     const firstInvalid = firstInvalidField(fieldErrors);
@@ -214,7 +238,7 @@
         editorMode === 'create'
           ? await api.createProfile(profileDraft)
           : await api.updateProfile(selectedProfile!.id, profileDraft);
-      applySnapshot(nextSnapshot);
+      applySnapshot(nextSnapshot, true);
     } catch (error) {
       saving = false;
       await presentProfileError(error);
@@ -243,7 +267,7 @@
   }
 
   function requestDelete(): void {
-    if (!selectedProfile || !settingsEditable || saving) return;
+    if (!selectedProfile || !settingsEditable || mutationBusy) return;
     openDialog({ kind: 'delete', profile: selectedProfile });
   }
 
@@ -269,7 +293,7 @@
     saving = true;
     message = '';
     try {
-      applySnapshot(await api.deleteProfile(action.profile.id));
+      applySnapshot(await api.deleteProfile(action.profile.id), true);
     } catch {
       message = `The profile “${action.profile.name}” could not be deleted.`;
     } finally {
@@ -454,6 +478,56 @@
   function formatStatus(status: AppSnapshot['lifecycle']['status']): string {
     return status.charAt(0).toUpperCase() + status.slice(1);
   }
+
+  async function handleInterfaceSelection(event: Event): Promise<void> {
+    const select = event.currentTarget as HTMLSelectElement;
+    const guid = select.value;
+    select.value = snapshot?.selectedInterfaceGuid ?? '';
+    if (!guid || guid === snapshot?.selectedInterfaceGuid) return;
+    await runInterfaceMutation('select', () => api.selectInterface(guid));
+  }
+
+  async function refreshInterfaces(): Promise<void> {
+    await runInterfaceMutation('refresh', () => api.refreshInterfaces());
+  }
+
+  async function runInterfaceMutation(
+    kind: Exclude<InterfaceOperation, null>,
+    operation: () => Promise<AppSnapshot>,
+  ): Promise<void> {
+    if (!settingsEditable || mutationBusy) return;
+    interfaceOperation = kind;
+    interfaceMessage = '';
+    try {
+      applySnapshot(await operation());
+    } catch (error) {
+      presentInterfaceError(error);
+    } finally {
+      interfaceOperation = null;
+    }
+  }
+
+  function presentInterfaceError(error: unknown): void {
+    if (isIpcError(error) && error.kind === 'settingsLocked') {
+      interfaceMessage = 'Network settings are locked while paqet is active.';
+      return;
+    }
+    if (isIpcError(error) && error.kind === 'interfaceNotFound') {
+      interfaceMessage =
+        'That network interface is no longer available. Refresh the list and choose another.';
+      return;
+    }
+    if (isIpcError(error) && error.kind === 'networkDiscovery') {
+      interfaceMessage =
+        'Windows network interfaces could not be refreshed. Check your network and try again.';
+      return;
+    }
+    interfaceMessage = 'The network interface could not be updated.';
+  }
+
+  function interfaceOptionLabel(networkInterface: NetworkInterface): string {
+    return `${networkInterface.friendlyName} · ${networkInterface.localAddress}`;
+  }
 </script>
 
 <svelte:head>
@@ -520,7 +594,7 @@
           bind:this={profileSelect}
           value={selectedProfile?.id ?? ''}
           disabled={!settingsEditable ||
-            saving ||
+            mutationBusy ||
             snapshot.profiles.length === 0}
           onchange={handleProfileSelection}
         >
@@ -535,7 +609,7 @@
           class="secondary-button compact-button"
           type="button"
           bind:this={newProfileButton}
-          disabled={!settingsEditable || saving}
+          disabled={!settingsEditable || mutationBusy}
           onclick={beginCreate}
         >
           New
@@ -545,7 +619,7 @@
           type="button"
           disabled={!selectedProfile ||
             !settingsEditable ||
-            saving ||
+            mutationBusy ||
             editorOpen}
           onclick={beginEdit}
         >
@@ -556,7 +630,12 @@
       {#if !selectedProfile && editorMode === 'view'}
         <div class="empty-state">
           <p>Add a server profile to begin configuring paqet.</p>
-          <button class="secondary-button" type="button" onclick={beginCreate}>
+          <button
+            class="secondary-button"
+            type="button"
+            disabled={!settingsEditable || mutationBusy}
+            onclick={beginCreate}
+          >
             Add server profile
           </button>
         </div>
@@ -573,7 +652,7 @@
               id="profile-name"
               bind:this={nameInput}
               bind:value={draft.name}
-              readonly={!editorOpen}
+              readonly={!editorOpen || !settingsEditable}
               disabled={saving}
               autocomplete="off"
               required={editorOpen}
@@ -597,7 +676,7 @@
                 id="server-host"
                 bind:this={serverHostInput}
                 bind:value={draft.serverHost}
-                readonly={!editorOpen}
+                readonly={!editorOpen || !settingsEditable}
                 disabled={saving}
                 autocapitalize="none"
                 autocomplete="off"
@@ -622,7 +701,7 @@
                 id="server-port"
                 bind:this={portInput}
                 bind:value={draft.port}
-                readonly={!editorOpen}
+                readonly={!editorOpen || !settingsEditable}
                 disabled={saving}
                 inputmode="numeric"
                 autocomplete="off"
@@ -649,7 +728,7 @@
                 bind:this={encryptionKeyInput}
                 bind:value={draft.encryptionKey}
                 type={revealKey ? 'text' : 'password'}
-                readonly={!editorOpen}
+                readonly={!editorOpen || !settingsEditable}
                 disabled={saving}
                 autocomplete="off"
                 spellcheck="false"
@@ -686,7 +765,7 @@
                 <button
                   class="danger-button"
                   type="button"
-                  disabled={saving}
+                  disabled={mutationBusy || !settingsEditable}
                   onclick={requestDelete}
                 >
                   Delete profile
@@ -701,7 +780,11 @@
               >
                 Cancel
               </button>
-              <button class="primary-small" type="submit" disabled={saving}>
+              <button
+                class="primary-small"
+                type="submit"
+                disabled={mutationBusy || !settingsEditable}
+              >
                 {saving
                   ? 'Saving…'
                   : editorMode === 'create'
@@ -729,10 +812,97 @@
         </button>
         {#if advancedExpanded}
           <div id="advanced-content" class="advanced-content">
-            <p>
-              Network interface details and optional paqet overrides appear here
-              when configured.
-            </p>
+            <section
+              class="interface-section"
+              aria-labelledby="interface-heading"
+            >
+              <div class="advanced-section-heading">
+                <div>
+                  <h3 id="interface-heading">Network interface</h3>
+                  <p>Used to derive the local paqet connection details.</p>
+                </div>
+                <button
+                  class="text-button refresh-button"
+                  type="button"
+                  disabled={!settingsEditable || mutationBusy}
+                  onclick={refreshInterfaces}
+                >
+                  {interfaceOperation === 'refresh' ? 'Refreshing…' : 'Refresh'}
+                </button>
+              </div>
+
+              <div class="field">
+                <label for="interface-select">Interface</label>
+                <select
+                  id="interface-select"
+                  class="interface-select"
+                  value={snapshot.selectedInterfaceGuid ?? ''}
+                  disabled={!settingsEditable ||
+                    mutationBusy ||
+                    snapshot.interfaces.length === 0}
+                  onchange={handleInterfaceSelection}
+                >
+                  {#if snapshot.interfaces.length === 0}
+                    <option value="">No usable interfaces found</option>
+                  {:else if !snapshot.selectedInterfaceGuid}
+                    <option value="">Select an interface</option>
+                  {/if}
+                  {#each snapshot.interfaces as networkInterface (networkInterface.guid)}
+                    <option value={networkInterface.guid}>
+                      {interfaceOptionLabel(networkInterface)}
+                    </option>
+                  {/each}
+                </select>
+              </div>
+
+              {#if interfaceOperation === 'select'}
+                <p class="interface-progress" role="status" aria-live="polite">
+                  Selecting network interface…
+                </p>
+              {/if}
+
+              {#if interfaceMessage}
+                <p class="inline-message" role="alert">{interfaceMessage}</p>
+              {/if}
+
+              {#if selectedInterface}
+                <dl
+                  class="interface-details"
+                  aria-label="Derived interface details"
+                >
+                  <div>
+                    <dt>Interface name</dt>
+                    <dd>{selectedInterface.interfaceName}</dd>
+                  </div>
+                  <div>
+                    <dt>Npcap device</dt>
+                    <dd>{selectedInterface.guid}</dd>
+                  </div>
+                  <div>
+                    <dt>Local address</dt>
+                    <dd>{selectedInterface.localAddress}</dd>
+                  </div>
+                  <div>
+                    <dt>Gateway address</dt>
+                    <dd>{selectedInterface.gatewayAddress}</dd>
+                  </div>
+                  <div>
+                    <dt>Gateway MAC</dt>
+                    <dd>{selectedInterface.gatewayMac}</dd>
+                  </div>
+                </dl>
+              {:else}
+                <div class="interface-empty" role="status">
+                  <strong>No usable network interface is available.</strong>
+                  <span>Connect Ethernet or Wi-Fi, then refresh the list.</span>
+                </div>
+              {/if}
+
+              <div class="override-preview" aria-labelledby="override-heading">
+                <h3 id="override-heading">Paqet overrides</h3>
+                <p>Optional override controls are not configured yet.</p>
+              </div>
+            </section>
           </div>
         {/if}
       </div>

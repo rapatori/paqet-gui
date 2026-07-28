@@ -54,6 +54,7 @@ button {
 
 h1,
 h2,
+h3,
 p {
   margin: 0;
 }
@@ -68,6 +69,11 @@ h2 {
   font-size: 17px;
   font-weight: 650;
   letter-spacing: -0.018em;
+}
+
+h3 {
+  font-size: 13px;
+  font-weight: 680;
 }
 
 .app-shell {
@@ -88,6 +94,7 @@ h2 {
 .form-actions,
 .log-heading,
 .log-actions,
+.advanced-section-heading,
 .dialog-actions {
   display: flex;
   align-items: center;
@@ -411,10 +418,100 @@ input[aria-invalid='true'] {
 }
 
 .advanced-content {
-  padding: 3px 2px 10px;
+  padding: 5px 2px 10px;
   color: #9bafb4;
   font-size: 12px;
   line-height: 1.5;
+}
+
+.interface-section {
+  display: grid;
+  gap: 11px;
+}
+
+.advanced-section-heading {
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.advanced-section-heading p,
+.override-preview p {
+  margin-top: 2px;
+  color: #7f979d;
+  font-size: 11px;
+}
+
+.refresh-button {
+  min-height: 44px;
+  flex: 0 0 auto;
+}
+
+.interface-select {
+  min-height: 44px;
+}
+
+.interface-progress {
+  color: #9ec5ca;
+}
+
+.inline-message {
+  padding: 8px 10px;
+  border-left: 3px solid #d78088;
+  border-radius: 4px;
+  color: #efc5c8;
+  background: #2a2025;
+  overflow-wrap: anywhere;
+}
+
+.interface-details {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  border: 1px solid #293f47;
+  border-radius: 8px;
+  background: #101b21;
+}
+
+.interface-details div {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  gap: 8px;
+  padding: 7px 9px;
+  border-bottom: 1px solid #253840;
+}
+
+.interface-details div:last-child {
+  border-bottom: 0;
+}
+
+.interface-details dt {
+  color: #7f979d;
+}
+
+.interface-details dd {
+  min-width: 0;
+  margin: 0;
+  color: #c4d2d5;
+  font-family: 'Cascadia Mono', Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.interface-empty {
+  display: grid;
+  gap: 2px;
+  padding: 10px;
+  border: 1px dashed #354a52;
+  border-radius: 8px;
+}
+
+.interface-empty strong {
+  color: #b7c7ca;
+}
+
+.override-preview {
+  padding-top: 11px;
+  border-top: 1px solid #293b43;
 }
 
 .empty-state {
@@ -588,6 +685,11 @@ input[aria-invalid='true'] {
 
   .server-row {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .interface-details div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1px;
   }
 
   .form-actions > *,

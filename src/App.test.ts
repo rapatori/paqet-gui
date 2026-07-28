@@ -4,7 +4,12 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { vi } from 'vitest';
 import App, { type AppApi } from './App.svelte';
-import type { AppSnapshot, Profile, ProfileDraft } from './lib/api';
+import type {
+  AppSnapshot,
+  NetworkInterface,
+  Profile,
+  ProfileDraft,
+} from './lib/api';
 
 const styles = readFileSync(join(process.cwd(), 'src', 'styles.css'), 'utf8');
 
@@ -24,8 +29,37 @@ const backupProfile: Profile = {
   encryptionKey: 'backup-test-key',
 };
 
+const ethernetInterface: NetworkInterface = {
+  friendlyName: 'Ethernet',
+  interfaceName: 'Ethernet',
+  guid: '\\Device\\NPF_{AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE}',
+  localAddress: '192.0.2.20',
+  gatewayAddress: '192.0.2.1',
+  gatewayMac: '00:11:22:33:44:55',
+};
+
+const wifiInterface: NetworkInterface = {
+  friendlyName: 'Wi-Fi',
+  interfaceName: 'Wi-Fi',
+  guid: '\\Device\\NPF_{BBBBBBBB-CCCC-4DDD-8EEE-FFFFFFFFFFFF}',
+  localAddress: '198.51.100.20',
+  gatewayAddress: '198.51.100.1',
+  gatewayMac: '66:77:88:99:AA:BB',
+};
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function snapshot(
   selectedProfile: Profile | null = primaryProfile,
+  overrides: Partial<AppSnapshot> = {},
 ): AppSnapshot {
   const profiles = [primaryProfile, backupProfile];
   return {
@@ -39,8 +73,8 @@ function snapshot(
         }))
       : [],
     selectedProfile,
-    interfaces: [],
-    selectedInterfaceGuid: null,
+    interfaces: [ethernetInterface, wifiInterface],
+    selectedInterfaceGuid: ethernetInterface.guid,
     advancedSettings: {
       logLevel: null,
       pcapSocketBuffer: null,
@@ -73,6 +107,7 @@ function snapshot(
       failure: null,
       settingsEditable: true,
     },
+    ...overrides,
   };
 }
 
@@ -83,6 +118,8 @@ function mockApi(initialSnapshot = snapshot()): AppApi {
     updateProfile: vi.fn().mockResolvedValue(initialSnapshot),
     deleteProfile: vi.fn().mockResolvedValue(initialSnapshot),
     selectProfile: vi.fn().mockResolvedValue(initialSnapshot),
+    refreshInterfaces: vi.fn().mockResolvedValue(initialSnapshot),
+    selectInterface: vi.fn().mockResolvedValue(initialSnapshot),
   };
 }
 
@@ -126,7 +163,12 @@ describe('application shell', () => {
     expect(advanced).toHaveAttribute('aria-expanded', 'false');
     await user.click(advanced);
     expect(advanced).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByText(/Network interface details/)).toBeInTheDocument();
+    expect(screen.getByRole('combobox', { name: 'Interface' })).toHaveValue(
+      ethernetInterface.guid,
+    );
+    expect(screen.getByText('Ethernet · 192.0.2.20')).toBeInTheDocument();
+    expect(screen.getByText(ethernetInterface.guid)).toBeInTheDocument();
+    expect(screen.getByText('00:11:22:33:44:55')).toBeInTheDocument();
   });
 
   it('presents an actionable empty state without inventing persisted data', async () => {
@@ -406,6 +448,200 @@ describe('application shell', () => {
     expect(await screen.findByLabelText('Profile name')).toHaveValue('Primary');
     expect(api.getAppSnapshot).toHaveBeenCalledTimes(2);
   });
+
+  it('selects a native interface and displays every derived detail', async () => {
+    const api = mockApi();
+    vi.mocked(api.selectInterface).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        selectedInterfaceGuid: wifiInterface.guid,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Interface' }),
+      wifiInterface.guid,
+    );
+
+    await waitFor(() =>
+      expect(api.selectInterface).toHaveBeenCalledWith(wifiInterface.guid),
+    );
+    expect(screen.getByRole('combobox', { name: 'Interface' })).toHaveValue(
+      wifiInterface.guid,
+    );
+    expect(screen.getByText(wifiInterface.interfaceName)).toBeInTheDocument();
+    expect(screen.getByText(wifiInterface.guid)).toBeInTheDocument();
+    expect(screen.getByText(wifiInterface.localAddress)).toBeInTheDocument();
+    expect(screen.getByText(wifiInterface.gatewayAddress)).toBeInTheDocument();
+    expect(screen.getByText(wifiInterface.gatewayMac)).toBeInTheDocument();
+  });
+
+  it('refreshes canonical interfaces without discarding an active profile draft', async () => {
+    const refreshedEthernet = {
+      ...ethernetInterface,
+      localAddress: '192.0.2.44',
+    };
+    const api = mockApi();
+    vi.mocked(api.refreshInterfaces).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        interfaces: [refreshedEthernet],
+        selectedInterfaceGuid: refreshedEthernet.guid,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Unsaved name');
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    await waitFor(() => expect(api.refreshInterfaces).toHaveBeenCalledOnce());
+    expect(screen.getByText('192.0.2.44')).toBeInTheDocument();
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Unsaved name');
+    expect(
+      screen.getByRole('button', { name: 'Save changes' }),
+    ).toBeInTheDocument();
+  });
+
+  it('does not regress canonical state when an older interface snapshot arrives', async () => {
+    const current = snapshot(primaryProfile, {
+      revision: '9007199254740993',
+    });
+    const api = mockApi(current);
+    vi.mocked(api.refreshInterfaces).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '9007199254740992',
+        interfaces: [wifiInterface],
+        selectedInterfaceGuid: wifiInterface.guid,
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+
+    await waitFor(() => expect(api.refreshInterfaces).toHaveBeenCalledOnce());
+    expect(screen.getByRole('combobox', { name: 'Interface' })).toHaveValue(
+      ethernetInterface.guid,
+    );
+    expect(
+      screen.getByText(ethernetInterface.localAddress),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(wifiInterface.gatewayMac),
+    ).not.toBeInTheDocument();
+  });
+
+  it('serializes a pending interface mutation and preserves the profile draft', async () => {
+    const pendingSelection = deferred<AppSnapshot>();
+    const api = mockApi();
+    vi.mocked(api.selectInterface).mockReturnValue(pendingSelection.promise);
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Pending draft');
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Interface' }),
+      wifiInterface.guid,
+    );
+
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Selecting network interface…',
+    );
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
+    expect(screen.getByRole('combobox', { name: 'Interface' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', { name: 'Delete profile' }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole('combobox', { name: 'Selected server profile' }),
+    ).toBeDisabled();
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Pending draft');
+    expect(api.refreshInterfaces).not.toHaveBeenCalled();
+
+    pendingSelection.resolve(
+      snapshot(primaryProfile, {
+        revision: '13',
+        selectedInterfaceGuid: wifiInterface.guid,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole('combobox', { name: 'Interface' })).toHaveValue(
+        wifiInterface.guid,
+      ),
+    );
+    expect(screen.queryByText('Selecting network interface…')).toBeNull();
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Pending draft');
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled();
+  });
+
+  it('distinguishes an empty interface result from refresh failure', async () => {
+    const api = mockApi(
+      snapshot(primaryProfile, {
+        interfaces: [],
+        selectedInterfaceGuid: null,
+      }),
+    );
+    vi.mocked(api.refreshInterfaces).mockRejectedValue({
+      kind: 'networkDiscovery',
+    });
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    expect(screen.getByText('No usable interfaces found')).toBeInTheDocument();
+    expect(
+      screen.getByText('No usable network interface is available.'),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Windows network interfaces could not be refreshed.',
+    );
+  });
+
+  it('keeps Advanced inspectable while all native mutation controls are locked', async () => {
+    const locked = snapshot(primaryProfile, {
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    const { user } = await renderLoaded(mockApi(locked));
+
+    expect(screen.getByRole('button', { name: 'New' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
+    expect(screen.getByRole('combobox', { name: 'Interface' })).toBeDisabled();
+    expect(screen.getByText(ethernetInterface.guid)).toBeInTheDocument();
+  });
+
+  it('maps a disappeared interface to an actionable native error', async () => {
+    const api = mockApi();
+    vi.mocked(api.selectInterface).mockRejectedValue({
+      kind: 'interfaceNotFound',
+    });
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Interface' }),
+      wifiInterface.guid,
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'no longer available',
+    );
+    expect(screen.getByRole('combobox', { name: 'Interface' })).toHaveValue(
+      ethernetInterface.guid,
+    );
+  });
 });
 
 describe('fixed-window responsive and preference contracts', () => {
@@ -420,6 +656,7 @@ describe('fixed-window responsive and preference contracts', () => {
     expect(styles).toMatch(/\.profile-toolbar\s*{\s*flex-wrap: wrap;/);
     expect(styles).toContain('grid-template-columns: minmax(0, 1fr)');
     expect(styles).toContain('overflow-wrap: anywhere');
+    expect(styles).toContain('grid-template-columns: 104px minmax(0, 1fr)');
     expect(styles).toContain('max-height: calc(100dvh - 40px)');
   });
 
