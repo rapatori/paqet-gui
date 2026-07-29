@@ -1,4 +1,10 @@
-import { render, screen, waitFor, within } from '@testing-library/svelte';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -10,6 +16,8 @@ import type {
   NetworkInterface,
   Profile,
   ProfileDraft,
+  RuntimeEvent,
+  WindowCloseRequest,
 } from './lib/api';
 
 const styles = readFileSync(join(process.cwd(), 'src', 'styles.css'), 'utf8');
@@ -131,7 +139,21 @@ function mockApi(initialSnapshot = snapshot()): AppApi {
     refreshInterfaces: vi.fn().mockResolvedValue(initialSnapshot),
     selectInterface: vi.fn().mockResolvedValue(initialSnapshot),
     replaceAdvancedSettings: vi.fn().mockResolvedValue(initialSnapshot),
+    connect: vi.fn().mockResolvedValue(initialSnapshot),
+    disconnect: vi.fn().mockResolvedValue(initialSnapshot),
+    subscribeRuntimeEvents: vi.fn().mockResolvedValue(undefined),
+    onWindowCloseRequested: vi.fn().mockResolvedValue(undefined),
+    cancelWindowClose: vi.fn().mockResolvedValue(undefined),
+    confirmWindowClose: vi.fn().mockResolvedValue(undefined),
   };
+}
+
+function runtimeCallback(api: AppApi): (event: RuntimeEvent) => void {
+  return vi.mocked(api.subscribeRuntimeEvents).mock.calls[0][0];
+}
+
+function closeCallback(api: AppApi): (request: WindowCloseRequest) => void {
+  return vi.mocked(api.onWindowCloseRequested).mock.calls[0][0];
 }
 
 async function renderLoaded(api = mockApi()) {
@@ -152,7 +174,7 @@ describe('application shell', () => {
     expect(screen.getByLabelText('Connection status')).toHaveTextContent(
       'Disconnected',
     );
-    expect(screen.getByRole('button', { name: 'Connect' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled();
     expect(
       screen.getByRole('log', { name: 'Connection logs' }),
     ).toHaveTextContent('Connection output will appear here.');
@@ -180,6 +202,407 @@ describe('application shell', () => {
     expect(screen.getByText('Ethernet · 192.0.2.20')).toBeInTheDocument();
     expect(screen.getByText(ethernetInterface.guid)).toBeInTheDocument();
     expect(screen.getByText('00:11:22:33:44:55')).toBeInTheDocument();
+  });
+
+  it('drives canonical connection controls through all process-aware lifecycle states', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    const connect = screen.getByRole('button', { name: 'Connect' });
+
+    await user.click(connect);
+    expect(api.connect).toHaveBeenCalledOnce();
+
+    runtimeCallback(api)({
+      kind: 'lifecycle',
+      revision: '9007199254740993',
+      sessionId: '1',
+      lifecycle: {
+        status: 'connecting',
+        process: 'absent',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    expect(
+      await screen.findByRole('button', { name: 'Connecting…' }),
+    ).toBeDisabled();
+    await waitFor(() =>
+      expect(screen.getByLabelText('Connection status')).toHaveTextContent(
+        'Connecting',
+      ),
+    );
+
+    runtimeCallback(api)({
+      kind: 'lifecycle',
+      revision: '9007199254740994',
+      sessionId: '1',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    const disconnect = await screen.findByRole('button', {
+      name: 'Disconnect',
+    });
+    expect(disconnect).toBeEnabled();
+    await user.click(disconnect);
+    expect(api.disconnect).toHaveBeenCalledOnce();
+
+    runtimeCallback(api)({
+      kind: 'lifecycle',
+      revision: '9007199254740995',
+      sessionId: '1',
+      lifecycle: {
+        status: 'disconnecting',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    expect(
+      await screen.findByRole('button', { name: 'Disconnecting…' }),
+    ).toBeDisabled();
+  });
+
+  it('keeps a failed running process locked and exposes its canonical reason', async () => {
+    const api = mockApi();
+    await renderLoaded(api);
+
+    runtimeCallback(api)({
+      kind: 'output',
+      revision: '13',
+      sessionId: '1',
+      lifecycle: {
+        status: 'failed',
+        process: 'running',
+        failure: { kind: 'connectionLost' },
+        settingsEditable: false,
+      },
+      record: {
+        sequence: '1',
+        stream: 'stdout',
+        text: 'connection lost, retrying....',
+        classification: { kind: 'connectionLost' },
+        truncated: false,
+      },
+    });
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Connection status')).toHaveTextContent(
+        'Failed',
+      ),
+    );
+    expect(
+      screen.getByText(
+        'The paqet client reported that the connection was lost.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Disconnect' })).toBeEnabled();
+    expect(
+      screen.getByRole('combobox', { name: 'Selected server profile' }),
+    ).toBeDisabled();
+  });
+
+  it('renders ordered replay gaps, stderr, and truncation and copies visible logs', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    runtimeCallback(api)({
+      kind: 'bootstrap',
+      revision: '13',
+      sessionId: '7',
+      lifecycle: snapshot().lifecycle,
+      gap: { firstMissing: '1', nextAvailable: '3' },
+      records: [
+        {
+          sequence: '5',
+          stream: 'stderr',
+          text: 'later error',
+          classification: { kind: 'display' },
+          truncated: true,
+        },
+        {
+          sequence: '3',
+          stream: 'stdout',
+          text: 'first retained',
+          classification: { kind: 'display' },
+          truncated: false,
+        },
+      ],
+    });
+
+    const log = screen.getByRole('log', { name: 'Connection logs' });
+    await waitFor(() =>
+      expect(log).toHaveTextContent('Output unavailable: sequences 1–2.'),
+    );
+    expect(log).toHaveTextContent('Output unavailable: sequences 4–4.');
+    expect(within(log).getByText('stderr')).toBeInTheDocument();
+    expect(within(log).getByText('record truncated')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Copy' }));
+    expect(writeText).toHaveBeenCalledWith(
+      '[output unavailable: sequences 1–2]\nfirst retained\n[output unavailable: sequences 4–4]\n[stderr] later error [record truncated]',
+    );
+    expect(screen.getByText('Logs copied.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Clear' }));
+    expect(log).toHaveTextContent('Connection output will appear here.');
+    expect(api.disconnect).not.toHaveBeenCalled();
+  });
+
+  it('pauses log follow when scrolled upward and jumps to the latest output', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    runtimeCallback(api)({
+      kind: 'bootstrap',
+      revision: '12',
+      sessionId: '1',
+      lifecycle: snapshot().lifecycle,
+      gap: null,
+      records: [
+        {
+          sequence: '1',
+          stream: 'stdout',
+          text: 'existing output',
+          classification: { kind: 'display' },
+          truncated: false,
+        },
+      ],
+    });
+    await screen.findByText('existing output');
+    const log = screen.getByRole('log', {
+      name: 'Connection logs',
+    }) as HTMLDivElement;
+    Object.defineProperties(log, {
+      scrollHeight: { configurable: true, value: 300 },
+      clientHeight: { configurable: true, value: 100 },
+      scrollTop: { configurable: true, writable: true, value: 50 },
+    });
+
+    await fireEvent.scroll(log);
+    runtimeCallback(api)({
+      kind: 'output',
+      revision: '13',
+      sessionId: '1',
+      lifecycle: snapshot().lifecycle,
+      record: {
+        sequence: '2',
+        stream: 'stdout',
+        text: 'new output',
+        classification: { kind: 'display' },
+        truncated: false,
+      },
+    });
+
+    await waitFor(() => expect(log.scrollTop).toBe(50));
+    const jump = await screen.findByRole('button', { name: 'Jump to latest' });
+    await user.click(jump);
+    expect(log.scrollTop).toBe(300);
+    expect(screen.queryByRole('button', { name: 'Jump to latest' })).toBeNull();
+  });
+
+  it('confirms or cancels supervised window close with safe modal focus', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    const request: WindowCloseRequest = {
+      requestId: '9007199254740993',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    };
+
+    closeCallback(api)(request);
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Disconnect and close?',
+    });
+    const keepOpen = within(dialog).getByRole('button', { name: 'Keep open' });
+    expect(keepOpen).toHaveFocus();
+    await user.keyboard('{Escape}');
+    await waitFor(() =>
+      expect(api.cancelWindowClose).toHaveBeenCalledWith(request.requestId),
+    );
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+
+    closeCallback(api)(request);
+    await user.click(
+      await screen.findByRole('button', { name: 'Disconnect and close' }),
+    );
+    expect(api.confirmWindowClose).toHaveBeenCalledWith(request.requestId);
+  });
+
+  it('does not let an older close cancellation dismiss a newer request', async () => {
+    const api = mockApi();
+    const cancellation = deferred<void>();
+    vi.mocked(api.cancelWindowClose).mockReturnValue(cancellation.promise);
+    const { user } = await renderLoaded(api);
+    const first: WindowCloseRequest = {
+      requestId: '1',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    };
+    const second = { ...first, requestId: '2' };
+
+    closeCallback(api)(first);
+    await user.click(await screen.findByRole('button', { name: 'Keep open' }));
+    closeCallback(api)(second);
+    cancellation.resolve();
+
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Disconnect and close?',
+    });
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Disconnect and close' }),
+    );
+    expect(api.confirmWindowClose).toHaveBeenCalledWith('2');
+  });
+
+  it('does not let an older close confirmation rejection dismiss a newer request', async () => {
+    const api = mockApi();
+    const confirmation = deferred<void>();
+    vi.mocked(api.confirmWindowClose).mockReturnValue(confirmation.promise);
+    const { user } = await renderLoaded(api);
+    const first: WindowCloseRequest = {
+      requestId: '1',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    };
+    const second = { ...first, requestId: '2' };
+
+    closeCallback(api)(first);
+    await user.click(
+      await screen.findByRole('button', { name: 'Disconnect and close' }),
+    );
+    closeCallback(api)(second);
+    confirmation.reject({ kind: 'commandConflict' });
+
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Disconnect and close?',
+    });
+    expect(
+      within(dialog).getByRole('button', { name: 'Keep open' }),
+    ).toBeEnabled();
+    expect(
+      screen.queryByText(/close request changed before it could be confirmed/i),
+    ).toBeNull();
+  });
+
+  it('keeps a newer active close dialog when a stale editable runtime event arrives', async () => {
+    const active = snapshot(primaryProfile, {
+      revision: '20',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    const api = mockApi(active);
+    await renderLoaded(api);
+    closeCallback(api)({ requestId: '1', lifecycle: active.lifecycle });
+    await screen.findByRole('alertdialog', { name: 'Disconnect and close?' });
+
+    runtimeCallback(api)({
+      kind: 'lifecycle',
+      revision: '19',
+      sessionId: '1',
+      lifecycle: snapshot().lifecycle,
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('alertdialog', { name: 'Disconnect and close?' }),
+      ).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText('Connection status')).toHaveTextContent(
+        'Connected',
+      ),
+    );
+  });
+
+  it('dismisses a rejected close decision and requires a fresh native request', async () => {
+    const api = mockApi();
+    vi.mocked(api.confirmWindowClose).mockRejectedValue({
+      kind: 'processLaunch',
+    });
+    const { user } = await renderLoaded(api);
+
+    closeCallback(api)({
+      requestId: '9',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    await user.click(
+      await screen.findByRole('button', { name: 'Disconnect and close' }),
+    );
+
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+    expect(
+      screen.getByText(/Use the window close control to continue/),
+    ).toBeInTheDocument();
+  });
+
+  it('preserves the earliest loss boundary across incremental frontend eviction', async () => {
+    const api = mockApi();
+    await renderLoaded(api);
+    const records = Array.from({ length: 2_000 }, (_, index) => ({
+      sequence: String(index + 3),
+      stream: 'stdout' as const,
+      text: `record ${index + 3}`,
+      classification: { kind: 'display' as const },
+      truncated: false,
+    }));
+
+    runtimeCallback(api)({
+      kind: 'bootstrap',
+      revision: '13',
+      sessionId: '1',
+      lifecycle: snapshot().lifecycle,
+      gap: { firstMissing: '1', nextAvailable: '3' },
+      records,
+    });
+    runtimeCallback(api)({
+      kind: 'output',
+      revision: '14',
+      sessionId: '1',
+      lifecycle: snapshot().lifecycle,
+      record: {
+        sequence: '2003',
+        stream: 'stdout',
+        text: 'record 2003',
+        classification: { kind: 'display' },
+        truncated: false,
+      },
+    });
+
+    const log = screen.getByRole('log', { name: 'Connection logs' });
+    await waitFor(() =>
+      expect(log).toHaveTextContent('Output unavailable: sequences 1–3.'),
+    );
+    expect(within(log).queryByText('record 3')).toBeNull();
+    expect(within(log).getByText('record 2003')).toBeInTheDocument();
   });
 
   it('presents an actionable empty state without inventing persisted data', async () => {
@@ -754,6 +1177,64 @@ describe('application shell', () => {
     expect(screen.getByRole('combobox', { name: 'Log level' })).toHaveValue(
       'debug',
     );
+  });
+
+  it('commits a just-blurred Advanced draft before connecting', async () => {
+    const initialSettings = advancedSettings({ connectionCount: 1 });
+    const updatedSettings = advancedSettings({ connectionCount: 2 });
+    const updated = snapshot(primaryProfile, {
+      revision: '13',
+      advancedSettings: updatedSettings,
+    });
+    const replacement = deferred<AppSnapshot>();
+    const api = mockApi(
+      snapshot(primaryProfile, { advancedSettings: initialSettings }),
+    );
+    vi.mocked(api.replaceAdvancedSettings).mockReturnValue(replacement.promise);
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    const count = screen.getByLabelText('Connection count');
+    await user.clear(count);
+    await user.type(count, '2');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+
+    await waitFor(() =>
+      expect(api.replaceAdvancedSettings).toHaveBeenCalledWith(updatedSettings),
+    );
+    expect(api.connect).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('region', { name: 'Server profile' }),
+      ).toHaveAttribute('aria-busy', 'true'),
+    );
+    expect(
+      screen.getByRole('combobox', { name: 'Selected server profile' }),
+    ).toBeDisabled();
+    replacement.resolve(updated);
+    await waitFor(() => expect(api.connect).toHaveBeenCalledOnce());
+  });
+
+  it('blocks Connect when a just-blurred enabled Advanced draft is invalid', async () => {
+    const api = mockApi(
+      snapshot(primaryProfile, {
+        advancedSettings: advancedSettings({ connectionCount: 1 }),
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await user.click(screen.getByRole('button', { name: /Advanced/ }));
+
+    const count = screen.getByLabelText('Connection count');
+    await user.clear(count);
+    await user.type(count, '0');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+
+    expect(
+      await screen.findByText(
+        'Correct the invalid Advanced setting before connecting.',
+      ),
+    ).toBeInTheDocument();
+    expect(api.connect).not.toHaveBeenCalled();
   });
 
   it('keeps invalid TCP flags local and commits ordered comma-separated combinations', async () => {

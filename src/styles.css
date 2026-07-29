@@ -175,6 +175,17 @@ h3 {
   background: #d78088;
 }
 
+.status-pending {
+  border-color: #38616b;
+  color: #b9dfe3;
+}
+
+.status-pending span {
+  border-color: #64c8d3;
+  border-top-color: transparent;
+  animation: spin 800ms linear infinite;
+}
+
 .configuration,
 .connection {
   border: 1px solid #293b43;
@@ -687,6 +698,13 @@ input[aria-invalid='true'] {
   line-height: 1.4;
 }
 
+.failure-message {
+  margin-bottom: 9px;
+  color: #efc5c8;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .connect-button {
   display: flex;
   align-items: center;
@@ -694,9 +712,9 @@ input[aria-invalid='true'] {
   gap: 9px;
   width: 100%;
   min-height: 48px;
-  border: 1px solid #3c555d;
-  color: #71878d;
-  background: #1a2a31;
+  border: 1px solid #64c8d3;
+  color: #09171c;
+  background: #64c8d3;
 }
 
 .connect-button span {
@@ -704,6 +722,34 @@ input[aria-invalid='true'] {
   height: 8px;
   border: 2px solid currentColor;
   border-radius: 50%;
+}
+
+.connect-button:hover:not(:disabled) {
+  border-color: #8bd9e1;
+  background: #8bd9e1;
+}
+
+.connect-button.disconnect-action {
+  border-color: #bd747b;
+  color: #f2d1d4;
+  background: #3a252b;
+}
+
+.connect-button.connection-pending {
+  border-color: #3c555d;
+  color: #91a9ae;
+  background: #1a2a31;
+}
+
+.connect-button.connection-pending span {
+  border-top-color: transparent;
+  animation: spin 800ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .log-heading {
@@ -720,8 +766,25 @@ input[aria-invalid='true'] {
 }
 
 .log-actions .text-button {
-  min-height: 36px;
+  min-height: 44px;
   font-size: 12px;
+}
+
+.copy-message {
+  margin: -3px 0 6px;
+  color: #9ec5ca;
+  font-size: 11px;
+}
+
+.copy-message.copy-error {
+  color: #efaaaf;
+}
+
+.log-shell {
+  position: relative;
+  display: flex;
+  min-height: 60px;
+  flex: 1;
 }
 
 .log {
@@ -738,6 +801,77 @@ input[aria-invalid='true'] {
   line-height: 1.55;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
+}
+
+.log-record,
+.log-gap {
+  margin: 0 0 4px;
+}
+
+.log-record:last-child,
+.log-gap:last-child {
+  margin-bottom: 0;
+}
+
+.log-record {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  color: #b7c8cb;
+}
+
+.log-record > span:not(.stream-marker, .truncated-marker) {
+  min-width: 0;
+  white-space: pre-wrap;
+}
+
+.log-stderr {
+  color: #efb7bb;
+}
+
+.stream-marker,
+.truncated-marker {
+  flex: 0 0 auto;
+  border: 1px solid #754a4f;
+  border-radius: 4px;
+  color: #efc5c8;
+  font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  line-height: 1.5;
+  text-transform: uppercase;
+}
+
+.stream-marker {
+  padding: 0 4px;
+}
+
+.truncated-marker {
+  padding: 0 4px;
+  border-color: #665a3e;
+  color: #e1c88f;
+}
+
+.log-gap {
+  padding: 4px 7px;
+  border-left: 2px solid #8d7541;
+  color: #d9c28e;
+  background: #17170f;
+}
+
+.jump-button {
+  position: absolute;
+  right: 9px;
+  bottom: 9px;
+  min-height: 44px;
+  padding: 0 10px;
+  border: 1px solid #49646c;
+  border-radius: 999px;
+  color: #d8edef;
+  background: #1b2d35;
+  font-size: 11px;
+  font-weight: 700;
+  box-shadow: 0 4px 12px rgb(0 0 0 / 28%);
 }
 
 .dialog-backdrop {
@@ -904,5 +1038,12 @@ input[aria-invalid='true'] {
   .status span,
   .connect-button span {
     forced-color-adjust: none;
+  }
+
+  .stream-marker,
+  .truncated-marker,
+  .log-gap,
+  .jump-button {
+    border-color: CanvasText;
   }
 }

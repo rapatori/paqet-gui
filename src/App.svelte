@@ -7,6 +7,8 @@
     IpcError,
     KcpBlock,
     KcpMode,
+    LifecycleSnapshot,
+    LogRecord,
     LogLevel,
     ManualKcpSettings,
     NetworkInterface,
@@ -14,6 +16,8 @@
     ProfileDraft,
     ProfileFieldName,
     ProfileId,
+    RuntimeEvent,
+    WindowCloseRequest,
   } from './lib/api';
 
   export interface AppApi {
@@ -25,6 +29,16 @@
     refreshInterfaces(): Promise<AppSnapshot>;
     selectInterface(guid: string): Promise<AppSnapshot>;
     replaceAdvancedSettings(settings: AdvancedSettings): Promise<AppSnapshot>;
+    connect(): Promise<AppSnapshot>;
+    disconnect(): Promise<AppSnapshot>;
+    subscribeRuntimeEvents(
+      onEvent: (event: RuntimeEvent) => void,
+    ): Promise<void>;
+    onWindowCloseRequested(
+      onRequest: (request: WindowCloseRequest) => void,
+    ): Promise<void>;
+    cancelWindowClose(requestId: string): Promise<void>;
+    confirmWindowClose(requestId: string): Promise<void>;
   }
 
   type EditorMode = 'view' | 'create' | 'edit';
@@ -79,12 +93,26 @@
   type KcpErrors = Partial<Record<KcpTextField, string>>;
   type ProfileInput = Omit<ProfileDraft, 'port'> & { port: string };
   type FieldErrors = Partial<Record<ProfileFieldName, string>>;
+  type LogEntry =
+    | { kind: 'record'; sessionId: string; record: LogRecord }
+    | {
+        kind: 'gap';
+        sessionId: string;
+        firstMissing: string;
+        nextAvailable: string;
+      };
   type DialogState =
     | { kind: 'discardSelection'; profileId: ProfileId }
     | { kind: 'discardCreate' }
     | { kind: 'delete'; profile: Profile }
     | { kind: 'unsafeBlock'; value: 'none' | 'null' }
+    | { kind: 'windowClose'; request: WindowCloseRequest }
     | null;
+
+  const maxVisibleLogRecords = 2_000;
+  const maxVisibleLogBytes = 512 * 1_024;
+  const maxVisibleLogEntries = maxVisibleLogRecords * 2 + 1;
+  const logBottomTolerance = 4;
 
   let { api = tauriApi }: { api?: AppApi } = $props();
 
@@ -114,6 +142,22 @@
   let revealKey = $state(false);
   let advancedExpanded = $state(false);
   let dialog = $state<DialogState>(null);
+  let runtimeReady = $state(false);
+  let closeReady = $state(false);
+  let connectionBusy = $state(false);
+  let connectionMessage = $state('');
+  let logEntries = $state<LogEntry[]>([]);
+  let logSessionId = $state<string | null>(null);
+  let followingLogs = $state(true);
+  let copyMessage = $state('');
+  let copyFailed = $state(false);
+  let closeDecisionBusy = $state(false);
+  let closeDecisionMessage = $state('');
+  let lastRuntimeRevision: string | null = null;
+  let pendingLifecycle: {
+    revision: string;
+    lifecycle: LifecycleSnapshot;
+  } | null = null;
 
   let nameInput = $state<HTMLInputElement>();
   let serverHostInput = $state<HTMLInputElement>();
@@ -127,9 +171,11 @@
   let dialogElement = $state<HTMLDivElement>();
   let profileSelect = $state<HTMLSelectElement>();
   let newProfileButton = $state<HTMLButtonElement>();
+  let logElement = $state<HTMLDivElement>();
   let dialogInvoker: HTMLElement | null = null;
   let mutationIdleResolvers: Array<() => void> = [];
   let settingsQueue = Promise.resolve();
+  let scheduledDraftCommits = Promise.resolve();
 
   const selectedProfile = $derived(snapshot?.selectedProfile ?? null);
   const selectedInterface = $derived(
@@ -155,8 +201,42 @@
   const statusLabel = $derived(
     snapshot ? formatStatus(snapshot.lifecycle.status) : 'Disconnected',
   );
+  const failureMessage = $derived(
+    snapshot?.lifecycle.failure
+      ? formatFailure(snapshot.lifecycle.failure)
+      : '',
+  );
+  const connectionAction = $derived.by(() => {
+    const lifecycle = snapshot?.lifecycle;
+    if (!lifecycle) return { label: 'Connect', kind: 'connect' as const };
+    if (lifecycle.status === 'connecting') {
+      return { label: 'Connecting…', kind: 'waiting' as const };
+    }
+    if (lifecycle.status === 'disconnecting') {
+      return { label: 'Disconnecting…', kind: 'waiting' as const };
+    }
+    if (lifecycle.process === 'running') {
+      return { label: 'Disconnect', kind: 'disconnect' as const };
+    }
+    return { label: 'Connect', kind: 'connect' as const };
+  });
+  const connectionDisabled = $derived(
+    loading ||
+      !snapshot ||
+      !runtimeReady ||
+      connectionBusy ||
+      connectionAction.kind === 'waiting' ||
+      (connectionAction.kind === 'connect' &&
+        (!closeReady ||
+          mutationBusy ||
+          editorOpen ||
+          !selectedProfile ||
+          !selectedInterface)),
+  );
 
   onMount(() => {
+    void subscribeRuntime();
+    void subscribeWindowClose();
     void loadSnapshot();
   });
 
@@ -258,6 +338,17 @@
       return false;
     }
 
+    if (
+      pendingLifecycle &&
+      BigInt(pendingLifecycle.revision) > BigInt(nextSnapshot.revision)
+    ) {
+      nextSnapshot = {
+        ...nextSnapshot,
+        revision: pendingLifecycle.revision,
+        lifecycle: pendingLifecycle.lifecycle,
+      };
+    }
+
     snapshot = nextSnapshot;
     if (resetProfileEditor) {
       editorMode = 'view';
@@ -276,6 +367,269 @@
       }
     }
     return true;
+  }
+
+  async function subscribeRuntime(): Promise<void> {
+    try {
+      await api.subscribeRuntimeEvents(handleRuntimeEvent);
+      runtimeReady = true;
+    } catch {
+      runtimeReady = false;
+      connectionMessage =
+        'Live connection state is unavailable. Restart paqet and try again.';
+    }
+  }
+
+  async function subscribeWindowClose(): Promise<void> {
+    try {
+      await api.onWindowCloseRequested(handleWindowCloseRequest);
+      closeReady = true;
+    } catch {
+      closeReady = false;
+      connectionMessage =
+        'Window-close confirmation is unavailable. Restart paqet and try again.';
+    }
+  }
+
+  function handleRuntimeEvent(event: RuntimeEvent): void {
+    if (
+      lastRuntimeRevision !== null &&
+      BigInt(event.revision) < BigInt(lastRuntimeRevision)
+    ) {
+      return;
+    }
+    lastRuntimeRevision = event.revision;
+    const lifecycleApplied = applyRuntimeLifecycle(
+      event.revision,
+      event.lifecycle,
+    );
+
+    if (event.kind === 'bootstrap') {
+      replaceLogSession(event.sessionId, event.records, event.gap);
+    } else if (event.kind === 'output') {
+      appendLogRecord(event.sessionId, event.record);
+    } else if (event.kind === 'gap') {
+      appendLogGap(event.sessionId, event.firstMissing, event.nextAvailable);
+    } else if (event.sessionId !== null) {
+      adoptLogSession(event.sessionId);
+    }
+
+    if (
+      lifecycleApplied &&
+      dialog?.kind === 'windowClose' &&
+      snapshot?.lifecycle.settingsEditable
+    ) {
+      dismissWindowCloseDialog();
+    }
+  }
+
+  function applyRuntimeLifecycle(
+    revision: string,
+    lifecycle: LifecycleSnapshot,
+  ): boolean {
+    pendingLifecycle = { revision, lifecycle };
+    if (!snapshot) return true;
+    if (BigInt(revision) < BigInt(snapshot.revision)) return false;
+    snapshot = { ...snapshot, revision, lifecycle };
+    return true;
+  }
+
+  function replaceLogSession(
+    sessionId: string | null,
+    records: LogRecord[],
+    gap: { firstMissing: string; nextAvailable: string } | null,
+  ): void {
+    logSessionId = sessionId;
+    if (sessionId === null) {
+      logEntries = [];
+      followingLogs = true;
+      return;
+    }
+
+    const sortedRecords = [...records].sort((left, right) =>
+      compareDecimal(left.sequence, right.sequence),
+    );
+    const entries: LogEntry[] = [];
+    if (gap) {
+      entries.push({ kind: 'gap', sessionId, ...gap });
+    }
+    let previousSequence: string | null = null;
+    for (const record of sortedRecords) {
+      if (
+        previousSequence !== null &&
+        BigInt(record.sequence) > BigInt(previousSequence) + 1n
+      ) {
+        entries.push({
+          kind: 'gap',
+          sessionId,
+          firstMissing: (BigInt(previousSequence) + 1n).toString(),
+          nextAvailable: record.sequence,
+        });
+      }
+      if (previousSequence !== record.sequence) {
+        entries.push({ kind: 'record', sessionId, record });
+      }
+      previousSequence = record.sequence;
+    }
+    logEntries = boundLogEntries(entries, sessionId);
+    followingLogs = true;
+    void scrollLogToLatest();
+  }
+
+  function adoptLogSession(sessionId: string): void {
+    if (logSessionId === sessionId) return;
+    logSessionId = sessionId;
+    logEntries = [];
+    followingLogs = true;
+    copyMessage = '';
+  }
+
+  function appendLogRecord(sessionId: string, record: LogRecord): void {
+    adoptLogSession(sessionId);
+    if (
+      logEntries.some(
+        (entry) =>
+          entry.kind === 'record' && entry.record.sequence === record.sequence,
+      )
+    ) {
+      return;
+    }
+    const shouldFollow = followingLogs && isLogAtBottom();
+    logEntries = boundLogEntries(
+      [...logEntries, { kind: 'record', sessionId, record }],
+      sessionId,
+    );
+    if (shouldFollow) void scrollLogToLatest();
+  }
+
+  function appendLogGap(
+    sessionId: string,
+    firstMissing: string,
+    nextAvailable: string,
+  ): void {
+    adoptLogSession(sessionId);
+    const duplicate = logEntries.some(
+      (entry) =>
+        entry.kind === 'gap' &&
+        entry.firstMissing === firstMissing &&
+        entry.nextAvailable === nextAvailable,
+    );
+    if (duplicate) return;
+    const shouldFollow = followingLogs && isLogAtBottom();
+    logEntries = boundLogEntries(
+      [...logEntries, { kind: 'gap', sessionId, firstMissing, nextAvailable }],
+      sessionId,
+    );
+    if (shouldFollow) void scrollLogToLatest();
+  }
+
+  function boundLogEntries(entries: LogEntry[], sessionId: string): LogEntry[] {
+    const bounded = mergeAdjacentGaps(entries, sessionId);
+    let recordCount = bounded.filter((entry) => entry.kind === 'record').length;
+    let byteCount = bounded.reduce(
+      (total, entry) =>
+        total +
+        (entry.kind === 'record' ? utf8ByteLength(entry.record.text) : 0),
+      0,
+    );
+    let firstRemoved: string | null = null;
+    let nextAvailable: string | null = null;
+
+    while (
+      recordCount > maxVisibleLogRecords ||
+      byteCount > maxVisibleLogBytes
+    ) {
+      const index = bounded.findIndex((entry) => entry.kind === 'record');
+      if (index === -1) break;
+      const [removed] = bounded.splice(index, 1);
+      if (removed.kind !== 'record') continue;
+      firstRemoved ??= removed.record.sequence;
+      recordCount -= 1;
+      byteCount -= utf8ByteLength(removed.record.text);
+      nextAvailable =
+        bounded.find((entry) => entry.kind === 'record')?.record.sequence ??
+        null;
+    }
+
+    if (firstRemoved && nextAvailable) {
+      const firstRecordIndex = bounded.findIndex(
+        (entry) => entry.kind === 'record',
+      );
+      const prefix = bounded.splice(0, firstRecordIndex);
+      const earliestMissing = prefix.reduce(
+        (earliest, entry) =>
+          entry.kind === 'gap' && BigInt(entry.firstMissing) < BigInt(earliest)
+            ? entry.firstMissing
+            : earliest,
+        firstRemoved,
+      );
+      const retentionGap: LogEntry = {
+        kind: 'gap',
+        sessionId,
+        firstMissing: earliestMissing,
+        nextAvailable,
+      };
+      bounded.unshift(retentionGap);
+    }
+
+    if (bounded.length > maxVisibleLogEntries) {
+      const removeCount = bounded.length - maxVisibleLogEntries + 1;
+      const removed = bounded.splice(0, removeCount);
+      const firstRemaining = bounded[0];
+      if (firstRemaining) {
+        const firstMissing = removed.reduce((earliest, entry) => {
+          const sequence =
+            entry.kind === 'gap' ? entry.firstMissing : entry.record.sequence;
+          return BigInt(sequence) < BigInt(earliest) ? sequence : earliest;
+        }, firstEntrySequence(removed[0]));
+        const nextAvailable = firstEntrySequence(firstRemaining);
+        if (firstRemaining.kind === 'gap') bounded.shift();
+        bounded.unshift({
+          kind: 'gap',
+          sessionId,
+          firstMissing,
+          nextAvailable,
+        });
+      }
+    }
+    return bounded;
+  }
+
+  function mergeAdjacentGaps(
+    entries: LogEntry[],
+    sessionId: string,
+  ): LogEntry[] {
+    const merged: LogEntry[] = [];
+    for (const entry of entries) {
+      const previous = merged.at(-1);
+      if (
+        entry.kind === 'gap' &&
+        previous?.kind === 'gap' &&
+        BigInt(entry.firstMissing) <= BigInt(previous.nextAvailable)
+      ) {
+        previous.nextAvailable =
+          BigInt(entry.nextAvailable) > BigInt(previous.nextAvailable)
+            ? entry.nextAvailable
+            : previous.nextAvailable;
+      } else {
+        merged.push(entry.kind === 'gap' ? { ...entry, sessionId } : entry);
+      }
+    }
+    return merged;
+  }
+
+  function firstEntrySequence(entry: LogEntry): string {
+    return entry.kind === 'gap' ? entry.firstMissing : entry.record.sequence;
+  }
+
+  function utf8ByteLength(value: string): number {
+    return new TextEncoder().encode(value).length;
+  }
+
+  function compareDecimal(left: string, right: string): number {
+    const leftValue = BigInt(left);
+    const rightValue = BigInt(right);
+    return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
   }
 
   function syncCommonDraft(
@@ -484,6 +838,28 @@
   async function confirmDialog(): Promise<void> {
     const action = dialog;
     const returnFocus = dialogInvoker;
+    if (action?.kind === 'windowClose') {
+      if (closeDecisionBusy) return;
+      const requestId = action.request.requestId;
+      closeDecisionBusy = true;
+      closeDecisionMessage = '';
+      try {
+        await api.confirmWindowClose(requestId);
+      } catch (error) {
+        if (
+          dialog?.kind !== 'windowClose' ||
+          dialog.request.requestId !== requestId
+        ) {
+          return;
+        }
+        dismissWindowCloseDialog();
+        connectionMessage =
+          isIpcError(error) && error.kind === 'commandConflict'
+            ? 'The close request changed before it could be confirmed.'
+            : 'paqet could not finish shutting down. Use the window close control to continue supervised shutdown.';
+      }
+      return;
+    }
     dialog = null;
     dialogInvoker = null;
     if (!action) return;
@@ -544,13 +920,14 @@
         : null;
     dialog = nextDialog;
     void tick().then(() =>
-      nextDialog.kind === 'unsafeBlock'
+      nextDialog.kind === 'unsafeBlock' || nextDialog.kind === 'windowClose'
         ? dialogCancelButton?.focus()
         : dialogPrimaryButton?.focus(),
     );
   }
 
   function closeDialog(): void {
+    if (dialog?.kind === 'windowClose') return;
     const returnFocus = dialogInvoker;
     dialog = null;
     dialogInvoker = null;
@@ -560,7 +937,11 @@
   function handleDialogKeydown(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       event.preventDefault();
-      closeDialog();
+      if (dialog?.kind === 'windowClose') {
+        void cancelWindowClose();
+      } else {
+        closeDialog();
+      }
       return;
     }
     if (event.key !== 'Tab' || !dialogElement) return;
@@ -717,6 +1098,214 @@
     return status.charAt(0).toUpperCase() + status.slice(1);
   }
 
+  function formatFailure(
+    failure: NonNullable<LifecycleSnapshot['failure']>,
+  ): string {
+    if (failure.kind === 'launchFailed') {
+      return 'paqet could not start. Review the connection output and configuration.';
+    }
+    if (failure.kind === 'connectionLost') {
+      return 'The paqet client reported that the connection was lost.';
+    }
+    if (failure.kind === 'configurationRejected') {
+      return 'The paqet client rejected the generated configuration.';
+    }
+    if (failure.kind === 'clientFailed') {
+      return 'The paqet client reported a fatal error.';
+    }
+    return failure.code === null
+      ? 'The paqet client exited unexpectedly.'
+      : `The paqet client exited unexpectedly with code ${failure.code}.`;
+  }
+
+  async function runConnectionAction(): Promise<void> {
+    if (connectionDisabled || connectionAction.kind === 'waiting') return;
+    const action = connectionAction.kind;
+    connectionBusy = true;
+    connectionMessage = '';
+    try {
+      await scheduledDraftCommits;
+      await settingsQueue;
+      if (action !== connectionAction.kind) return;
+      if (
+        action === 'connect' &&
+        (Object.keys(commonErrors).length > 0 ||
+          Object.keys(kcpErrors).length > 0)
+      ) {
+        connectionMessage =
+          'Correct the invalid Advanced setting before connecting.';
+        return;
+      }
+      if (action === 'connect') {
+        applySnapshot(await api.connect());
+      } else {
+        applySnapshot(await api.disconnect());
+      }
+    } catch (error) {
+      presentConnectionError(error, action);
+    } finally {
+      connectionBusy = false;
+    }
+  }
+
+  function presentConnectionError(
+    error: unknown,
+    action: 'connect' | 'disconnect',
+  ): void {
+    if (!isIpcError(error)) {
+      connectionMessage =
+        action === 'connect'
+          ? 'paqet could not start. Review the connection output and try again.'
+          : 'paqet could not finish disconnecting. Its process remains supervised.';
+      return;
+    }
+    if (error.kind === 'profileNotSelected') {
+      connectionMessage = 'Select a server profile before connecting.';
+    } else if (error.kind === 'interfaceNotSelected') {
+      connectionMessage =
+        'Select a usable network interface before connecting.';
+    } else if (error.kind === 'configValidation') {
+      connectionMessage = `The ${formatConfigField(error.field)} setting is invalid. Review Advanced settings and try again.`;
+    } else if (error.kind === 'configGeneration') {
+      connectionMessage = 'The paqet configuration could not be generated.';
+    } else if (error.kind === 'configStorage') {
+      connectionMessage = 'The paqet configuration could not be saved.';
+    } else if (error.kind === 'processLaunch') {
+      connectionMessage =
+        action === 'connect'
+          ? 'The paqet client could not be started.'
+          : 'The paqet process could not finish its supervised shutdown.';
+    } else if (error.kind === 'runtimeSubscription') {
+      connectionMessage = 'Live connection state is unavailable.';
+    } else if (error.kind === 'commandConflict') {
+      connectionMessage =
+        'The connection state changed. Wait for it to settle and try again.';
+    } else {
+      connectionMessage = 'The connection action could not be completed.';
+    }
+  }
+
+  function formatConfigField(field: string): string {
+    return field.replace(/([A-Z])/g, ' $1').toLowerCase();
+  }
+
+  function handleLogScroll(): void {
+    followingLogs = isLogAtBottom();
+  }
+
+  function isLogAtBottom(): boolean {
+    if (!logElement) return true;
+    return (
+      logElement.scrollHeight -
+        logElement.scrollTop -
+        logElement.clientHeight <=
+      logBottomTolerance
+    );
+  }
+
+  async function scrollLogToLatest(): Promise<void> {
+    await tick();
+    if (!logElement) return;
+    logElement.scrollTop = logElement.scrollHeight;
+    followingLogs = true;
+  }
+
+  async function copyLogs(): Promise<void> {
+    if (logEntries.length === 0) return;
+    copyMessage = '';
+    copyFailed = false;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('unavailable');
+      await navigator.clipboard.writeText(
+        logEntries.map(formatLogEntry).join('\n'),
+      );
+      copyMessage = 'Logs copied.';
+    } catch {
+      copyFailed = true;
+      copyMessage = 'Logs could not be copied to the clipboard.';
+    }
+  }
+
+  function clearLogs(): void {
+    logEntries = [];
+    followingLogs = true;
+    copyMessage = '';
+    copyFailed = false;
+  }
+
+  function formatLogEntry(entry: LogEntry): string {
+    if (entry.kind === 'gap') {
+      return `[output unavailable: sequences ${entry.firstMissing}–${(
+        BigInt(entry.nextAvailable) - 1n
+      ).toString()}]`;
+    }
+    const stream = entry.record.stream === 'stderr' ? '[stderr] ' : '';
+    const truncated = entry.record.truncated ? ' [record truncated]' : '';
+    return `${stream}${entry.record.text}${truncated}`;
+  }
+
+  function logEntryKey(entry: LogEntry): string {
+    return entry.kind === 'record'
+      ? `${entry.sessionId}:record:${entry.record.sequence}`
+      : `${entry.sessionId}:gap:${entry.firstMissing}:${entry.nextAvailable}`;
+  }
+
+  function handleWindowCloseRequest(request: WindowCloseRequest): void {
+    if (dialog?.kind === 'windowClose') {
+      if (dialog.request.requestId !== request.requestId) {
+        closeDecisionBusy = false;
+        closeDecisionMessage = '';
+      }
+      dialog = { kind: 'windowClose', request };
+      return;
+    }
+    closeDecisionBusy = false;
+    closeDecisionMessage = '';
+    openDialog({ kind: 'windowClose', request });
+  }
+
+  async function cancelWindowClose(): Promise<void> {
+    const action = dialog;
+    if (action?.kind !== 'windowClose' || closeDecisionBusy) {
+      return;
+    }
+    const requestId = action.request.requestId;
+    closeDecisionBusy = true;
+    closeDecisionMessage = '';
+    try {
+      await api.cancelWindowClose(requestId);
+      if (
+        dialog?.kind === 'windowClose' &&
+        dialog.request.requestId === requestId
+      ) {
+        dismissWindowCloseDialog();
+      }
+    } catch {
+      if (
+        dialog?.kind !== 'windowClose' ||
+        dialog.request.requestId !== requestId
+      ) {
+        return;
+      }
+      if (snapshot?.lifecycle.settingsEditable) {
+        dismissWindowCloseDialog();
+      } else {
+        closeDecisionMessage =
+          'The close request changed before it could be canceled.';
+        closeDecisionBusy = false;
+      }
+    }
+  }
+
+  function dismissWindowCloseDialog(): void {
+    const returnFocus = dialogInvoker;
+    dialog = null;
+    dialogInvoker = null;
+    closeDecisionBusy = false;
+    closeDecisionMessage = '';
+    void tick().then(() => returnFocus?.focus());
+  }
+
   async function handleInterfaceSelection(event: Event): Promise<void> {
     const select = event.currentTarget as HTMLSelectElement;
     const guid = select.value;
@@ -803,7 +1392,14 @@
   }
 
   function scheduleCommonDraftCommit(field: CommonTextField): void {
-    window.setTimeout(() => void commitCommonDraft(field), 0);
+    scheduledDraftCommits = scheduledDraftCommits.then(
+      () =>
+        new Promise<void>((resolve) => {
+          window.setTimeout(() => {
+            void commitCommonDraft(field).finally(resolve);
+          }, 0);
+        }),
+    );
   }
 
   async function commitCommonDraft(field: CommonTextField): Promise<void> {
@@ -1292,7 +1888,14 @@
   }
 
   function scheduleKcpDraftCommit(field: KcpTextField): void {
-    window.setTimeout(() => void commitKcpDraft(field), 0);
+    scheduledDraftCommits = scheduledDraftCommits.then(
+      () =>
+        new Promise<void>((resolve) => {
+          window.setTimeout(() => {
+            void commitKcpDraft(field).finally(resolve);
+          }, 0);
+        }),
+    );
   }
 
   async function commitKcpDraft(field: KcpTextField): Promise<void> {
@@ -1600,6 +2203,8 @@
     <p
       class:status-failed={statusLabel === 'Failed'}
       class:status-connected={statusLabel === 'Connected'}
+      class:status-pending={statusLabel === 'Connecting' ||
+        statusLabel === 'Disconnecting'}
       class="status"
       aria-label="Connection status"
       aria-live="polite"
@@ -1609,7 +2214,12 @@
     </p>
   </header>
 
-  <section class="configuration" aria-labelledby="profile-heading">
+  <section
+    class="configuration"
+    aria-labelledby="profile-heading"
+    aria-busy={connectionBusy}
+    inert={connectionBusy ? true : undefined}
+  >
     <div class="section-heading">
       <div>
         <p class="eyebrow">Configuration</p>
@@ -2460,10 +3070,26 @@
     {#if message}
       <p class="app-message" role="alert">{message}</p>
     {/if}
+    {#if connectionMessage}
+      <p class="app-message" role="alert">{connectionMessage}</p>
+    {/if}
+    {#if failureMessage && !connectionMessage}
+      <p class="failure-message" role="status" aria-live="polite">
+        {failureMessage}
+      </p>
+    {/if}
     <h2 id="connection-heading" class="sr-only">Connection</h2>
-    <button class="connect-button" type="button" disabled>
+    <button
+      class:disconnect-action={connectionAction.kind === 'disconnect'}
+      class:connection-pending={connectionAction.kind === 'waiting'}
+      class="connect-button"
+      type="button"
+      disabled={connectionDisabled}
+      aria-busy={connectionBusy || connectionAction.kind === 'waiting'}
+      onclick={runConnectionAction}
+    >
       <span aria-hidden="true"></span>
-      Connect
+      {connectionAction.label}
     </button>
 
     <div class="log-heading">
@@ -2472,12 +3098,72 @@
         <h2>Logs</h2>
       </div>
       <div class="log-actions" aria-label="Log actions">
-        <button class="text-button" type="button" disabled>Copy</button>
-        <button class="text-button" type="button" disabled>Clear</button>
+        <button
+          class="text-button"
+          type="button"
+          disabled={logEntries.length === 0}
+          onclick={copyLogs}>Copy</button
+        >
+        <button
+          class="text-button"
+          type="button"
+          disabled={logEntries.length === 0}
+          onclick={clearLogs}>Clear</button
+        >
       </div>
     </div>
-    <div class="log" role="log" aria-label="Connection logs">
-      <p>Connection output will appear here.</p>
+    {#if copyMessage}
+      <p
+        class:copy-error={copyFailed}
+        class="copy-message"
+        role={copyFailed ? 'alert' : 'status'}
+        aria-live="polite"
+      >
+        {copyMessage}
+      </p>
+    {/if}
+    <div class="log-shell">
+      <div
+        class="log"
+        bind:this={logElement}
+        role="log"
+        aria-label="Connection logs"
+        aria-live="polite"
+        aria-relevant="additions text"
+        onscroll={handleLogScroll}
+      >
+        {#if logEntries.length === 0}
+          <p>Connection output will appear here.</p>
+        {:else}
+          {#each logEntries as entry (logEntryKey(entry))}
+            {#if entry.kind === 'gap'}
+              <p class="log-gap">
+                Output unavailable: sequences {entry.firstMissing}–{(
+                  BigInt(entry.nextAvailable) - 1n
+                ).toString()}.
+              </p>
+            {:else}
+              <p
+                class:log-stderr={entry.record.stream === 'stderr'}
+                class="log-record"
+              >
+                {#if entry.record.stream === 'stderr'}
+                  <span class="stream-marker">stderr</span>
+                {/if}
+                <span>{entry.record.text}</span>
+                {#if entry.record.truncated}
+                  <span class="truncated-marker">record truncated</span>
+                {/if}
+              </p>
+            {/if}
+          {/each}
+        {/if}
+      </div>
+      {#if !followingLogs && logEntries.length > 0}
+        <button class="jump-button" type="button" onclick={scrollLogToLatest}>
+          Jump to latest
+        </button>
+      {/if}
     </div>
   </section>
 </main>
@@ -2496,7 +3182,37 @@
       aria-labelledby="dialog-title"
       aria-describedby="dialog-description"
     >
-      {#if dialog.kind === 'delete'}
+      {#if dialog.kind === 'windowClose'}
+        <p class="eyebrow">paqet is active</p>
+        <h2 id="dialog-title">Disconnect and close?</h2>
+        <p id="dialog-description">
+          paqet is {formatStatus(
+            dialog.request.lifecycle.status,
+          ).toLowerCase()}. Closing will stop the supervised client process and
+          wait for its process tree to exit.
+        </p>
+        {#if closeDecisionMessage}
+          <p class="inline-message" role="alert">{closeDecisionMessage}</p>
+        {/if}
+        <div class="dialog-actions">
+          <button
+            class="text-button"
+            type="button"
+            bind:this={dialogCancelButton}
+            disabled={closeDecisionBusy}
+            onclick={cancelWindowClose}>Keep open</button
+          >
+          <button
+            class="danger-button"
+            type="button"
+            bind:this={dialogPrimaryButton}
+            disabled={closeDecisionBusy}
+            onclick={confirmDialog}
+          >
+            {closeDecisionBusy ? 'Closing…' : 'Disconnect and close'}
+          </button>
+        </div>
+      {:else if dialog.kind === 'delete'}
         <p class="eyebrow">Permanent action</p>
         <h2 id="dialog-title">Delete “{dialog.profile.name}”?</h2>
         <p id="dialog-description">
