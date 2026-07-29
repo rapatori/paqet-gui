@@ -24,6 +24,7 @@
         "maximizable": false,
         "fullscreen": false,
         "dragDropEnabled": false,
+        "zoomHotkeysEnabled": true,
         "useHttpsScheme": true
       }
     ],

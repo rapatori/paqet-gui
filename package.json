@@ -19,6 +19,7 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:sidecar": "node --test scripts/build-sidecar.test.mjs",
+    "test:webview": "npm run tauri -- build --debug --no-bundle && node scripts/verify-windows-webview.mjs",
     "tauri": "tauri",
     "tauri:sidecar": "node scripts/build-sidecar.mjs"
   },

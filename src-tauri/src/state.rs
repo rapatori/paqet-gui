@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fmt,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -457,10 +457,21 @@ impl fmt::Debug for AppState {
 
 impl AppState {
     pub fn from_app_handle<R: Runtime>(app: &AppHandle<R>) -> Result<Self, StateError> {
-        let profile_store = ProfileStore::from_app_handle(app)?;
+        let test_data_directory = test_data_directory();
+        let test_storage_paths = test_data_directory.as_deref().map(test_storage_paths);
+        let profile_store = if let Some((profile_path, _)) = &test_storage_paths {
+            ProfileStore::new(profile_path.clone())
+        } else {
+            ProfileStore::from_app_handle(app)?
+        };
         let profiles = profile_store.load()?;
+        reject_persisted_test_profiles(test_data_directory.as_deref(), &profiles)?;
         let interfaces = discover_interfaces()?;
-        let config_store = RuntimeConfigStore::from_app_handle(app)?;
+        let config_store = if let Some((_, config_path)) = test_storage_paths {
+            RuntimeConfigStore::new(config_path)
+        } else {
+            RuntimeConfigStore::from_app_handle(app)?
+        };
         let executable = resolve_paqet_executable(app.path())?;
         let launcher = Arc::new(move |config_path: &Path| {
             SupervisedPaqet::launch_pinned_executable(&executable, config_path)
@@ -916,6 +927,44 @@ impl AppState {
     }
 }
 
+#[cfg(debug_assertions)]
+fn test_data_directory() -> Option<PathBuf> {
+    select_test_data_directory(std::env::var_os("PAQET_GUI_TEST_DATA_DIR"))
+}
+
+#[cfg(not(debug_assertions))]
+fn test_data_directory() -> Option<PathBuf> {
+    select_test_data_directory(std::env::var_os("PAQET_GUI_TEST_DATA_DIR"))
+}
+
+#[cfg(debug_assertions)]
+fn select_test_data_directory(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from)
+}
+
+#[cfg(not(debug_assertions))]
+fn select_test_data_directory(_value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    None
+}
+
+fn reject_persisted_test_profiles(
+    test_directory: Option<&Path>,
+    profiles: &ProfileCollection,
+) -> Result<(), StateError> {
+    if test_directory.is_some() && !profiles.profiles().is_empty() {
+        Err(StateError::Unavailable)
+    } else {
+        Ok(())
+    }
+}
+
+fn test_storage_paths(directory: &Path) -> (PathBuf, PathBuf) {
+    (
+        directory.join("config").join("profiles.json"),
+        directory.join("local").join("config.yaml"),
+    )
+}
+
 fn coordinate_runtime(
     inner: Arc<Mutex<StateData>>,
     session_id: u64,
@@ -1077,6 +1126,38 @@ mod tests {
         config::KcpMode,
         process::{LogClassification, OutputStream},
     };
+
+    #[test]
+    fn test_data_override_is_debug_only() {
+        let selected = select_test_data_directory(Some(std::ffi::OsString::from("isolated")));
+        #[cfg(debug_assertions)]
+        assert_eq!(selected, Some(PathBuf::from("isolated")));
+        #[cfg(not(debug_assertions))]
+        assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn test_data_override_rejects_persisted_profiles() {
+        let mut profiles = ProfileCollection::default();
+        profiles.create(draft("Unexpected", "secret")).unwrap();
+
+        assert!(matches!(
+            reject_persisted_test_profiles(Some(Path::new("isolated")), &profiles),
+            Err(StateError::Unavailable)
+        ));
+        assert!(reject_persisted_test_profiles(None, &profiles).is_ok());
+    }
+
+    #[test]
+    fn test_data_override_redirects_both_secret_bearing_stores() {
+        assert_eq!(
+            test_storage_paths(Path::new("isolated")),
+            (
+                PathBuf::from("isolated/config/profiles.json"),
+                PathBuf::from("isolated/local/config.yaml")
+            )
+        );
+    }
 
     #[test]
     fn snapshot_lists_profiles_without_unselected_keys() {
