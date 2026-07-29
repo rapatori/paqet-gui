@@ -209,17 +209,22 @@ async function waitForApplication(client) {
   const deadline = Date.now() + launchTimeoutMs;
   while (Date.now() < deadline) {
     const ready = await client.evaluate(
-      `(() => ({
+      `(async () => {
+      await document.fonts.ready;
+      return {
       documentReady: document.readyState === 'complete',
+      fontsReady: document.fonts.status === 'loaded',
       hasShell: Boolean(document.querySelector('.app-shell')),
       hasConnection: Boolean(document.querySelector('.connect-button')),
       hasLogs: Boolean(document.querySelector('[aria-label="Log actions"]')),
       loading: document.querySelector('.configuration')?.getAttribute('aria-busy') === 'true'
-    }))()`,
+      };
+    })()`,
       'startup readiness',
     );
     if (
       ready.documentReady &&
+      ready.fontsReady &&
       ready.hasShell &&
       ready.hasConnection &&
       ready.hasLogs &&
@@ -512,6 +517,36 @@ async function verifyClipboardApi(client) {
   );
 }
 
+async function verifyFonts(client) {
+  const fonts = await client.evaluate(
+    `(async () => {
+      const [interfaceRegular, interfaceBold, monoRegular, monoBold] = await Promise.all([
+        document.fonts.load('400 16px "Space Grotesk"', 'paqet'),
+        document.fonts.load('680 25px "Space Grotesk"', 'paqet'),
+        document.fonts.load('400 11px "JetBrains Mono"', 'connection output'),
+        document.fonts.load('700 9px "JetBrains Mono"', 'stderr')
+      ]);
+      const loaded = (faces) => faces.length > 0 && faces.every((face) => face.status === 'loaded');
+      const firstFamily = (value) => value.split(',')[0].trim().replace(/^['"]|['"]$/g, '');
+      return {
+      interfaceFont: firstFamily(getComputedStyle(document.documentElement).fontFamily),
+      logFont: firstFamily(getComputedStyle(document.querySelector('.log')).fontFamily),
+      interfaceLoaded: loaded(interfaceRegular) && loaded(interfaceBold),
+      monoLoaded: loaded(monoRegular) && loaded(monoBold)
+      };
+    })()`,
+    'font inspection',
+  );
+  check(
+    fonts.interfaceLoaded && fonts.interfaceFont === 'Space Grotesk',
+    'Space Grotesk is not active in WebView2',
+  );
+  check(
+    fonts.monoLoaded && fonts.logFont === 'JetBrains Mono',
+    'JetBrains Mono is not active in WebView2 logs',
+  );
+}
+
 async function waitForExit(child, timeoutMs) {
   if (child.exitCode !== null) return child.exitCode;
   return Promise.race([
@@ -707,6 +742,7 @@ async function main() {
     );
 
     await verifyClipboardApi(client);
+    await verifyFonts(client);
     testProcessIdentities.push(...processTreeIdentities(child.pid));
     sendNativeInput(child, 'zoom-reset');
     await delay(300);
@@ -728,6 +764,9 @@ async function main() {
     console.log(`Keyboard: ${focused.join(' -> ')}`);
     console.log(
       'Clipboard: secure WebView2 write API is available (non-mutating)',
+    );
+    console.log(
+      'Fonts: Space Grotesk interface and JetBrains Mono logs loaded',
     );
   } catch (error) {
     if (appOutput.trim()) {

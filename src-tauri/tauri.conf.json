@@ -37,6 +37,11 @@
   "bundle": {
     "active": true,
     "icon": ["icons/icon.ico"],
+    "resources": {
+      "../THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../src/assets/fonts/SPACE_GROTESK_OFL.txt": "licenses/fonts/SPACE_GROTESK_OFL.txt",
+      "../src/assets/fonts/JETBRAINS_MONO_OFL.txt": "licenses/fonts/JETBRAINS_MONO_OFL.txt"
+    },
     "targets": "all",
     "windows": {
       "webviewInstallMode": {

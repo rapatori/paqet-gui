@@ -9,3 +9,4 @@ package-lock.json
 .git
 AGENTS.md
 README.md
+src/assets/fonts/*_OFL.txt

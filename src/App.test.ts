@@ -6,6 +6,7 @@ import {
   within,
 } from '@testing-library/svelte';
 import userEvent from '@testing-library/user-event';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { vi } from 'vitest';
@@ -21,6 +22,41 @@ import type {
 } from './lib/api';
 
 const styles = readFileSync(join(process.cwd(), 'src', 'styles.css'), 'utf8');
+const notices = readFileSync(
+  join(process.cwd(), 'THIRD_PARTY_NOTICES.md'),
+  'utf8',
+);
+const spaceGroteskPath = join(
+  process.cwd(),
+  'src',
+  'assets',
+  'fonts',
+  'space-grotesk-latin-variable.woff2',
+);
+const jetBrainsMonoPath = join(
+  process.cwd(),
+  'src',
+  'assets',
+  'fonts',
+  'jetbrains-mono-latin-variable.woff2',
+);
+const spaceGroteskLicense = readFileSync(
+  join(process.cwd(), 'src', 'assets', 'fonts', 'SPACE_GROTESK_OFL.txt'),
+  'utf8',
+);
+const jetBrainsMonoLicense = readFileSync(
+  join(process.cwd(), 'src', 'assets', 'fonts', 'JETBRAINS_MONO_OFL.txt'),
+  'utf8',
+);
+const tauriConfig = JSON.parse(
+  readFileSync(join(process.cwd(), 'src-tauri', 'tauri.conf.json'), 'utf8'),
+) as {
+  bundle: { resources: Record<string, string> };
+};
+
+function sha256(path: string) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
 
 const primaryProfile: Profile = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -2251,6 +2287,59 @@ describe('fixed-window responsive and preference contracts', () => {
     expect(styles).toContain('transition-duration: 0.01ms !important');
     expect(styles).toContain('@media (forced-colors: active)');
     expect(styles).toContain('border-color: CanvasText');
-    expect(styles).toContain('outline: 2px solid #64c8d3');
+    expect(styles).toContain('outline: 2px solid var(--accent)');
+  });
+
+  it('uses the locally bundled Nightlife Utility visual system', () => {
+    expect(styles).toMatch(
+      /@font-face\s*{[^}]*font-family: 'Space Grotesk';[^}]*font-style: normal;[^}]*font-weight: 300 700;[^}]*font-display: swap;[^}]*url\('\.\/assets\/fonts\/space-grotesk-latin-variable\.woff2'\)/s,
+    );
+    expect(styles).toMatch(
+      /@font-face\s*{[^}]*font-family: 'JetBrains Mono';[^}]*font-style: normal;[^}]*font-weight: 400 700;[^}]*font-display: swap;[^}]*url\('\.\/assets\/fonts\/jetbrains-mono-latin-variable\.woff2'\)/s,
+    );
+    expect(styles).toContain('--ink: #151116');
+    expect(styles).toContain('--accent: #ff8a4c');
+    expect(styles).toContain('--connected: #b7f05a');
+    expect(styles).toContain('--danger: #ff7a82');
+    expect(styles).toContain('--control-border: #897180');
+    expect(styles).toMatch(
+      /\.connect-button\.disconnect-action:hover:not\(:disabled\)\s*{[^}]*background: var\(--danger-hover\);/s,
+    );
+    expect(styles).not.toContain('font-weight: 750');
+    expect(styles).not.toContain('#64c8d3');
+    expect(styles).not.toContain('#0e171d');
+  });
+
+  it('pins and bundles complete notices for the local font resources', () => {
+    const spaceGroteskHash =
+      '0640890476fc1198ab4de571fb658de443c4d85b66466ec09534a8737ab1ce9d';
+    const jetBrainsMonoHash =
+      '83c005d49d8a6a50474c73a5a36ac0468076e9c4a29da7bdb14995d80560a5be';
+
+    expect(sha256(spaceGroteskPath)).toBe(spaceGroteskHash);
+    expect(sha256(jetBrainsMonoPath)).toBe(jetBrainsMonoHash);
+    expect(notices).toContain(spaceGroteskHash);
+    expect(notices).toContain(jetBrainsMonoHash);
+    expect(notices).toContain('fonts.gstatic.com/s/spacegrotesk/v22/');
+    expect(notices).toContain('fonts.gstatic.com/s/jetbrainsmono/v24/');
+    expect(spaceGroteskLicense).toContain(
+      'Copyright 2020 The Space Grotesk Project Authors',
+    );
+    expect(jetBrainsMonoLicense).toContain(
+      'Copyright 2020 The JetBrains Mono Project Authors',
+    );
+    for (const license of [spaceGroteskLicense, jetBrainsMonoLicense]) {
+      expect(license).toContain('SIL OPEN FONT LICENSE Version 1.1');
+      expect(license).toContain('PERMISSION & CONDITIONS');
+      expect(license).toContain('TERMINATION');
+      expect(license).toContain('DISCLAIMER');
+    }
+    expect(tauriConfig.bundle.resources).toEqual({
+      '../THIRD_PARTY_NOTICES.md': 'licenses/THIRD_PARTY_NOTICES.md',
+      '../src/assets/fonts/SPACE_GROTESK_OFL.txt':
+        'licenses/fonts/SPACE_GROTESK_OFL.txt',
+      '../src/assets/fonts/JETBRAINS_MONO_OFL.txt':
+        'licenses/fonts/JETBRAINS_MONO_OFL.txt',
+    });
   });
 });
