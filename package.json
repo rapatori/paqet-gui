@@ -20,6 +20,8 @@
     "test:run": "vitest run",
     "test:sidecar": "node --test scripts/build-sidecar.test.mjs",
     "test:webview": "npm run tauri -- build --debug --no-bundle && node scripts/verify-windows-webview.mjs",
+    "test:webview:accessibility": "npm run tauri -- build --debug --no-bundle && node scripts/verify-windows-webview.mjs --accessibility",
+    "test:webview:clipboard:destructive": "npm run tauri -- build --debug --no-bundle && node scripts/verify-windows-webview.mjs --accessibility --destructive-clipboard",
     "test:webview:sidecar": "npm run tauri:sidecar -- --debug --no-bundle && node scripts/verify-windows-webview.mjs --sidecar",
     "tauri": "tauri",
     "tauri:sidecar": "node scripts/build-sidecar.mjs"

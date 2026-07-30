@@ -95,7 +95,12 @@ function redact(value) {
 }
 
 function sanitizedError(error, message = undefined) {
-  const detail = error instanceof Error ? error.message : String(error);
+  const detail =
+    error instanceof AggregateError
+      ? `${error.message}: ${error.errors.map((nested) => (nested instanceof Error ? nested.message : String(nested))).join('; ')}`
+      : error instanceof Error
+        ? error.message
+        : String(error);
   return new Error(redact(message ? `${message}: ${detail}` : detail));
 }
 
@@ -401,6 +406,7 @@ async function findPage(port, child) {
 class DevToolsClient {
   constructor(url) {
     this.socket = new WebSocket(url);
+    this.closed = false;
     this.nextId = 1;
     this.pending = new Map();
     this.opened = new Promise((resolve, reject) => {
@@ -444,6 +450,7 @@ class DevToolsClient {
       }
     });
     this.socket.addEventListener('close', () => {
+      this.closed = true;
       for (const pending of this.pending.values()) {
         clearTimeout(pending.timeout);
         pending.reject(new Error('WebView2 DevTools connection closed'));
@@ -453,6 +460,7 @@ class DevToolsClient {
   }
 
   async send(method, params = {}) {
+    if (this.closed) throw new Error('WebView2 DevTools connection is closed');
     await this.opened;
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
@@ -465,13 +473,14 @@ class DevToolsClient {
     });
   }
 
-  async evaluate(expression, label = 'evaluation') {
+  async evaluate(expression, label = 'evaluation', options = {}) {
     let result;
     try {
       result = await this.send('Runtime.evaluate', {
         expression,
         awaitPromise: true,
         returnByValue: true,
+        ...options,
       });
     } catch (error) {
       throw sanitizedError(error, `WebView ${label} failed`);
@@ -489,7 +498,7 @@ class DevToolsClient {
   }
 
   close() {
-    this.socket.close();
+    if (!this.closed) this.socket.close();
   }
 }
 
@@ -667,19 +676,27 @@ try {
     [PaqetInput]::keybd_event(0x30, 0, 0, [UIntPtr]::Zero)
     [PaqetInput]::keybd_event(0x30, 0, $KEYUP, [UIntPtr]::Zero)
     [PaqetInput]::keybd_event(0x11, 0, $KEYUP, [UIntPtr]::Zero)
-  } elseif ($mode -eq 'tab') {
+  } elseif ($mode -eq 'tab' -or $mode -eq 'shift-tab') {
     for ($index = 0; $index -lt $count; $index++) {
       if ([PaqetInput]::GetForegroundWindow() -ne $handle) { throw 'paqet lost foreground ownership' }
+      if ($mode -eq 'shift-tab') { [PaqetInput]::keybd_event(0x10, 0, 0, [UIntPtr]::Zero) }
       [PaqetInput]::keybd_event(0x09, 0, 0, [UIntPtr]::Zero)
       [PaqetInput]::keybd_event(0x09, 0, $KEYUP, [UIntPtr]::Zero)
+      if ($mode -eq 'shift-tab') { [PaqetInput]::keybd_event(0x10, 0, $KEYUP, [UIntPtr]::Zero) }
       Start-Sleep -Milliseconds 80
     }
+  } elseif ($mode -eq 'escape') {
+    if ([PaqetInput]::GetForegroundWindow() -ne $handle) { throw 'paqet lost foreground ownership' }
+    [PaqetInput]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
+    [PaqetInput]::keybd_event(0x1B, 0, $KEYUP, [UIntPtr]::Zero)
   } else {
     throw "unknown input mode $mode"
   }
 } finally {
+  [PaqetInput]::keybd_event(0x10, 0, $KEYUP, [UIntPtr]::Zero)
   [PaqetInput]::keybd_event(0x11, 0, $KEYUP, [UIntPtr]::Zero)
   [PaqetInput]::keybd_event(0x12, 0, $KEYUP, [UIntPtr]::Zero)
+  [PaqetInput]::keybd_event(0x1B, 0, $KEYUP, [UIntPtr]::Zero)
 }
 `;
 
@@ -707,7 +724,7 @@ function sendNativeInput(child, mode, count = 1) {
         '-NoProfile',
         '-NonInteractive',
         '-Command',
-        `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class KeyRelease { [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra); }'; 0x09,0x11,0x12,0x30,0xBB | ForEach-Object { [KeyRelease]::keybd_event($_, 0, 2, [UIntPtr]::Zero) }`,
+        `Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class KeyRelease { [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra); }'; 0x09,0x10,0x11,0x12,0x1B,0x30,0xBB | ForEach-Object { [KeyRelease]::keybd_event($_, 0, 2, [UIntPtr]::Zero) }`,
       ],
       { stdio: 'ignore', timeout: commandTimeoutMs },
     );
@@ -1049,6 +1066,7 @@ async function launchApplication(
     hostIdentity: undefined,
     identities: [],
     outputTails: { stderr: '', stdout: '' },
+    pageUrl: undefined,
     streamsClosed: Promise.all([
       once(child.stdout, 'close'),
       once(child.stderr, 'close'),
@@ -1087,6 +1105,7 @@ async function launchApplication(
     const port = await findDevToolsPort(userData, child);
     const page = await findPage(port, child);
     session.client = new DevToolsClient(page.webSocketDebuggerUrl);
+    session.pageUrl = page.url;
     await waitForApplication(session.client);
     session.version = await session.client.send('Browser.getVersion');
     session.identities.push(...processTreeIdentities(child.pid));
@@ -1338,6 +1357,509 @@ async function verifyApp001A(session) {
     'Browser zoom did not return to 100%',
   );
   return { baseline, focused, nativeMetrics, zoomed, zoomRatio };
+}
+
+function axValue(node, property) {
+  return node[property]?.value;
+}
+
+function axProperty(node, property) {
+  return node.properties?.find((candidate) => candidate.name === property)
+    ?.value?.value;
+}
+
+async function readAccessibilityTree(client) {
+  const { nodes } = await client.send('Accessibility.getFullAXTree');
+  return nodes;
+}
+
+function findAxNode(nodes, role, name, exact = true) {
+  return nodes.find(
+    (node) =>
+      !node.ignored &&
+      axValue(node, 'role') === role &&
+      (exact
+        ? axValue(node, 'name') === name
+        : axValue(node, 'name')?.startsWith(name)),
+  );
+}
+
+async function verifyAccessibilityShell(client) {
+  await client.send('Accessibility.enable');
+  const nodes = await readAccessibilityTree(client);
+  const requiredNodes = [
+    ['heading', 'paqet', true],
+    ['combobox', 'Selected server profile', true],
+    ['form', 'Server profile', true],
+    ['button', 'Advanced', false],
+    ['button', 'Connect', true],
+    ['log', 'Connection logs', true],
+  ];
+  for (const [role, name, exact] of requiredNodes) {
+    check(
+      findAxNode(nodes, role, name, exact),
+      `Accessibility tree is missing ${role} “${name}”`,
+    );
+  }
+  const disclosure = findAxNode(nodes, 'button', 'Advanced', false);
+  check(
+    axProperty(disclosure, 'expanded') === false,
+    'Advanced accessibility state is not collapsed',
+  );
+}
+
+async function verifyEmulatedPreferences(client, child) {
+  await client.send('Emulation.setEmulatedMedia', {
+    media: '',
+    features: [
+      { name: 'forced-colors', value: 'active' },
+      { name: 'prefers-reduced-motion', value: 'reduce' },
+    ],
+  });
+  const preferences = await client.evaluate(
+    `(() => {
+      const chevron = document.querySelector('.chevron');
+      const surfaces = ['.configuration', '.connection', '.log', 'button'];
+      return {
+        forcedColors: matchMedia('(forced-colors: active)').matches,
+        reducedMotion: matchMedia('(prefers-reduced-motion: reduce)').matches,
+        transitionDurations: chevron ? getComputedStyle(chevron).transitionDuration.split(',').map((value) => Number.parseFloat(value) || 0) : [],
+        boundaries: surfaces.map((selector) => {
+          const element = document.querySelector(selector);
+          const style = element ? getComputedStyle(element) : null;
+          return {
+            selector,
+            width: style ? Number.parseFloat(style.borderTopWidth) || 0 : 0,
+            style: style?.borderTopStyle ?? 'none'
+          };
+        }),
+        protectedColors: ['.wordmark-mark', '.status span', '.connect-button span'].map((selector) => getComputedStyle(document.querySelector(selector)).forcedColorAdjust)
+      };
+    })()`,
+    'emulated accessibility preferences',
+  );
+  check(preferences.forcedColors, 'Forced-colors emulation did not activate');
+  check(preferences.reducedMotion, 'Reduced-motion emulation did not activate');
+  check(
+    preferences.transitionDurations.length > 0 &&
+      preferences.transitionDurations.every((duration) => duration <= 0.001),
+    'Reduced-motion transition override is not effective',
+  );
+  check(
+    preferences.boundaries.every(
+      (boundary) => boundary.width >= 1 && boundary.style !== 'none',
+    ),
+    'Forced-colors mode removed a required control or surface boundary',
+  );
+  check(
+    preferences.protectedColors.every((value) => value === 'none'),
+    'Forced-color-adjust protection is not effective',
+  );
+
+  await client.evaluate(
+    `(() => {
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
+      document.body.tabIndex = -1;
+      document.body.focus();
+    })()`,
+    'forced-colors focus reset',
+  );
+  sendNativeInput(child, 'tab');
+  await delay(120);
+  const focus = await client.evaluate(
+    `(() => {
+      const element = document.activeElement;
+      const style = element instanceof HTMLElement ? getComputedStyle(element) : null;
+      return {
+        text: element?.textContent?.trim() ?? '',
+        outlineWidth: style ? Number.parseFloat(style.outlineWidth) || 0 : 0,
+        outlineStyle: style?.outlineStyle ?? 'none'
+      };
+    })()`,
+    'forced-colors focus ring',
+  );
+  check(
+    focus.text === 'New' &&
+      focus.outlineWidth >= 2 &&
+      focus.outlineStyle !== 'none',
+    'Forced-colors keyboard focus ring is missing or out of order',
+  );
+  assertNoHorizontalOverflow(await readMetrics(client), 'Forced-colors mode');
+}
+
+async function focusedButtonText(client) {
+  return client.evaluate(
+    `document.activeElement instanceof HTMLButtonElement ? document.activeElement.textContent.trim() : ''`,
+    'focused dialog button',
+  );
+}
+
+async function verifyDialogAccessibility(client, child, expected) {
+  await waitForValue(
+    client,
+    `document.querySelector('#dialog-title')?.textContent.trim() === ${JSON.stringify(expected.title)}`,
+    `${expected.label} dialog`,
+  );
+  const nodes = await readAccessibilityTree(client);
+  const dialog = findAxNode(nodes, 'alertdialog', expected.title);
+  check(
+    dialog,
+    `${expected.label} dialog is missing from the accessibility tree`,
+  );
+  check(
+    axValue(dialog, 'description') === expected.description,
+    `${expected.label} dialog description is not accessible`,
+  );
+  check(
+    axProperty(dialog, 'modal') === true,
+    `${expected.label} dialog is not exposed as modal`,
+  );
+  check(
+    [
+      ['heading', 'paqet'],
+      ['form', 'Server profile'],
+      ['button', 'Connect'],
+      ['log', 'Connection logs'],
+    ].every(([role, name]) => !findAxNode(nodes, role, name)),
+    `${expected.label} dialog did not hide the application shell from accessibility`,
+  );
+  check(
+    (await focusedButtonText(client)) === expected.initialFocus,
+    `${expected.label} dialog initial focus is incorrect`,
+  );
+  const focusedNode = findAxNode(nodes, 'button', expected.initialFocus);
+  check(
+    focusedNode && axProperty(focusedNode, 'focused') === true,
+    `${expected.label} dialog focus is not exposed in the accessibility tree`,
+  );
+
+  sendNativeInput(
+    child,
+    expected.initialFocus === expected.last ? 'tab' : 'shift-tab',
+  );
+  await delay(120);
+  check(
+    (await focusedButtonText(client)) ===
+      (expected.initialFocus === expected.last
+        ? expected.first
+        : expected.last),
+    `${expected.label} dialog did not wrap focus from its initial boundary`,
+  );
+  sendNativeInput(
+    child,
+    expected.initialFocus === expected.last ? 'shift-tab' : 'tab',
+  );
+  await delay(120);
+  check(
+    (await focusedButtonText(client)) === expected.initialFocus,
+    `${expected.label} dialog did not wrap focus back to its initial action`,
+  );
+  sendNativeInput(child, 'escape');
+  await waitForValue(
+    client,
+    `!document.querySelector('.dialog')`,
+    `${expected.label} Escape dismissal`,
+  );
+  const restoredFocus = await client.evaluate(
+    `(() => ({
+      matches: document.activeElement?.matches(${JSON.stringify(expected.returnFocus)}) ?? false,
+      tag: document.activeElement?.tagName ?? '',
+      id: document.activeElement?.id ?? '',
+      classes: Array.from(document.activeElement?.classList ?? []),
+      text: document.activeElement?.textContent?.trim() ?? ''
+    }))()`,
+    `${expected.label} restored focus`,
+  );
+  check(
+    restoredFocus.matches,
+    `${expected.label} did not restore invoker focus: ${JSON.stringify(restoredFocus)}`,
+  );
+}
+
+async function verifyDeleteDialog(client, child) {
+  await client.evaluate(
+    domAction(`clickButton('Edit');`),
+    'open profile editor for delete dialog',
+  );
+  await waitForValue(
+    client,
+    `document.activeElement?.id === 'profile-name' && Array.from(document.querySelectorAll('.profile-form button')).some((button) => button.textContent.trim() === 'Delete profile')`,
+    'profile editor delete action',
+  );
+  await client.evaluate(
+    domAction(`
+      const button = findButton('Delete profile');
+      if (!(button instanceof HTMLButtonElement)) throw new Error('Missing button Delete profile');
+      button.focus();
+    `),
+    'focus delete dialog invoker',
+  );
+  await waitForValue(
+    client,
+    `document.activeElement?.textContent.trim() === 'Delete profile'`,
+    'focused delete dialog invoker',
+  );
+  await client.evaluate(
+    domAction(`clickButton('Delete profile');`),
+    'open delete dialog',
+  );
+  await verifyDialogAccessibility(client, child, {
+    description:
+      'This removes the saved server profile. This action cannot be undone.',
+    first: 'Cancel',
+    initialFocus: 'Delete profile',
+    label: 'Delete profile',
+    last: 'Delete profile',
+    returnFocus: '.profile-form .danger-button',
+    title: 'Delete “Accessibility fixture”?',
+  });
+  await client.evaluate(
+    domAction(`clickButton('Cancel');`),
+    'leave profile editor',
+  );
+}
+
+async function verifyUnsafeBlockDialog(client, child) {
+  await client.evaluate(
+    domAction(`
+      const disclosure = document.querySelector('.disclosure-button');
+      if (!(disclosure instanceof HTMLButtonElement)) throw new Error('Missing Advanced disclosure');
+      disclosure.click();
+    `),
+    'expand Advanced settings for accessibility',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('#advanced-content')`,
+    'expanded Advanced settings for accessibility',
+  );
+  await client.evaluate(
+    domAction(`
+      const label = Array.from(document.querySelectorAll('.override-toggle')).find((candidate) => candidate.querySelector('strong')?.textContent.trim() === 'Override KCP block');
+      const checkbox = label?.querySelector('input[type="checkbox"]');
+      if (!(checkbox instanceof HTMLInputElement)) throw new Error('Missing KCP block override');
+      checkbox.click();
+    `),
+    'enable KCP block override',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('#kcp-block') instanceof HTMLSelectElement && !document.querySelector('#kcp-block').disabled`,
+    'enabled KCP block override',
+  );
+  await client.evaluate(
+    domAction(`
+      const select = document.querySelector('#kcp-block');
+      if (!(select instanceof HTMLSelectElement)) throw new Error('Missing select #kcp-block');
+      select.focus();
+    `),
+    'focus unsafe KCP block invoker',
+  );
+  await waitForValue(
+    client,
+    `document.activeElement?.id === 'kcp-block'`,
+    'focused unsafe KCP block invoker',
+  );
+  await client.evaluate(
+    domAction(`setSelect('#kcp-block', 'none');`),
+    'select insecure KCP block',
+  );
+  await verifyDialogAccessibility(client, child, {
+    description:
+      'Traffic will not be encrypted or authenticated. The server must use this exact value; None and Null are not interchangeable.',
+    first: 'Cancel',
+    initialFocus: 'Cancel',
+    label: 'Unsafe KCP block',
+    last: 'Use insecure block',
+    returnFocus: '#kcp-block',
+    title: 'Use insecure “none” KCP block?',
+  });
+}
+
+async function verifyClipboardRoundTrip(session) {
+  const { client } = session;
+  const origin = new URL(session.pageUrl).origin;
+  const sentinel = `paqet-clipboard-${randomBytes(32).toString('hex')}`;
+  await client.send('Browser.grantPermissions', {
+    origin,
+    permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'],
+  });
+  console.log(
+    'APP-001D1 clipboard warning: this destructive check replaces prior clipboard content with a non-secret sentinel and does not retain or restore it',
+  );
+  try {
+    const roundTrip = await client.evaluate(
+      `(async () => {
+        if (typeof navigator.clipboard?.readText !== 'function' || typeof navigator.clipboard?.writeText !== 'function') {
+          throw new Error('Clipboard text APIs are unavailable');
+        }
+        await navigator.clipboard.writeText(${JSON.stringify(sentinel)});
+        return await navigator.clipboard.readText() === ${JSON.stringify(sentinel)};
+      })()`,
+      'destructive clipboard round trip',
+      { userGesture: true },
+    );
+    check(roundTrip, 'Clipboard sentinel did not round-trip');
+  } finally {
+    await client.send('Browser.resetPermissions');
+  }
+}
+
+async function verifyAccessibilityWorkflows(destructiveClipboard) {
+  check(process.platform === 'win32', 'WebView verification requires Windows');
+  check(process.arch === 'x64', 'WebView verification requires Windows x64');
+  await access(executable);
+  const testRoot = await mkdtemp(
+    path.join(os.tmpdir(), 'paqet-accessibility-'),
+  );
+  const appData = path.join(testRoot, 'app-data');
+  const fixturePath = path.join(appData, 'network-interfaces.json');
+  const sessions = new Set();
+  const key = `paqet-app001d1-${randomBytes(32).toString('hex')}`;
+  secretSentinels = [key];
+  let interrupted;
+  const terminateOnSignal = (signal) => {
+    interrupted ??= signal;
+    for (const session of sessions) {
+      try {
+        terminateOwnedChild(session);
+      } catch {
+        process.exitCode = 1;
+      }
+    }
+  };
+  process.once('SIGINT', terminateOnSignal);
+  process.once('SIGTERM', terminateOnSignal);
+  process.once('SIGBREAK', terminateOnSignal);
+  let evidence;
+  let failure;
+  let teardownFailure;
+  try {
+    await mkdir(appData, { recursive: true });
+    await writeFile(
+      fixturePath,
+      `${JSON.stringify(
+        [
+          {
+            friendlyName: 'Accessibility Ethernet',
+            interfaceName: 'accessibility0',
+            guid: '\\Device\\NPF_{33333333-3333-4333-8333-333333333333}',
+            localAddress: '192.0.2.30',
+            gatewayAddress: '192.0.2.1',
+            gatewayMac: '02:00:00:00:03:01',
+          },
+        ],
+        null,
+        2,
+      )}\n`,
+    );
+    const session = await launchApplication(
+      testRoot,
+      appData,
+      1,
+      { PAQET_GUI_TEST_NETWORK_FIXTURE: '1' },
+      sessions,
+    );
+    await verifyEmulatedPreferences(session.client, session.child);
+    await clientResetMedia(session.client);
+    await createProfile(session.client, {
+      host: '192.0.2.90',
+      key,
+      name: 'Accessibility fixture',
+      port: 4901,
+    });
+    await verifyAccessibilityShell(session.client);
+    await verifyDeleteDialog(session.client, session.child);
+    await verifyUnsafeBlockDialog(session.client, session.child);
+    if (destructiveClipboard) {
+      await verifyClipboardRoundTrip(session);
+    }
+    evidence = {
+      version: session.version.product,
+    };
+    await session.client.send('Accessibility.disable');
+    await closeApplication(session);
+    sessions.delete(session);
+  } catch (error) {
+    const appOutput = [...sessions]
+      .map((session) => session.appOutput.trim())
+      .filter(Boolean)
+      .join('\n');
+    failure = appOutput
+      ? new Error(redact(`${error.message}\nApplication output:\n${appOutput}`))
+      : sanitizedError(error);
+  } finally {
+    const teardownErrors = [];
+    for (const session of sessions) {
+      if (!session.client?.closed) {
+        try {
+          await clientResetMedia(session.client);
+          await session.client?.send('Accessibility.disable');
+        } catch (error) {
+          teardownErrors.push(sanitizedError(error));
+        }
+      }
+      try {
+        await closeApplication(session);
+      } catch (error) {
+        teardownErrors.push(sanitizedError(error));
+      }
+    }
+    try {
+      await rm(testRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 200,
+      });
+    } catch (error) {
+      teardownErrors.push(sanitizedError(error));
+    }
+    process.off('SIGINT', terminateOnSignal);
+    process.off('SIGTERM', terminateOnSignal);
+    process.off('SIGBREAK', terminateOnSignal);
+    if (teardownErrors.length > 0) {
+      teardownFailure = new AggregateError(
+        teardownErrors,
+        'Accessibility WebView teardown failed',
+      );
+    }
+  }
+  if (failure && teardownFailure) {
+    throw new AggregateError(
+      [failure, teardownFailure],
+      'Accessibility verification and teardown failed',
+    );
+  }
+  if (failure) throw failure;
+  if (teardownFailure) throw teardownFailure;
+  if (interrupted)
+    throw new Error(`Accessibility verification interrupted by ${interrupted}`);
+
+  console.log(
+    `Host: ${os.version()} ${os.arch()}, WebView2 ${evidence.version}`,
+  );
+  console.log(
+    'APP-001D1 preferences: forced-colors and reduced-motion media queries activated; representative surface boundaries, keyboard focus, no horizontal overflow, and disclosure transition override verified',
+  );
+  console.log(
+    'APP-001D1 accessibility: canonical shell roles plus primary-first and cancel-first modal semantics, focus wrapping, Escape dismissal, and invoker restoration verified',
+  );
+  if (destructiveClipboard) {
+    console.log(
+      'APP-001D1 clipboard: destructive non-secret text sentinel write/read round-trip verified; prior clipboard content was intentionally not retained or restored',
+    );
+  }
+  console.log(
+    destructiveClipboard
+      ? 'Teardown: identity-recorded process tree exited with zero orphans; temporary clipboard permissions reset and temporary root deleted'
+      : 'Teardown: identity-recorded process tree exited with zero orphans; media/accessibility emulation reset and temporary root deleted',
+  );
+}
+
+async function clientResetMedia(client) {
+  if (!client) return;
+  await client.send('Emulation.setEmulatedMedia', { media: '', features: [] });
 }
 
 async function readInterfaceDetails(client) {
@@ -2158,7 +2680,27 @@ async function verifyDisconnectedWorkflows() {
   );
 }
 
-if (process.argv.slice(2).includes('--sidecar')) {
+const flags = new Set(process.argv.slice(2));
+const knownFlags = new Set([
+  '--accessibility',
+  '--destructive-clipboard',
+  '--sidecar',
+]);
+for (const flag of flags) {
+  check(knownFlags.has(flag), `Unknown WebView verification flag ${flag}`);
+}
+check(
+  !(flags.has('--sidecar') && flags.size > 1),
+  'Sidecar verification cannot be combined with another workflow',
+);
+check(
+  !flags.has('--destructive-clipboard') || flags.has('--accessibility'),
+  'Destructive clipboard verification requires --accessibility',
+);
+
+if (flags.has('--accessibility')) {
+  await verifyAccessibilityWorkflows(flags.has('--destructive-clipboard'));
+} else if (flags.has('--sidecar')) {
   await verifySidecarWorkflows();
 } else {
   await verifyDisconnectedWorkflows();
