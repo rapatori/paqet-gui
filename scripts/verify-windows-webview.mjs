@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import {
   access,
@@ -23,11 +23,21 @@ const executable = path.join(
   'debug',
   'paqet-gui.exe',
 );
+const copiedSidecar = path.join(
+  root,
+  'src-tauri',
+  'target',
+  'debug',
+  'paqet_windows_amd64.exe',
+);
 const expectedWidth = 440;
 const expectedHeight = 760;
 const commandTimeoutMs = 10_000;
 const launchTimeoutMs = 30_000;
 const workflowTimeoutMs = 15_000;
+const pinnedSidecarSize = 9_775_616;
+const pinnedSidecarSha256 =
+  '49b377270473c223534ac1c2846d15c287863318e6fe6ee3c123f36ab97b441c';
 const permittedSecretPaths = new Set([
   'app-data/config/profiles.json',
   'app-data/config/profiles.bak',
@@ -931,6 +941,74 @@ async function waitForTestProcesses(identities, timeoutMs) {
   );
 }
 
+async function waitForPaqetProcess(session, label) {
+  const deadline = Date.now() + workflowTimeoutMs;
+  while (Date.now() < deadline) {
+    if (session.child.exitCode !== null) {
+      throw new Error(`paqet exited while waiting for ${label}`);
+    }
+    const identity = processTreeIdentities(session.child.pid).find(
+      ({ name, pid }) =>
+        pid !== session.child.pid &&
+        name.toLowerCase() === 'paqet_windows_amd64.exe',
+    );
+    if (identity) {
+      session.identities.push(identity);
+      return identity;
+    }
+    await delay(50);
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+function terminateExactProcess(identity) {
+  check(
+    processIdentityExists(identity),
+    'The expected paqet process is absent',
+  );
+  const result = spawnSync(
+    'taskkill.exe',
+    ['/PID', String(identity.pid), '/F'],
+    { stdio: 'ignore', timeout: commandTimeoutMs },
+  );
+  check(
+    result.status === 0 || !processIdentityExists(identity),
+    'Cannot terminate the exact paqet process',
+  );
+}
+
+function wrongIdentitySidecar(exactSidecar) {
+  const mutated = Buffer.from(exactSidecar);
+  const peOffset = mutated.readUInt32LE(0x3c);
+  check(
+    mutated.subarray(peOffset, peOffset + 4).equals(Buffer.from('PE\0\0')),
+    'The pinned sidecar does not have a valid PE signature',
+  );
+  const optionalHeader = peOffset + 24;
+  check(
+    [0x10b, 0x20b].includes(mutated.readUInt16LE(optionalHeader)),
+    'The pinned sidecar has an unsupported PE optional header',
+  );
+  const checksumOffset = optionalHeader + 64;
+  mutated.writeUInt32LE(
+    (mutated.readUInt32LE(checksumOffset) ^ 0xffffffff) >>> 0,
+    checksumOffset,
+  );
+  return mutated;
+}
+
+function verifyWrongIdentityRemainsLaunchable() {
+  const result = spawnSync(copiedSidecar, ['version'], {
+    encoding: 'utf8',
+    timeout: commandTimeoutMs,
+    windowsHide: true,
+  });
+  check(
+    result.status === 0 && result.signal === null && !result.error,
+    'The wrong-identity sidecar is not independently launchable',
+  );
+}
+
 function uniqueIdentities(identities) {
   return [
     ...new Map(
@@ -1115,6 +1193,83 @@ async function closeApplication(session) {
   }
 }
 
+async function closeActiveApplication(session, paqetIdentity) {
+  session.identities.push(...processTreeIdentities(session.child.pid));
+  sendNativeInput(session.child, 'close');
+  await waitForValue(
+    session.client,
+    `document.querySelector('#dialog-title')?.textContent.trim() === 'Disconnect and close?'`,
+    'supervised close confirmation',
+  );
+  check(
+    processIdentityExists(paqetIdentity),
+    'paqet exited before supervised close confirmation',
+  );
+  await session.client.evaluate(
+    domAction(
+      `clickButton('Disconnect and close', document.querySelector('.dialog'));`,
+    ),
+    'confirm supervised close',
+  );
+  const exitCode = await waitForExit(session.child, workflowTimeoutMs);
+  check(
+    exitCode === 0,
+    `paqet exited during supervised close with code ${exitCode}`,
+  );
+  session.client.close();
+  await waitForTestProcesses(uniqueIdentities(session.identities), 5_000);
+  await Promise.race([
+    session.streamsClosed,
+    delay(2_000).then(() => {
+      throw new Error(
+        'Application output pipes did not close after supervised close',
+      );
+    }),
+  ]);
+  check(
+    !session.outputSecretLeak,
+    'Application output contained a secret sentinel',
+  );
+}
+
+async function forceCloseApplication(session) {
+  const errors = [];
+  session.client?.close();
+  if (session.child.exitCode === null) {
+    try {
+      session.identities.push(...processTreeIdentities(session.child.pid));
+    } catch (error) {
+      errors.push(sanitizedError(error));
+    }
+    try {
+      terminateOwnedChild(session);
+    } catch (error) {
+      errors.push(sanitizedError(error));
+    }
+  }
+  try {
+    await waitForExit(session.child, 5_000);
+    await waitForTestProcesses(uniqueIdentities(session.identities), 5_000);
+  } catch (error) {
+    errors.push(sanitizedError(error));
+  }
+  try {
+    await Promise.race([
+      session.streamsClosed,
+      delay(2_000).then(() => {
+        throw new Error(
+          'Application output pipes did not close after forced cleanup',
+        );
+      }),
+    ]);
+  } catch (error) {
+    errors.push(sanitizedError(error));
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, 'Application forced cleanup failed');
+  }
+}
+
 async function verifyApp001A(session) {
   const { child, client } = session;
   const baseline = await readMetrics(client);
@@ -1262,7 +1417,306 @@ async function auditSecrets(testRoot) {
   return [...foundPaths].sort();
 }
 
-async function main() {
+function sha256(contents) {
+  return createHash('sha256').update(contents).digest('hex');
+}
+
+async function readVerifiedSidecar() {
+  const contents = await readFile(copiedSidecar);
+  check(
+    contents.length === pinnedSidecarSize &&
+      sha256(contents) === pinnedSidecarSha256,
+    'The copied paqet sidecar does not match the pinned manifest identity',
+  );
+  return contents;
+}
+
+async function verifySidecarWorkflows() {
+  check(process.platform === 'win32', 'Sidecar verification requires Windows');
+  check(process.arch === 'x64', 'Sidecar verification requires Windows x64');
+  await access(executable);
+  const exactSidecar = await readVerifiedSidecar();
+  secretSentinels = [`paqet-app001c-${randomBytes(32).toString('hex')}`];
+  const testRoot = await mkdtemp(path.join(os.tmpdir(), 'paqet-sidecar-'));
+  const appData = path.join(testRoot, 'app-data');
+  const profile = {
+    name: 'Pinned lifecycle',
+    host: '192.0.2.80',
+    port: 9999,
+    key: secretSentinels[0],
+  };
+  const sessions = new Set();
+  const sidecarIdentities = [];
+  let interrupted;
+  let copiedSidecarRestored = true;
+  let permittedPaths = [];
+  let webViewVersion;
+  let failure;
+  let teardownFailure;
+  const terminateOnSignal = (signal) => {
+    interrupted ??= signal;
+    for (const session of sessions) {
+      try {
+        terminateOwnedChild(session);
+      } catch {
+        process.exitCode = 1;
+      }
+    }
+  };
+  process.once('SIGINT', terminateOnSignal);
+  process.once('SIGTERM', terminateOnSignal);
+  process.once('SIGBREAK', terminateOnSignal);
+
+  try {
+    await mkdir(appData, { recursive: true });
+
+    const corruptSidecar = wrongIdentitySidecar(exactSidecar);
+    copiedSidecarRestored = false;
+    await writeFile(copiedSidecar, corruptSidecar);
+    check(
+      corruptSidecar.length === pinnedSidecarSize &&
+        sha256(corruptSidecar) !== pinnedSidecarSha256,
+      'The wrong-identity sidecar fixture is not precise',
+    );
+    verifyWrongIdentityRemainsLaunchable();
+
+    const rejection = await launchApplication(
+      testRoot,
+      appData,
+      'sidecar-rejection',
+      {},
+      sessions,
+    );
+    webViewVersion = rejection.version.product;
+    await createProfile(rejection.client, profile);
+    await rejection.client.evaluate(
+      domAction(`clickButton('Connect');`),
+      'connect with wrong sidecar identity',
+    );
+    await waitForValue(
+      rejection.client,
+      `(() => {
+        const button = document.querySelector('.connect-button');
+        const message = Array.from(document.querySelectorAll('.connection .app-message')).find((item) => item.textContent.trim() === 'The paqet client could not be started.');
+        return Boolean(message) &&
+          document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
+          button?.textContent.trim() === 'Connect' && !button.disabled;
+      })()`,
+      'wrong sidecar identity rejection',
+    );
+    check(
+      !processTreeIdentities(rejection.child.pid).some(
+        ({ name, pid }) =>
+          pid !== rejection.child.pid &&
+          name.toLowerCase() === 'paqet_windows_amd64.exe',
+      ),
+      'A wrong-identity paqet process was launched',
+    );
+    await closeApplication(rejection);
+    sessions.delete(rejection);
+
+    await writeFile(copiedSidecar, exactSidecar);
+    await readVerifiedSidecar();
+    copiedSidecarRestored = true;
+
+    const lifecycle = await launchApplication(
+      testRoot,
+      appData,
+      'sidecar-lifecycle',
+      { PAQET_GUI_TEST_ALLOW_PERSISTED_PROFILES: '1' },
+      sessions,
+    );
+    check(
+      lifecycle.version.product === webViewVersion,
+      'WebView2 version changed between sidecar launches',
+    );
+    const { client } = lifecycle;
+
+    await client.evaluate(
+      domAction(`clickButton('Connect');`),
+      'initial connect',
+    );
+    const firstPaqet = await waitForPaqetProcess(
+      lifecycle,
+      'the initial pinned paqet process',
+    );
+    sidecarIdentities.push(firstPaqet);
+    await waitForValue(
+      client,
+      `(() => {
+        const log = document.querySelector('[aria-label="Connection logs"]');
+        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connected' &&
+          document.querySelector('.connect-button')?.textContent.trim() === 'Disconnect' &&
+          log?.textContent.includes('Client started:') &&
+          log?.textContent.includes('SOCKS5 server listening on 127.0.0.1:1080');
+      })()`,
+      'initial real paqet connection',
+    );
+    const firstPaqetTree = processTreeIdentities(firstPaqet.pid);
+    lifecycle.identities.push(...firstPaqetTree);
+    sidecarIdentities.push(...firstPaqetTree);
+
+    await client.evaluate(
+      domAction(`clickButton('Disconnect');`),
+      'disconnect',
+    );
+    await waitForValue(
+      client,
+      `(() => {
+        const button = document.querySelector('.connect-button');
+        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
+          button?.textContent.trim() === 'Connect' && !button.disabled &&
+          !document.querySelector('#profile-select')?.disabled;
+      })()`,
+      'requested disconnect completion',
+    );
+    await waitForTestProcesses(firstPaqetTree, 5_000);
+
+    await client.evaluate(
+      domAction(`clickButton('Connect');`),
+      'connect before unexpected exit',
+    );
+    const secondPaqet = await waitForPaqetProcess(
+      lifecycle,
+      'the second pinned paqet process',
+    );
+    sidecarIdentities.push(secondPaqet);
+    check(
+      secondPaqet.pid !== firstPaqet.pid ||
+        secondPaqet.created !== firstPaqet.created,
+      'Reconnect reused the initial process identity',
+    );
+    await waitForValue(
+      client,
+      `document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connected'`,
+      'connected state before unexpected exit',
+    );
+    const secondPaqetTree = processTreeIdentities(secondPaqet.pid);
+    lifecycle.identities.push(...secondPaqetTree);
+    sidecarIdentities.push(...secondPaqetTree);
+    terminateExactProcess(secondPaqet);
+    await waitForValue(
+      client,
+      `(() => {
+        const failure = document.querySelector('.failure-message');
+        const button = document.querySelector('.connect-button');
+        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
+          failure?.textContent.includes('exited unexpectedly') &&
+          button?.textContent.trim() === 'Connect' && !button.disabled &&
+          !document.querySelector('#profile-select')?.disabled;
+      })()`,
+      'unexpected paqet exit recovery',
+    );
+    await waitForTestProcesses(secondPaqetTree, 5_000);
+
+    await client.evaluate(
+      domAction(`clickButton('Connect');`),
+      'final reconnect',
+    );
+    const thirdPaqet = await waitForPaqetProcess(
+      lifecycle,
+      'the third pinned paqet process',
+    );
+    sidecarIdentities.push(thirdPaqet);
+    check(
+      sidecarIdentities
+        .slice(0, -1)
+        .every(
+          (identity) =>
+            identity.pid !== thirdPaqet.pid ||
+            identity.created !== thirdPaqet.created,
+        ),
+      'Final reconnect reused a prior process identity',
+    );
+    await waitForValue(
+      client,
+      `document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connected'`,
+      'connected state before supervised close',
+    );
+    await closeActiveApplication(lifecycle, thirdPaqet);
+    sessions.delete(lifecycle);
+    await waitForTestProcesses(sidecarIdentities, 5_000);
+    permittedPaths = await auditSecrets(testRoot);
+  } catch (error) {
+    const appOutput = [...sessions]
+      .map((session) => session.appOutput.trim())
+      .filter(Boolean)
+      .join('\n');
+    failure = appOutput
+      ? new Error(redact(`${error.message}\nApplication output:\n${appOutput}`))
+      : sanitizedError(error);
+  } finally {
+    const teardownErrors = [];
+    for (const session of sessions) {
+      try {
+        await forceCloseApplication(session);
+      } catch (error) {
+        teardownErrors.push(sanitizedError(error));
+      }
+    }
+    try {
+      await waitForTestProcesses(sidecarIdentities, 5_000);
+    } catch (error) {
+      teardownErrors.push(sanitizedError(error));
+    }
+    if (!copiedSidecarRestored) {
+      try {
+        await writeFile(copiedSidecar, exactSidecar);
+        await readVerifiedSidecar();
+        copiedSidecarRestored = true;
+      } catch (error) {
+        teardownErrors.push(sanitizedError(error));
+      }
+    }
+    try {
+      await readVerifiedSidecar();
+    } catch (error) {
+      teardownErrors.push(sanitizedError(error));
+    }
+    try {
+      await rm(testRoot, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 200,
+      });
+    } catch (error) {
+      teardownErrors.push(sanitizedError(error));
+    }
+    process.off('SIGINT', terminateOnSignal);
+    process.off('SIGTERM', terminateOnSignal);
+    process.off('SIGBREAK', terminateOnSignal);
+    if (teardownErrors.length > 0) {
+      teardownFailure = new AggregateError(
+        teardownErrors,
+        'Sidecar WebView teardown failed',
+      );
+    }
+  }
+  if (failure && teardownFailure) {
+    throw new AggregateError(
+      [failure, teardownFailure],
+      'Sidecar verification and teardown failed',
+    );
+  }
+  if (failure) throw failure;
+  if (teardownFailure) throw teardownFailure;
+  if (interrupted)
+    throw new Error(`Sidecar verification interrupted by ${interrupted}`);
+
+  console.log(`Host: ${os.version()} ${os.arch()}, WebView2 ${webViewVersion}`);
+  console.log(
+    `APP-001C identity: wrong copied SHA-256 rejected before spawn; restored sidecar verified at ${pinnedSidecarSize} bytes / ${pinnedSidecarSha256}`,
+  );
+  console.log(
+    'APP-001C lifecycle: real pinned paqet startup marker, SOCKS listener, requested disconnect, unexpected exit recovery, and reconnect verified',
+  );
+  console.log(
+    `APP-001C close/cleanup: supervised active close confirmed; ${uniqueIdentities(sidecarIdentities).length} recorded sidecar-tree identities exited; sentinels restricted to ${permittedPaths.join(', ')}; temporary root deleted`,
+  );
+}
+
+async function verifyDisconnectedWorkflows() {
   check(process.platform === 'win32', 'WebView verification requires Windows');
   check(process.arch === 'x64', 'WebView verification requires Windows x64');
   await access(executable);
@@ -1704,4 +2158,8 @@ async function main() {
   );
 }
 
-await main();
+if (process.argv.slice(2).includes('--sidecar')) {
+  await verifySidecarWorkflows();
+} else {
+  await verifyDisconnectedWorkflows();
+}
