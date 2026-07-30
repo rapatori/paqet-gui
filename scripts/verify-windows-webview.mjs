@@ -1,6 +1,15 @@
 import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import {
+  access,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -18,6 +27,67 @@ const expectedWidth = 440;
 const expectedHeight = 760;
 const commandTimeoutMs = 10_000;
 const launchTimeoutMs = 30_000;
+const workflowTimeoutMs = 15_000;
+const permittedSecretPaths = new Set([
+  'app-data/config/profiles.json',
+  'app-data/config/profiles.bak',
+  'app-data/local/config.yaml',
+]);
+let secretSentinels = [];
+
+function textSecretRepresentations(sentinel) {
+  return [
+    sentinel,
+    Buffer.from(sentinel).toString('base64'),
+    [...Buffer.from(sentinel)]
+      .map((byte) => `%${byte.toString(16).padStart(2, '0').toUpperCase()}`)
+      .join(''),
+  ];
+}
+
+function percentEncodedPattern(sentinel) {
+  const pattern = [...Buffer.from(sentinel)]
+    .map(
+      (byte) =>
+        `%${byte
+          .toString(16)
+          .padStart(2, '0')
+          .split('')
+          .map((digit) =>
+            /[a-f]/i.test(digit)
+              ? `[${digit.toLowerCase()}${digit.toUpperCase()}]`
+              : digit,
+          )
+          .join('')}`,
+    )
+    .join('');
+  return new RegExp(pattern, 'g');
+}
+
+function fileSecretRepresentations(sentinel) {
+  return [
+    Buffer.from(sentinel),
+    Buffer.from(sentinel, 'utf16le'),
+    Buffer.from(Buffer.from(sentinel).toString('base64')),
+    Buffer.from(textSecretRepresentations(sentinel)[2]),
+  ];
+}
+
+function redact(value) {
+  let redacted = String(value);
+  for (const sentinel of secretSentinels) {
+    for (const representation of textSecretRepresentations(sentinel)) {
+      redacted = redacted.replaceAll(representation, '[REDACTED]');
+    }
+    redacted = redacted.replace(percentEncodedPattern(sentinel), '[REDACTED]');
+  }
+  return redacted;
+}
+
+function sanitizedError(error, message = undefined) {
+  const detail = error instanceof Error ? error.message : String(error);
+  return new Error(redact(message ? `${message}: ${detail}` : detail));
+}
 
 function check(condition, message) {
   if (!condition) throw new Error(message);
@@ -25,6 +95,214 @@ function check(condition, message) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function pathExists(filePath) {
+  try {
+    await access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForPath(
+  filePath,
+  child,
+  label,
+  timeoutMs = workflowTimeoutMs,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (child.exitCode !== null) {
+      throw new Error(`paqet exited while waiting for ${label}`);
+    }
+    if (await pathExists(filePath)) return;
+    await delay(50);
+  }
+  throw new Error(`Timed out waiting for ${label}`);
+}
+
+async function waitForValue(
+  client,
+  expression,
+  label,
+  timeoutMs = workflowTimeoutMs,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastValue;
+  while (Date.now() < deadline) {
+    lastValue = await client.evaluate(expression, label);
+    if (lastValue) return lastValue;
+    await delay(50);
+  }
+  throw new Error(
+    `Timed out waiting for ${label}; last value ${redact(JSON.stringify(lastValue))}`,
+  );
+}
+
+function domAction(body) {
+  return `(() => {
+    const findButton = (label, root = document) => Array.from(root.querySelectorAll('button')).find((button) => button.textContent.trim() === label);
+    const setInput = (selector, value) => {
+      const input = document.querySelector(selector);
+      if (!(input instanceof HTMLInputElement)) throw new Error('Missing input ' + selector);
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return input;
+    };
+    const setSelect = (selector, value) => {
+      const select = document.querySelector(selector);
+      if (!(select instanceof HTMLSelectElement)) throw new Error('Missing select ' + selector);
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set;
+      setter.call(select, value);
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      return select;
+    };
+    const clickButton = (label, root = document) => {
+      const button = findButton(label, root);
+      if (!(button instanceof HTMLButtonElement)) throw new Error('Missing button ' + label);
+      if (button.disabled) throw new Error('Disabled button ' + label);
+      button.click();
+      return button;
+    };
+    ${body}
+  })()`;
+}
+
+async function createProfile(client, profile) {
+  await client.evaluate(
+    domAction(`clickButton('New');`),
+    'open new profile editor',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('.profile-form button[type="submit"]')?.textContent.trim() === 'Save profile'`,
+    'new profile editor',
+  );
+  await client.evaluate(
+    domAction(`
+      setInput('#profile-name', ${JSON.stringify(profile.name)});
+      setInput('#server-host', ${JSON.stringify(profile.host)});
+      setInput('#server-port', ${JSON.stringify(String(profile.port))});
+      setInput('#encryption-key', ${JSON.stringify(profile.key)});
+      document.querySelector('.profile-form').requestSubmit();
+    `),
+    `create ${profile.name} profile`,
+  );
+  await waitForValue(
+    client,
+    `(() => {
+      const select = document.querySelector('#profile-select');
+      return select instanceof HTMLSelectElement &&
+        Array.from(select.options).some((option) => option.textContent.trim() === ${JSON.stringify(profile.name)}) &&
+        !document.querySelector('.profile-form button[type="submit"]');
+    })()`,
+    `${profile.name} canonical profile`,
+  );
+}
+
+async function selectProfileByName(client, name) {
+  await client.evaluate(
+    domAction(`
+      const select = document.querySelector('#profile-select');
+      const option = Array.from(select.options).find((candidate) => candidate.textContent.trim() === ${JSON.stringify(name)});
+      if (!option) throw new Error('Missing profile option');
+      setSelect('#profile-select', option.value);
+    `),
+    `select ${name} profile`,
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('#profile-name')?.value === ${JSON.stringify(name)}`,
+    `${name} profile selection`,
+  );
+}
+
+async function editSelectedProfile(client, profile) {
+  await client.evaluate(
+    domAction(`clickButton('Edit');`),
+    'open profile editor',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('.profile-form button[type="submit"]')?.textContent.trim() === 'Save changes'`,
+    'profile edit form',
+  );
+  await client.evaluate(
+    domAction(`
+      setInput('#profile-name', ${JSON.stringify(profile.name)});
+      setInput('#server-host', ${JSON.stringify(profile.host)});
+      setInput('#server-port', ${JSON.stringify(String(profile.port))});
+      setInput('#encryption-key', ${JSON.stringify(profile.key)});
+      document.querySelector('.profile-form').requestSubmit();
+    `),
+    'save updated profile',
+  );
+  await waitForValue(
+    client,
+    `(() => {
+      const select = document.querySelector('#profile-select');
+      return document.querySelector('#profile-name')?.value === ${JSON.stringify(profile.name)} &&
+        select?.selectedOptions[0]?.textContent.trim() === ${JSON.stringify(profile.name)} &&
+        !document.querySelector('.profile-form button[type="submit"]');
+    })()`,
+    'updated profile canonical UI',
+  );
+}
+
+async function deleteSelectedProfile(client, name) {
+  await client.evaluate(
+    domAction(`clickButton('Edit');`),
+    'open delete editor',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('.profile-form button[type="submit"]')?.textContent.trim() === 'Save changes'`,
+    'delete profile editor',
+  );
+  await client.evaluate(
+    domAction(`clickButton('Delete profile');`),
+    'request profile deletion',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('#dialog-title')?.textContent.trim() === ${JSON.stringify(`Delete “${name}”?`)}`,
+    'profile deletion confirmation',
+  );
+  await client.evaluate(
+    domAction(
+      `clickButton('Delete profile', document.querySelector('.dialog'));`,
+    ),
+    'confirm profile deletion',
+  );
+  await waitForValue(
+    client,
+    `(() => {
+      const select = document.querySelector('#profile-select');
+      return select instanceof HTMLSelectElement &&
+        !Array.from(select.options).some((option) => option.textContent.trim() === ${JSON.stringify(name)}) &&
+        !document.querySelector('.dialog');
+    })()`,
+    'deleted profile removal',
+  );
+}
+
+function profileViewExpression() {
+  return `(() => {
+    const select = document.querySelector('#profile-select');
+    const key = document.querySelector('#encryption-key');
+    return {
+      names: select instanceof HTMLSelectElement ? Array.from(select.options).map((option) => option.textContent.trim()) : [],
+      selectedName: select?.selectedOptions[0]?.textContent.trim() ?? '',
+      name: document.querySelector('#profile-name')?.value ?? '',
+      host: document.querySelector('#server-host')?.value ?? '',
+      port: document.querySelector('#server-port')?.value ?? '',
+      keyType: key?.type ?? '',
+      keyLength: key?.value?.length ?? 0
+    };
+  })()`;
 }
 
 async function fetchJson(url) {
@@ -186,15 +464,15 @@ class DevToolsClient {
         returnByValue: true,
       });
     } catch (error) {
-      throw new Error(`WebView ${label} failed: ${error.message}`, {
-        cause: error,
-      });
+      throw sanitizedError(error, `WebView ${label} failed`);
     }
     if (result.exceptionDetails) {
       throw new Error(
-        result.exceptionDetails.exception?.description ??
-          result.exceptionDetails.text ??
-          'WebView evaluation failed',
+        redact(
+          result.exceptionDetails.exception?.description ??
+            result.exceptionDetails.text ??
+            'WebView evaluation failed',
+        ),
       );
     }
     return result.result.value;
@@ -353,8 +631,14 @@ if ($mode -eq 'close') {
   exit 0
 }
 [PaqetInput]::ShowWindowAsync($handle, 9) | Out-Null
-if (-not [PaqetInput]::SetForegroundWindow($handle)) { throw 'cannot focus paqet main window' }
-Start-Sleep -Milliseconds 40
+$focused = $false
+for ($attempt = 0; $attempt -lt 10; $attempt++) {
+  [PaqetInput]::ShowWindowAsync($handle, 9) | Out-Null
+  [PaqetInput]::SetForegroundWindow($handle) | Out-Null
+  Start-Sleep -Milliseconds 40
+  if ([PaqetInput]::GetForegroundWindow() -eq $handle) { $focused = $true; break }
+}
+if (-not $focused) { throw 'cannot focus paqet main window' }
 $count = [int]$env:PAQET_TEST_COUNT
 $KEYUP = 2
 try {
@@ -424,7 +708,9 @@ function sendNativeInput(child, mode, count = 1) {
   }
   if (result.status !== 0) {
     throw new Error(
-      `Windows input ${mode} failed: ${(result.stderr || result.stdout).trim()}`,
+      redact(
+        `Windows input ${mode} failed: ${(result.stderr || result.stdout).trim()}`,
+      ),
     );
   }
   return result.stdout.trim();
@@ -615,6 +901,23 @@ function terminateProcessTree(identity) {
   );
 }
 
+function terminateOwnedChild(session) {
+  if (session.hostIdentity) {
+    terminateProcessTree(session.hostIdentity);
+    return;
+  }
+  if (session.child.exitCode !== null) return;
+  const result = spawnSync(
+    'taskkill.exe',
+    ['/PID', String(session.child.pid), '/T', '/F'],
+    { stdio: 'ignore', timeout: commandTimeoutMs },
+  );
+  check(
+    result.status === 0 || session.child.exitCode !== null,
+    'Cannot terminate the unidentified application process tree',
+  );
+}
+
 async function waitForTestProcesses(identities, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -628,13 +931,27 @@ async function waitForTestProcesses(identities, timeoutMs) {
   );
 }
 
-async function main() {
-  check(process.platform === 'win32', 'WebView verification requires Windows');
-  check(process.arch === 'x64', 'WebView verification requires Windows x64');
-  await access(executable);
-  const testRoot = await mkdtemp(path.join(os.tmpdir(), 'paqet-webview-'));
-  const userData = path.join(testRoot, 'webview');
-  const appData = path.join(testRoot, 'app-data');
+function uniqueIdentities(identities) {
+  return [
+    ...new Map(
+      identities
+        .filter(Boolean)
+        .map((identity) => [
+          `${identity.pid}:${identity.name}:${identity.created}`,
+          identity,
+        ]),
+    ).values(),
+  ];
+}
+
+async function launchApplication(
+  testRoot,
+  appData,
+  launchNumber,
+  extraEnv,
+  sessions,
+) {
+  const userData = path.join(testRoot, `webview-launch-${launchNumber}`);
   const child = spawn(executable, [], {
     cwd: root,
     env: {
@@ -643,191 +960,691 @@ async function main() {
       WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:
         '--remote-debugging-address=127.0.0.1 --remote-debugging-port=0',
       WEBVIEW2_USER_DATA_FOLDER: userData,
+      ...extraEnv,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  let hostIdentity;
-  let interrupted;
-  const terminateOnSignal = (signal) => {
-    interrupted ??= signal;
-    try {
-      terminateProcessTree(hostIdentity);
-    } catch {
-      process.exitCode = 1;
-    }
+  const session = {
+    appOutput: '',
+    child,
+    client: undefined,
+    hostIdentity: undefined,
+    identities: [],
+    outputTails: { stderr: '', stdout: '' },
+    streamsClosed: Promise.all([
+      once(child.stdout, 'close'),
+      once(child.stderr, 'close'),
+    ]),
+    userData,
+    version: undefined,
   };
-  process.once('SIGINT', terminateOnSignal);
-  process.once('SIGTERM', terminateOnSignal);
-  process.once('SIGBREAK', terminateOnSignal);
-  let appOutput = '';
-  child.stdout.on('data', (chunk) => {
-    appOutput += chunk.toString();
-  });
-  child.stderr.on('data', (chunk) => {
-    appOutput += chunk.toString();
-  });
-  let client;
-  let testProcessIdentities = [];
-  let failure;
-  let teardownFailure;
+  sessions.add(session);
+  const captureOutput = (stream) => (chunk) => {
+    const text = chunk.toString();
+    const searchable = `${session.outputTails[stream]}${text}`;
+    if (
+      secretSentinels.some((sentinel) => {
+        const [exact, base64, percent] = textSecretRepresentations(sentinel);
+        return (
+          searchable.includes(exact) ||
+          searchable.includes(base64) ||
+          searchable.toLowerCase().includes(percent.toLowerCase())
+        );
+      })
+    ) {
+      session.outputSecretLeak = true;
+    }
+    session.outputTails[stream] = searchable.slice(-512);
+    session.appOutput = `${session.appOutput}${redact(text)}`.slice(
+      -128 * 1024,
+    );
+  };
+  child.stdout.on('data', captureOutput('stdout'));
+  child.stderr.on('data', captureOutput('stderr'));
+
   try {
-    hostIdentity = processIdentity(child.pid);
-    check(hostIdentity, 'Cannot identify the launched paqet process');
-    testProcessIdentities.push(hostIdentity);
+    session.hostIdentity = processIdentity(child.pid);
+    check(session.hostIdentity, 'Cannot identify the launched paqet process');
+    session.identities.push(session.hostIdentity);
     const port = await findDevToolsPort(userData, child);
     const page = await findPage(port, child);
-    client = new DevToolsClient(page.webSocketDebuggerUrl);
-    await waitForApplication(client);
-    const version = await client.send('Browser.getVersion');
-    testProcessIdentities.push(...processTreeIdentities(child.pid));
+    session.client = new DevToolsClient(page.webSocketDebuggerUrl);
+    await waitForApplication(session.client);
+    session.version = await session.client.send('Browser.getVersion');
+    session.identities.push(...processTreeIdentities(child.pid));
+    return session;
+  } catch (error) {
+    const teardownErrors = [];
+    try {
+      terminateOwnedChild(session);
+    } catch (teardownError) {
+      teardownErrors.push(sanitizedError(teardownError));
+    }
+    try {
+      await waitForTestProcesses(uniqueIdentities(session.identities), 5_000);
+    } catch (teardownError) {
+      teardownErrors.push(sanitizedError(teardownError));
+    }
+    try {
+      await Promise.race([
+        session.streamsClosed,
+        delay(2_000).then(() => {
+          throw new Error(
+            'Application output pipes did not close after launch failure',
+          );
+        }),
+      ]);
+    } catch (teardownError) {
+      teardownErrors.push(sanitizedError(teardownError));
+    }
+    if (teardownErrors.length > 0) {
+      throw new AggregateError(
+        [
+          sanitizedError(error, `Launch ${launchNumber} failed`),
+          ...teardownErrors,
+        ],
+        `Launch ${launchNumber} and teardown failed`,
+        { cause: error },
+      );
+    }
+    throw sanitizedError(error, `Launch ${launchNumber} failed`);
+  }
+}
 
-    const baseline = await readMetrics(client);
-    const nativeMetrics = JSON.parse(sendNativeInput(child, 'metrics'));
-    check(
-      baseline.innerWidth === expectedWidth &&
-        baseline.innerHeight === expectedHeight,
-      `Expected ${expectedWidth}x${expectedHeight} logical client area, received ${baseline.innerWidth}x${baseline.innerHeight}`,
+async function closeApplication(session) {
+  const errors = [];
+  session.client?.close();
+  if (session.child.exitCode === null) {
+    try {
+      session.identities.push(...processTreeIdentities(session.child.pid));
+    } catch (error) {
+      errors.push(sanitizedError(error));
+    }
+  }
+  if (session.child.exitCode === null) {
+    try {
+      sendNativeInput(session.child, 'close');
+    } catch (error) {
+      errors.push(sanitizedError(error));
+      try {
+        terminateOwnedChild(session);
+      } catch (killError) {
+        errors.push(sanitizedError(killError));
+      }
+    }
+  }
+  const exitCode = await waitForExit(session.child, 5_000);
+  if (exitCode === undefined && session.child.exitCode === null) {
+    errors.push(new Error('paqet did not exit after graceful window close'));
+    try {
+      terminateOwnedChild(session);
+    } catch (error) {
+      errors.push(sanitizedError(error));
+    }
+    if ((await waitForExit(session.child, 2_000)) === undefined) {
+      errors.push(new Error('paqet did not exit after forced teardown'));
+    }
+  }
+  try {
+    await waitForTestProcesses(uniqueIdentities(session.identities), 5_000);
+  } catch (error) {
+    errors.push(sanitizedError(error));
+  }
+  try {
+    await Promise.race([
+      session.streamsClosed,
+      delay(2_000).then(() => {
+        throw new Error(
+          'Application output pipes did not close during teardown',
+        );
+      }),
+    ]);
+  } catch (error) {
+    errors.push(sanitizedError(error));
+  }
+  if (exitCode !== undefined && exitCode !== 0) {
+    errors.push(
+      new Error(`paqet exited during teardown with code ${exitCode}`),
     );
-    assertNoHorizontalOverflow(baseline, 'Default zoom');
-    check(
-      nativeMetrics.clientWidth ===
-        Math.round(expectedWidth * (nativeMetrics.dpi / 96)) &&
-        nativeMetrics.clientHeight ===
-          Math.round(expectedHeight * (nativeMetrics.dpi / 96)),
-      `Native client geometry does not match ${expectedWidth}x${expectedHeight} logical pixels at ${nativeMetrics.dpi} DPI`,
-    );
-    check(
-      Math.abs(baseline.devicePixelRatio - nativeMetrics.dpi / 96) <= 0.01 &&
-        Math.abs(baseline.viewportScale - 1) <= 0.01,
-      `WebView scaling does not match ${nativeMetrics.dpi} DPI`,
-    );
-    check(
-      baseline.connect?.height >= 48,
-      'Primary connection action is smaller than 48 CSS pixels',
-    );
-    const focused = await verifyKeyboard(client, child);
+  }
+  if (session.outputSecretLeak) {
+    errors.push(new Error('Application output contained a secret sentinel'));
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, 'Application launch teardown failed');
+  }
+}
 
-    await client.evaluate(
-      `(() => {
+async function verifyApp001A(session) {
+  const { child, client } = session;
+  const baseline = await readMetrics(client);
+  const nativeMetrics = JSON.parse(sendNativeInput(child, 'metrics'));
+  check(
+    baseline.innerWidth === expectedWidth &&
+      baseline.innerHeight === expectedHeight,
+    `Expected ${expectedWidth}x${expectedHeight} logical client area, received ${baseline.innerWidth}x${baseline.innerHeight}`,
+  );
+  assertNoHorizontalOverflow(baseline, 'Default zoom');
+  check(
+    nativeMetrics.clientWidth ===
+      Math.round(expectedWidth * (nativeMetrics.dpi / 96)) &&
+      nativeMetrics.clientHeight ===
+        Math.round(expectedHeight * (nativeMetrics.dpi / 96)),
+    `Native client geometry does not match ${expectedWidth}x${expectedHeight} logical pixels at ${nativeMetrics.dpi} DPI`,
+  );
+  check(
+    Math.abs(baseline.devicePixelRatio - nativeMetrics.dpi / 96) <= 0.01 &&
+      Math.abs(baseline.viewportScale - 1) <= 0.01,
+    `WebView scaling does not match ${nativeMetrics.dpi} DPI`,
+  );
+  check(
+    baseline.connect?.height >= 48,
+    'Primary connection action is smaller than 48 CSS pixels',
+  );
+  const focused = await verifyKeyboard(client, child);
+
+  await client.evaluate(
+    `(() => {
       window.__paqetZoomKeys = [];
       addEventListener('keydown', (event) => {
         window.__paqetZoomKeys.push({ key: event.key, code: event.code, ctrlKey: event.ctrlKey });
       });
     })()`,
-      'zoom key observer setup',
+    'zoom key observer setup',
+  );
+  sendNativeInput(child, 'zoom-in', 5);
+  await delay(500);
+  const zoomed = await readMetrics(client);
+  const zoomRatio = zoomed.devicePixelRatio / baseline.devicePixelRatio;
+  const zoomKeys = await client.evaluate(
+    'window.__paqetZoomKeys',
+    'zoom key evidence',
+  );
+  check(
+    Math.abs(zoomRatio - 2) <= 0.05,
+    `Expected 200% browser zoom, received ${Math.round(zoomRatio * 100)}%; keys ${JSON.stringify(zoomKeys)}; viewport ${baseline.innerWidth}x${baseline.innerHeight} -> ${zoomed.innerWidth}x${zoomed.innerHeight}`,
+  );
+  assertNoHorizontalOverflow(zoomed, '200% zoom');
+  await assertReachable(client, '.connect-button', 'Primary connection action');
+  await assertReachable(client, '[aria-label="Log actions"]', 'Log actions');
+  await assertReachable(
+    client,
+    '[aria-label="Connection logs"]',
+    'Log surface',
+  );
+  await verifyClipboardApi(client);
+  await verifyFonts(client);
+  session.identities.push(...processTreeIdentities(child.pid));
+  sendNativeInput(child, 'zoom-reset');
+  await delay(300);
+  const restored = await readMetrics(client);
+  check(
+    Math.abs(restored.devicePixelRatio - baseline.devicePixelRatio) <= 0.01,
+    'Browser zoom did not return to 100%',
+  );
+  return { baseline, focused, nativeMetrics, zoomed, zoomRatio };
+}
+
+async function readInterfaceDetails(client) {
+  return client.evaluate(
+    `(() => ({
+      optionCount: document.querySelector('#interface-select')?.options.length ?? 0,
+      selectedGuid: document.querySelector('#interface-select')?.value ?? '',
+      details: Object.fromEntries(Array.from(document.querySelectorAll('[aria-label="Derived interface details"] > div')).map((row) => [row.querySelector('dt')?.textContent.trim(), row.querySelector('dd')?.textContent.trim()]))
+    }))()`,
+    'interface details',
+  );
+}
+
+function assertInterfaceDetails(actual, expected) {
+  check(actual.optionCount === 2, 'Expected exactly two network interfaces');
+  check(
+    actual.selectedGuid === expected.guid,
+    'Selected interface GUID changed',
+  );
+  check(
+    actual.details['Interface name'] === expected.interfaceName &&
+      actual.details['Npcap device'] === expected.guid &&
+      actual.details['Local address'] === expected.localAddress &&
+      actual.details['Gateway address'] === expected.gatewayAddress &&
+      actual.details['Gateway MAC'] === expected.gatewayMac,
+    'Rendered derived interface details do not match the fixture',
+  );
+}
+
+async function listRegularFiles(directory) {
+  const files = [];
+  const pending = [directory];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const entries = await readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      const entryPath = path.join(current, entry.name);
+      if (entry.isDirectory()) pending.push(entryPath);
+      else if (entry.isFile()) files.push(entryPath);
+      else if (entry.isSymbolicLink()) {
+        throw new Error('Secret audit encountered an unexpected symbolic link');
+      }
+    }
+  }
+  return files;
+}
+
+async function auditSecrets(testRoot) {
+  const foundPaths = new Set();
+  const foundSentinels = new Set();
+  for (const filePath of await listRegularFiles(testRoot)) {
+    const contents = await readFile(filePath);
+    const relativePath = path
+      .relative(testRoot, filePath)
+      .split(path.sep)
+      .join('/');
+    for (const sentinel of secretSentinels) {
+      const representations = fileSecretRepresentations(sentinel);
+      const percent = representations.pop().toString().toLowerCase();
+      if (
+        !representations.some((value) => contents.includes(value)) &&
+        !contents.toString('latin1').toLowerCase().includes(percent)
+      )
+        continue;
+      foundPaths.add(relativePath);
+      foundSentinels.add(sentinel);
+      check(
+        permittedSecretPaths.has(relativePath),
+        `Secret sentinel escaped to ${relativePath}`,
+      );
+    }
+  }
+  check(
+    foundSentinels.size === secretSentinels.length,
+    'Not every secret sentinel was found in an expected disclosed store',
+  );
+  return [...foundPaths].sort();
+}
+
+async function main() {
+  check(process.platform === 'win32', 'WebView verification requires Windows');
+  check(process.arch === 'x64', 'WebView verification requires Windows x64');
+  await access(executable);
+  secretSentinels = Array.from(
+    { length: 3 },
+    () => `paqet-app001b-${randomBytes(32).toString('hex')}`,
+  );
+  const testRoot = await mkdtemp(path.join(os.tmpdir(), 'paqet-webview-'));
+  const appData = path.join(testRoot, 'app-data');
+  const fixturePath = path.join(appData, 'network-interfaces.json');
+  const configPath = path.join(appData, 'local', 'config.yaml');
+  const releaseGate = path.join(appData, 'release-launch-failure');
+  const interfaces = [
+    {
+      friendlyName: 'Fixture Ethernet',
+      interfaceName: 'fixture0',
+      guid: '\\Device\\NPF_{11111111-1111-4111-8111-111111111111}',
+      localAddress: '192.0.2.10',
+      gatewayAddress: '192.0.2.1',
+      gatewayMac: '02:00:00:00:01:01',
+    },
+    {
+      friendlyName: 'Fixture Wi-Fi',
+      interfaceName: 'fixture1',
+      guid: '\\Device\\NPF_{22222222-2222-4222-8222-222222222222}',
+      localAddress: '198.51.100.20',
+      gatewayAddress: '198.51.100.1',
+      gatewayMac: '02:00:00:00:02:01',
+    },
+  ];
+  const refreshedSecondInterface = {
+    ...interfaces[1],
+    localAddress: '203.0.113.21',
+    gatewayAddress: '203.0.113.1',
+    gatewayMac: '02:00:00:00:02:99',
+  };
+  const refreshedInterfaces = [interfaces[0], refreshedSecondInterface];
+  const primary = {
+    name: 'Primary',
+    host: '192.0.2.80',
+    port: 4101,
+    key: secretSentinels[0],
+  };
+  const backup = {
+    name: 'Backup',
+    host: '198.51.100.80',
+    port: 4102,
+    key: secretSentinels[1],
+  };
+  const backupUpdated = {
+    name: 'Backup updated',
+    host: '203.0.113.80',
+    port: 5102,
+    key: secretSentinels[2],
+  };
+  const temporary = {
+    name: 'Temporary',
+    host: '192.0.2.81',
+    port: 4103,
+    key: `${secretSentinels[1]}-temporary`,
+  };
+  const sessions = new Set();
+  let interrupted;
+  const terminateOnSignal = (signal) => {
+    interrupted ??= signal;
+    for (const session of sessions) {
+      try {
+        terminateOwnedChild(session);
+      } catch {
+        process.exitCode = 1;
+      }
+    }
+  };
+  process.once('SIGINT', terminateOnSignal);
+  process.once('SIGTERM', terminateOnSignal);
+  process.once('SIGBREAK', terminateOnSignal);
+  let app001aEvidence;
+  let webViewVersion;
+  let permittedPaths = [];
+  let failure;
+  let teardownFailure;
+  try {
+    await mkdir(appData, { recursive: true });
+    await writeFile(fixturePath, `${JSON.stringify(interfaces, null, 2)}\n`);
+
+    const launch1 = await launchApplication(
+      testRoot,
+      appData,
+      1,
+      {
+        PAQET_GUI_TEST_LAUNCH_MODE: 'delayed-failure',
+        PAQET_GUI_TEST_NETWORK_FIXTURE: '1',
+      },
+      sessions,
     );
-    sendNativeInput(child, 'zoom-in', 5);
-    await delay(500);
-    const zoomed = await readMetrics(client);
-    const zoomRatio = zoomed.devicePixelRatio / baseline.devicePixelRatio;
-    const zoomKeys = await client.evaluate(
-      'window.__paqetZoomKeys',
-      'zoom key evidence',
+    webViewVersion = launch1.version.product;
+    app001aEvidence = await verifyApp001A(launch1);
+
+    const { client: client1 } = launch1;
+    await createProfile(client1, primary);
+    await createProfile(client1, backup);
+    await selectProfileByName(client1, backup.name);
+    await editSelectedProfile(client1, backupUpdated);
+    await createProfile(client1, temporary);
+    await selectProfileByName(client1, temporary.name);
+    await deleteSelectedProfile(client1, temporary.name);
+    const finalLaunch1Profiles = await client1.evaluate(
+      profileViewExpression(),
+      'launch 1 final profiles',
     );
     check(
-      Math.abs(zoomRatio - 2) <= 0.05,
-      `Expected 200% browser zoom, received ${Math.round(zoomRatio * 100)}%; keys ${JSON.stringify(zoomKeys)}; viewport ${baseline.innerWidth}x${baseline.innerHeight} -> ${zoomed.innerWidth}x${zoomed.innerHeight}`,
-    );
-    assertNoHorizontalOverflow(zoomed, '200% zoom');
-    await assertReachable(
-      client,
-      '.connect-button',
-      'Primary connection action',
-    );
-    await assertReachable(client, '[aria-label="Log actions"]', 'Log actions');
-    await assertReachable(
-      client,
-      '[aria-label="Connection logs"]',
-      'Log surface',
+      JSON.stringify(finalLaunch1Profiles.names) ===
+        JSON.stringify([primary.name, backupUpdated.name]) &&
+        finalLaunch1Profiles.selectedName === backupUpdated.name,
+      'Launch 1 did not end with exactly Primary and selected Backup updated',
     );
 
-    await verifyClipboardApi(client);
-    await verifyFonts(client);
-    testProcessIdentities.push(...processTreeIdentities(child.pid));
-    sendNativeInput(child, 'zoom-reset');
-    await delay(300);
-    const restored = await readMetrics(client);
+    await client1.evaluate(
+      domAction(`
+        const disclosure = document.querySelector('.disclosure-button');
+        if (!(disclosure instanceof HTMLButtonElement)) throw new Error('Missing Advanced disclosure');
+        disclosure.click();
+      `),
+      'expand Advanced settings',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('.disclosure-button')?.getAttribute('aria-expanded') === 'true' && document.querySelector('#advanced-content')`,
+      'expanded Advanced settings',
+    );
+    const initialInterface = await readInterfaceDetails(client1);
     check(
-      Math.abs(restored.devicePixelRatio - baseline.devicePixelRatio) <= 0.01,
-      'Browser zoom did not return to 100%',
+      initialInterface.optionCount === 2,
+      'Expected two fixture interfaces',
+    );
+    await client1.evaluate(
+      domAction(
+        `setSelect('#interface-select', ${JSON.stringify(interfaces[1].guid)});`,
+      ),
+      'select second interface',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('#interface-select')?.value === ${JSON.stringify(interfaces[1].guid)} && !document.querySelector('.interface-progress')`,
+      'second interface selection',
+    );
+    assertInterfaceDetails(await readInterfaceDetails(client1), interfaces[1]);
+
+    await writeFile(
+      fixturePath,
+      `${JSON.stringify(refreshedInterfaces, null, 2)}\n`,
+    );
+    await client1.evaluate(
+      domAction(`clickButton('Refresh');`),
+      'refresh interfaces',
+    );
+    await waitForValue(
+      client1,
+      `(() => {
+        const rows = Array.from(document.querySelectorAll('[aria-label="Derived interface details"] > div'));
+        const details = Object.fromEntries(rows.map((row) => [row.querySelector('dt')?.textContent.trim(), row.querySelector('dd')?.textContent.trim()]));
+        return document.querySelector('#interface-select')?.value === ${JSON.stringify(refreshedSecondInterface.guid)} &&
+          details['Local address'] === ${JSON.stringify(refreshedSecondInterface.localAddress)} &&
+          details['Gateway MAC'] === ${JSON.stringify(refreshedSecondInterface.gatewayMac)} &&
+          !Array.from(document.querySelectorAll('button')).some((button) => button.textContent.trim() === 'Refreshing…');
+      })()`,
+      'refreshed canonical interface details',
+    );
+    assertInterfaceDetails(
+      await readInterfaceDetails(client1),
+      refreshedSecondInterface,
     );
 
-    console.log(
-      `Host: ${os.version()} ${os.arch()}, WebView2 ${version.product}`,
+    await client1.evaluate(
+      domAction(`
+        const label = Array.from(document.querySelectorAll('.override-toggle')).find((candidate) => candidate.querySelector('strong')?.textContent.trim() === 'Override connection count');
+        const checkbox = label?.querySelector('input[type="checkbox"]');
+        if (!(checkbox instanceof HTMLInputElement)) throw new Error('Missing connection count override');
+        checkbox.click();
+      `),
+      'enable connection count override',
     );
-    console.log(
-      `Default: client ${baseline.innerWidth}x${baseline.innerHeight} CSS px / ${nativeMetrics.clientWidth}x${nativeMetrics.clientHeight} physical px, window ${nativeMetrics.windowWidth}x${nativeMetrics.windowHeight} physical px at ${nativeMetrics.dpi} DPI, DPR ${baseline.devicePixelRatio}, document ${baseline.scrollWidth}x${baseline.scrollHeight}`,
+    await waitForValue(
+      client1,
+      `(() => {
+        const input = document.querySelector('#connection-count');
+        const label = input?.closest('.override-item')?.querySelector('.override-toggle input');
+        return label?.checked && input instanceof HTMLInputElement && !input.disabled;
+      })()`,
+      'enabled connection count override',
     );
-    console.log(
-      `Zoom: ${Math.round(zoomRatio * 100)}%, viewport ${zoomed.innerWidth}x${zoomed.innerHeight} CSS px, document ${zoomed.scrollWidth}x${zoomed.scrollHeight}, no horizontal overflow`,
+    await client1.evaluate(
+      domAction(`
+        const input = setInput('#connection-count', '3');
+        input.dispatchEvent(new Event('blur'));
+      `),
+      'commit connection count override',
     );
-    console.log(`Keyboard: ${focused.join(' -> ')}`);
-    console.log(
-      'Clipboard: secure WebView2 write API is available (non-mutating)',
+    await waitForValue(
+      client1,
+      `(() => {
+        const input = document.querySelector('#connection-count');
+        return input?.value === '3' && !input.disabled && !document.querySelector('.settings-progress') && !document.querySelector('#connection-count-error');
+      })()`,
+      'canonical connection count',
     );
-    console.log(
-      'Fonts: Space Grotesk interface and JetBrains Mono logs loaded',
+
+    await client1.evaluate(domAction(`clickButton('Connect');`), 'connect');
+    const connecting = await waitForValue(
+      client1,
+      `(() => {
+        const button = document.querySelector('.connect-button');
+        const configuration = document.querySelector('.configuration');
+        const controls = Array.from(configuration?.querySelectorAll('button, select, input, textarea') ?? []);
+        const editableControls = controls.filter((control) =>
+          !control.matches('.disclosure-button, .reveal-button') &&
+          !(control instanceof HTMLInputElement && control.readOnly)
+        );
+        const readonlyInputs = controls.filter((control) => control instanceof HTMLInputElement && control.readOnly);
+        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connecting' &&
+          button?.textContent.trim() === 'Connecting…' && button.disabled &&
+          editableControls.length > 10 && editableControls.every((control) => control.disabled) &&
+          readonlyInputs.length >= 4;
+      })()`,
+      'canonical Connecting lock state',
     );
+    check(connecting === true, 'Configuration controls were not locked');
+
+    await waitForPath(configPath, launch1.child, 'generated config.yaml');
+    const generatedConfig = await readFile(configPath, 'utf8');
+    check(
+      generatedConfig.includes(
+        `addr: ${backupUpdated.host}:${backupUpdated.port}`,
+      ) &&
+        generatedConfig.includes(`key: ${backupUpdated.key}`) &&
+        generatedConfig.includes(
+          `interface: ${refreshedSecondInterface.interfaceName}`,
+        ) &&
+        generatedConfig.includes(`guid: ${refreshedSecondInterface.guid}`) &&
+        generatedConfig.includes(
+          `addr: ${refreshedSecondInterface.localAddress}:0`,
+        ) &&
+        generatedConfig.includes(
+          `router_mac: ${refreshedSecondInterface.gatewayMac}`,
+        ) &&
+        generatedConfig.includes('conn: 3'),
+      'Generated configuration does not contain the selected canonical values',
+    );
+    check(
+      !generatedConfig.includes(primary.key) &&
+        !generatedConfig.includes(backup.key) &&
+        !generatedConfig.includes(temporary.key),
+      'Generated configuration contains an unselected or deleted secret',
+    );
+    await writeFile(releaseGate, 'release\n');
+    await waitForValue(
+      client1,
+      `(() => {
+        const button = document.querySelector('.connect-button');
+        const status = document.querySelector('[aria-label="Connection status"]');
+        const message = Array.from(document.querySelectorAll('.connection .app-message')).find((item) => item.textContent.trim() === 'The paqet client could not be started.');
+        const log = document.querySelector('[aria-label="Connection logs"]');
+        return Boolean(message) && status?.textContent.trim() === 'Disconnected' &&
+          button?.textContent.trim() === 'Connect' && !button.disabled &&
+          !document.querySelector('#profile-select')?.disabled &&
+          !Array.from(document.querySelectorAll('.profile-toolbar button')).find((candidate) => candidate.textContent.trim() === 'Edit')?.disabled &&
+          !document.querySelector('#interface-select')?.disabled &&
+          !document.querySelector('#connection-count')?.disabled &&
+          log?.querySelectorAll('.log-record, .log-gap').length === 0 &&
+          log?.textContent.trim() === 'Connection output will appear here.';
+      })()`,
+      'exact launch failure recovery',
+    );
+
+    await closeApplication(launch1);
+    sessions.delete(launch1);
+
+    const launch2 = await launchApplication(
+      testRoot,
+      appData,
+      2,
+      {
+        PAQET_GUI_TEST_ALLOW_PERSISTED_PROFILES: '1',
+        PAQET_GUI_TEST_NETWORK_FIXTURE: '1',
+      },
+      sessions,
+    );
+    check(
+      launch2.version.product === webViewVersion,
+      'WebView2 version changed between launches',
+    );
+    const { client: client2 } = launch2;
+    const launch2Profiles = await client2.evaluate(
+      profileViewExpression(),
+      'restart persisted profiles',
+    );
+    check(
+      JSON.stringify(launch2Profiles.names) ===
+        JSON.stringify([primary.name, backupUpdated.name]) &&
+        launch2Profiles.selectedName === backupUpdated.name &&
+        launch2Profiles.name === backupUpdated.name &&
+        launch2Profiles.host === backupUpdated.host &&
+        launch2Profiles.port === String(backupUpdated.port) &&
+        launch2Profiles.keyType === 'password' &&
+        launch2Profiles.keyLength === backupUpdated.key.length,
+      'Restart did not restore the selected updated profile in masked form',
+    );
+    const restartKeyMatches = await client2.evaluate(
+      `document.querySelector('#encryption-key')?.value === ${JSON.stringify(backupUpdated.key)}`,
+      'restart encryption key verification',
+    );
+    check(
+      restartKeyMatches,
+      'Restart did not restore the updated encryption key',
+    );
+
+    await client2.evaluate(
+      domAction(`
+        const disclosure = document.querySelector('.disclosure-button');
+        if (!(disclosure instanceof HTMLButtonElement)) throw new Error('Missing Advanced disclosure');
+        disclosure.click();
+      `),
+      'expand Advanced settings after restart',
+    );
+    await waitForValue(
+      client2,
+      `document.querySelector('#advanced-content')`,
+      'restart Advanced settings',
+    );
+    const restartInterface = await readInterfaceDetails(client2);
+    assertInterfaceDetails(restartInterface, refreshedInterfaces[0]);
+    const restartState = await client2.evaluate(
+      `(() => {
+        const countInput = document.querySelector('#connection-count');
+        const countToggle = countInput?.closest('.override-item')?.querySelector('.override-toggle input');
+        const log = document.querySelector('[aria-label="Connection logs"]');
+        return {
+          status: document.querySelector('[aria-label="Connection status"]')?.textContent.trim(),
+          connect: document.querySelector('.connect-button')?.textContent.trim(),
+          countChecked: countToggle?.checked,
+          countDisabled: countInput?.disabled,
+          countValue: countInput?.value,
+          logRecords: log?.querySelectorAll('.log-record, .log-gap').length,
+          logText: log?.textContent.trim()
+        };
+      })()`,
+      'restart session-only state',
+    );
+    check(
+      restartState.status === 'Disconnected' &&
+        restartState.connect === 'Connect' &&
+        restartState.countChecked === false &&
+        restartState.countDisabled === true &&
+        restartState.countValue === '1' &&
+        restartState.logRecords === 0 &&
+        restartState.logText === 'Connection output will appear here.',
+      'Restart did not reset interface-independent session state',
+    );
+
+    await closeApplication(launch2);
+    sessions.delete(launch2);
+    permittedPaths = await auditSecrets(testRoot);
   } catch (error) {
-    if (appOutput.trim()) {
+    const appOutput = [...sessions]
+      .map((session) => session.appOutput.trim())
+      .filter(Boolean)
+      .join('\n');
+    if (appOutput) {
       failure = new Error(
-        `${error.message}\nApplication output:\n${appOutput.trim()}`,
-        {
-          cause: error,
-        },
+        redact(`${error.message}\nApplication output:\n${appOutput}`),
       );
     } else {
-      failure = error;
+      failure = sanitizedError(error);
     }
   } finally {
     const teardownErrors = [];
-    client?.close();
-    if (child.exitCode === null) {
+    for (const session of sessions) {
       try {
-        testProcessIdentities.push(...processTreeIdentities(child.pid));
+        await closeApplication(session);
       } catch (error) {
-        teardownErrors.push(error);
+        teardownErrors.push(sanitizedError(error));
       }
-    }
-    if (child.exitCode === null) {
-      try {
-        sendNativeInput(child, 'close');
-      } catch (error) {
-        teardownErrors.push(error);
-        try {
-          terminateProcessTree(hostIdentity);
-        } catch (killError) {
-          teardownErrors.push(killError);
-        }
-      }
-    }
-    const exitCode = await waitForExit(child, 5_000);
-    if (exitCode === undefined && child.exitCode === null) {
-      try {
-        terminateProcessTree(hostIdentity);
-      } catch (error) {
-        teardownErrors.push(error);
-      }
-      if ((await waitForExit(child, 2_000)) === undefined) {
-        teardownErrors.push(
-          new Error('paqet did not exit after forced teardown'),
-        );
-      }
-    }
-    try {
-      const identities = [
-        ...new Map(
-          testProcessIdentities
-            .filter(Boolean)
-            .map((identity) => [
-              `${identity.pid}:${identity.name}:${identity.created}`,
-              identity,
-            ]),
-        ).values(),
-      ];
-      await waitForTestProcesses(identities, 5_000);
-    } catch (error) {
-      teardownErrors.push(error);
     }
     try {
       await rm(testRoot, {
@@ -837,7 +1654,7 @@ async function main() {
         retryDelay: 200,
       });
     } catch (error) {
-      teardownErrors.push(error);
+      teardownErrors.push(sanitizedError(error));
     }
     process.off('SIGINT', terminateOnSignal);
     process.off('SIGTERM', terminateOnSignal);
@@ -859,6 +1676,32 @@ async function main() {
   if (teardownFailure) throw teardownFailure;
   if (interrupted)
     throw new Error(`WebView verification interrupted by ${interrupted}`);
+
+  const { baseline, focused, nativeMetrics, zoomed, zoomRatio } =
+    app001aEvidence;
+  console.log(`Host: ${os.version()} ${os.arch()}, WebView2 ${webViewVersion}`);
+  console.log(
+    `APP-001A default: client ${baseline.innerWidth}x${baseline.innerHeight} CSS px / ${nativeMetrics.clientWidth}x${nativeMetrics.clientHeight} physical px, window ${nativeMetrics.windowWidth}x${nativeMetrics.windowHeight} physical px at ${nativeMetrics.dpi} DPI, DPR ${baseline.devicePixelRatio}, document ${baseline.scrollWidth}x${baseline.scrollHeight}`,
+  );
+  console.log(
+    `APP-001A zoom: ${Math.round(zoomRatio * 100)}%, viewport ${zoomed.innerWidth}x${zoomed.innerHeight} CSS px, document ${zoomed.scrollWidth}x${zoomed.scrollHeight}, no horizontal overflow; primary and log surfaces reachable`,
+  );
+  console.log(`APP-001A keyboard: ${focused.join(' -> ')}`);
+  console.log(
+    'APP-001A clipboard/fonts: secure write API available (non-mutating); Space Grotesk interface and JetBrains Mono logs loaded',
+  );
+  console.log(
+    'APP-001B launch 1: real profile create/select/edit/delete, two-interface refresh with GUID preservation, connection-count override, Connecting locks, generated YAML, exact launch failure, editable recovery, and empty logs verified',
+  );
+  console.log(
+    'APP-001B launch 2: persisted selected profiles and masked updated key restored; interface selection, Advanced override, lifecycle, and logs reset verified',
+  );
+  console.log(
+    `Secret audit: exact sentinels restricted to ${permittedPaths.join(', ')}`,
+  );
+  console.log(
+    'Teardown: both identity-recorded process trees exited with zero orphans; temporary root deleted',
+  );
 }
 
 await main();

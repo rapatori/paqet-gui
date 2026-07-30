@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    fmt,
+    fmt, io,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -291,6 +291,7 @@ impl RuntimeProcess for SupervisedPaqet {
 
 type RuntimeLauncher =
     Arc<dyn Fn(&Path) -> Result<Box<dyn RuntimeProcess>, ProcessError> + Send + Sync>;
+type InterfaceProvider = Arc<dyn Fn() -> Result<Vec<NetworkInterface>, NetworkError> + Send + Sync>;
 
 enum RuntimeControl {
     Disconnect {
@@ -432,6 +433,7 @@ impl StateData {
 pub struct AppState {
     inner: Arc<Mutex<StateData>>,
     config_store: RuntimeConfigStore,
+    interface_provider: InterfaceProvider,
     launcher: RuntimeLauncher,
 }
 
@@ -440,6 +442,7 @@ impl Clone for AppState {
         Self {
             inner: Arc::clone(&self.inner),
             config_store: self.config_store.clone(),
+            interface_provider: Arc::clone(&self.interface_provider),
             launcher: Arc::clone(&self.launcher),
         }
     }
@@ -465,23 +468,51 @@ impl AppState {
             ProfileStore::from_app_handle(app)?
         };
         let profiles = profile_store.load()?;
-        reject_persisted_test_profiles(test_data_directory.as_deref(), &profiles)?;
-        let interfaces = discover_interfaces()?;
+        let allow_persisted_profiles = test_harness_mode(
+            test_data_directory.as_deref(),
+            std::env::var_os("PAQET_GUI_TEST_ALLOW_PERSISTED_PROFILES"),
+            "1",
+        );
+        reject_persisted_test_profiles(
+            test_data_directory.as_deref(),
+            allow_persisted_profiles,
+            &profiles,
+        )?;
+        let interface_provider = test_interface_provider(
+            test_data_directory.as_deref(),
+            std::env::var_os("PAQET_GUI_TEST_NETWORK_FIXTURE"),
+        );
+        let interfaces = interface_provider()?;
         let config_store = if let Some((_, config_path)) = test_storage_paths {
             RuntimeConfigStore::new(config_path)
         } else {
             RuntimeConfigStore::from_app_handle(app)?
         };
-        let executable = resolve_paqet_executable(app.path())?;
-        let launcher = Arc::new(move |config_path: &Path| {
-            SupervisedPaqet::launch_pinned_executable(&executable, config_path)
-                .map(|process| Box::new(process) as Box<dyn RuntimeProcess>)
-        });
+        let launcher = if test_harness_mode(
+            test_data_directory.as_deref(),
+            std::env::var_os("PAQET_GUI_TEST_LAUNCH_MODE"),
+            "delayed-failure",
+        ) {
+            delayed_failure_launcher(
+                test_data_directory
+                    .as_deref()
+                    .expect("test harness mode requires an isolated data directory")
+                    .join("release-launch-failure"),
+                Duration::from_secs(10),
+            )
+        } else {
+            let executable = resolve_paqet_executable(app.path())?;
+            Arc::new(move |config_path: &Path| {
+                SupervisedPaqet::launch_pinned_executable(&executable, config_path)
+                    .map(|process| Box::new(process) as Box<dyn RuntimeProcess>)
+            })
+        };
         Ok(Self::from_parts(
             profile_store,
             profiles,
             interfaces,
             config_store,
+            interface_provider,
             launcher,
         ))
     }
@@ -507,8 +538,9 @@ impl AppState {
         Ok(Self::from_parts(
             profile_store,
             profiles,
-            interfaces,
+            interfaces.clone(),
             config_store,
+            fixed_interface_provider(interfaces),
             launcher,
         ))
     }
@@ -518,6 +550,7 @@ impl AppState {
         profiles: ProfileCollection,
         interfaces: Vec<NetworkInterface>,
         config_store: RuntimeConfigStore,
+        interface_provider: InterfaceProvider,
         launcher: RuntimeLauncher,
     ) -> Self {
         let selected_interface_guid = interfaces.first().map(|interface| interface.guid.clone());
@@ -543,6 +576,7 @@ impl AppState {
                 shutdown_requested: false,
             })),
             config_store,
+            interface_provider,
             launcher,
         }
     }
@@ -576,7 +610,7 @@ impl AppState {
 
     pub fn refresh_interfaces(&self) -> Result<AppSnapshot, StateError> {
         self.lock()?.ensure_editable()?;
-        let interfaces = discover_interfaces()?;
+        let interfaces = (self.interface_provider)()?;
         self.lock()?.replace_interfaces(interfaces)
     }
 
@@ -949,12 +983,102 @@ fn select_test_data_directory(_value: Option<std::ffi::OsString>) -> Option<Path
 
 fn reject_persisted_test_profiles(
     test_directory: Option<&Path>,
+    allow_persisted_profiles: bool,
     profiles: &ProfileCollection,
 ) -> Result<(), StateError> {
-    if test_directory.is_some() && !profiles.profiles().is_empty() {
+    if test_directory.is_some() && !allow_persisted_profiles && !profiles.profiles().is_empty() {
         Err(StateError::Unavailable)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(debug_assertions)]
+fn test_harness_mode(
+    test_directory: Option<&Path>,
+    value: Option<std::ffi::OsString>,
+    expected: &str,
+) -> bool {
+    test_directory.is_some() && value.is_some_and(|value| value == expected)
+}
+
+#[cfg(not(debug_assertions))]
+fn test_harness_mode(
+    _test_directory: Option<&Path>,
+    _value: Option<std::ffi::OsString>,
+    _expected: &str,
+) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn fixed_interface_provider(interfaces: Vec<NetworkInterface>) -> InterfaceProvider {
+    Arc::new(move || Ok(interfaces.clone()))
+}
+
+#[cfg(debug_assertions)]
+fn test_interface_provider(
+    test_directory: Option<&Path>,
+    value: Option<std::ffi::OsString>,
+) -> InterfaceProvider {
+    if test_harness_mode(test_directory, value, "1") {
+        let path = test_directory
+            .expect("test interface mode requires an isolated data directory")
+            .join("network-interfaces.json");
+        Arc::new(move || read_test_interfaces(&path))
+    } else {
+        Arc::new(discover_interfaces)
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn test_interface_provider(
+    _test_directory: Option<&Path>,
+    _value: Option<std::ffi::OsString>,
+) -> InterfaceProvider {
+    Arc::new(discover_interfaces)
+}
+
+#[cfg(debug_assertions)]
+fn read_test_interfaces(path: &Path) -> Result<Vec<NetworkInterface>, NetworkError> {
+    let bytes = std::fs::read(path)
+        .map_err(|_| NetworkError::InvalidWindowsData("isolated interface fixture"))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| NetworkError::InvalidWindowsData("isolated interface fixture"))
+}
+
+fn delayed_failure_launcher(gate: PathBuf, timeout: Duration) -> RuntimeLauncher {
+    Arc::new(move |_: &Path| {
+        wait_for_test_launch_gate(&gate, timeout)?;
+        Err(ProcessError::Platform {
+            operation: "launch the isolated test process",
+            source: io::Error::other("isolated launch failure"),
+        })
+    })
+}
+
+fn wait_for_test_launch_gate(gate: &Path, timeout: Duration) -> Result<(), ProcessError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match gate.try_exists() {
+            Ok(true) => return Ok(()),
+            Ok(false) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(false) => {
+                return Err(ProcessError::Platform {
+                    operation: "wait for the isolated launch gate",
+                    source: io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "isolated launch gate timed out",
+                    ),
+                });
+            }
+            Err(source) => {
+                return Err(ProcessError::Platform {
+                    operation: "inspect the isolated launch gate",
+                    source,
+                });
+            }
+        }
     }
 }
 
@@ -1142,10 +1266,34 @@ mod tests {
         profiles.create(draft("Unexpected", "secret")).unwrap();
 
         assert!(matches!(
-            reject_persisted_test_profiles(Some(Path::new("isolated")), &profiles),
+            reject_persisted_test_profiles(Some(Path::new("isolated")), false, &profiles),
             Err(StateError::Unavailable)
         ));
-        assert!(reject_persisted_test_profiles(None, &profiles).is_ok());
+        assert!(
+            reject_persisted_test_profiles(Some(Path::new("isolated")), true, &profiles).is_ok()
+        );
+        assert!(reject_persisted_test_profiles(None, false, &profiles).is_ok());
+    }
+
+    #[test]
+    fn isolated_harness_modes_are_debug_only_and_require_the_data_boundary() {
+        let value = Some(std::ffi::OsString::from("1"));
+        #[cfg(debug_assertions)]
+        {
+            assert!(test_harness_mode(
+                Some(Path::new("isolated")),
+                value.clone(),
+                "1"
+            ));
+            assert!(!test_harness_mode(None, value.clone(), "1"));
+            assert!(!test_harness_mode(
+                Some(Path::new("isolated")),
+                value,
+                "different"
+            ));
+        }
+        #[cfg(not(debug_assertions))]
+        assert!(!test_harness_mode(Some(Path::new("isolated")), value, "1"));
     }
 
     #[test]
@@ -1157,6 +1305,72 @@ mod tests {
                 PathBuf::from("isolated/local/config.yaml")
             )
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn isolated_interface_provider_rereads_the_fixed_fixture() {
+        let directory = TestDirectory::new();
+        let path = directory.path().join("network-interfaces.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&vec![interface("Ethernet", "guid-a")]).unwrap(),
+        )
+        .unwrap();
+        let provider =
+            test_interface_provider(Some(directory.path()), Some(std::ffi::OsString::from("1")));
+        assert_eq!(provider().unwrap()[0].friendly_name, "Ethernet");
+
+        fs::write(
+            &path,
+            serde_json::to_vec(&vec![interface("Wi-Fi", "guid-b")]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(provider().unwrap()[0].friendly_name, "Wi-Fi");
+
+        fs::write(&path, b"not-json").unwrap();
+        assert!(matches!(
+            provider(),
+            Err(NetworkError::InvalidWindowsData(
+                "isolated interface fixture"
+            ))
+        ));
+    }
+
+    #[test]
+    fn isolated_launch_failure_waits_for_the_fixed_gate() {
+        let directory = TestDirectory::new();
+        let gate = directory.path().join("gate");
+        let launcher = delayed_failure_launcher(gate.clone(), Duration::from_secs(1));
+        let worker = thread::spawn(move || launcher(Path::new("config.yaml")));
+        thread::sleep(Duration::from_millis(30));
+        assert!(!worker.is_finished());
+        fs::write(gate, b"").unwrap();
+
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(ProcessError::Platform {
+                operation: "launch the isolated test process",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn isolated_launch_failure_has_a_bounded_wait() {
+        let directory = TestDirectory::new();
+        let launcher = delayed_failure_launcher(
+            directory.path().join("missing-gate"),
+            Duration::from_millis(20),
+        );
+
+        assert!(matches!(
+            launcher(Path::new("config.yaml")),
+            Err(ProcessError::Platform {
+                operation: "wait for the isolated launch gate",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1227,6 +1441,7 @@ mod tests {
             ProfileCollection::default(),
             Vec::new(),
             RuntimeConfigStore::new(directory.path().join("config.yaml")),
+            fixed_interface_provider(Vec::new()),
             unavailable_launcher(),
         );
         let before = state.snapshot().unwrap();
@@ -1837,8 +2052,9 @@ mod tests {
         AppState::from_parts(
             profile_store,
             profiles,
-            interfaces,
+            interfaces.clone(),
             RuntimeConfigStore::new(directory.path().join("config.yaml")),
+            fixed_interface_provider(interfaces),
             factory.launcher(),
         )
     }
