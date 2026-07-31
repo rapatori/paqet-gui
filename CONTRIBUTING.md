@@ -14,7 +14,7 @@ The supported upstream behavior is version-specific. Changes involving paqet con
 
 ## Development Setup
 
-Development is supported on Windows 10 or Windows 11 x64. Install:
+Development is supported on Windows 11 x64. Install:
 
 - Node.js `24.16.x` and npm `12.0.1`.
 - [rustup](https://rustup.rs/). The repository pins Rust `1.97.0`, the MSVC target, `rustfmt`, and Clippy in `rust-toolchain.toml`.
@@ -33,7 +33,7 @@ Run the desktop development shell with:
 npm.cmd run tauri -- dev
 ```
 
-The visible shell is a development scaffold and is not yet a working paqet client. The native Windows process supervisor is tested with a local helper executable; Npcap and the upstream paqet binary are not required for the deterministic development test suite.
+The development application is a functional paqet client. Its deterministic test suite uses local fixtures and helper executables, so Npcap, server credentials, and the upstream paqet binary are not required for routine validation.
 
 Release-sidecar builds use `npm.cmd run tauri:sidecar`. That command requires the exact pinned executable at `src-tauri/binaries/paqet_windows_amd64-x86_64-pc-windows-msvc.exe`, verifies its byte length and SHA-256, and then applies `src-tauri/tauri.sidecar.conf.json`. The upstream binary remains untracked and must not be included in contributions.
 
@@ -58,6 +58,7 @@ npm.cmd run lint
 npm.cmd run check
 npm.cmd run test:run
 npm.cmd run test:sidecar
+node --test scripts/verify-release.test.mjs
 npm.cmd run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo test --manifest-path src-tauri/Cargo.toml --locked
@@ -66,6 +67,8 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --release --features pr
 cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --features process-test-support -- -D warnings
 npm.cmd run tauri -- build --debug --no-bundle
 ```
+
+Release packaging additionally requires the checksum-pinned paqet sidecar and `cargo-about 0.8.4`. Use the documented commands in [README.md](README.md); do not publish an installer until its separate install, launch, and uninstall qualification is complete.
 
 Pull requests should explain the user-visible or technical problem, the chosen solution, relevant security or compatibility implications, and the exact validation performed. CI must pass before merge.
 

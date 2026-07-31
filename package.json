@@ -23,6 +23,10 @@
     "test:webview:accessibility": "npm run tauri -- build --debug --no-bundle && node scripts/verify-windows-webview.mjs --accessibility",
     "test:webview:clipboard:destructive": "npm run tauri -- build --debug --no-bundle && node scripts/verify-windows-webview.mjs --accessibility --destructive-clipboard",
     "test:webview:sidecar": "npm run tauri:sidecar -- --debug --no-bundle && node scripts/verify-windows-webview.mjs --sidecar",
+    "licenses:paqet": "node scripts/generate-release-notices.mjs",
+    "licenses:rust": "cargo about generate --locked --offline --fail --manifest-path src-tauri/Cargo.toml --config src-tauri/about.toml --output-file licenses/RUST_THIRD_PARTY_LICENSES.txt src-tauri/about.hbs",
+    "package": "node scripts/build-release.mjs",
+    "package:verify": "node scripts/verify-release.mjs",
     "tauri": "tauri",
     "tauri:sidecar": "node scripts/build-sidecar.mjs"
   },
@@ -34,6 +38,7 @@
     "@testing-library/svelte": "5.4.2",
     "@testing-library/user-event": "14.6.1",
     "@types/node": "26.1.1",
+    "7zip-bin-full": "26.2.1",
     "eslint": "10.7.0",
     "eslint-plugin-svelte": "3.22.0",
     "globals": "17.7.0",

@@ -5,6 +5,7 @@ description = "A lightweight Windows desktop client for paqet"
 authors = ["paqet-gui contributors"]
 edition = "2024"
 license = "MIT"
+publish = false
 rust-version = "1.97.0"
 
 [lib]

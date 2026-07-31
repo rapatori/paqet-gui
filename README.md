@@ -8,13 +8,13 @@ This project is not affiliated with or endorsed by the upstream paqet project.
 
 ## Project Status
 
-`paqet-gui` is in early development. The repository currently contains the validated Tauri/Svelte application scaffold, the pinned paqet compatibility contract, native profile validation and persistence, typed Windows network-interface discovery, deterministic paqet configuration generation with atomic runtime storage, lifecycle/log classification, and Windows process-tree supervision. Profile UI and IPC integration, the production interface, and release packaging are not implemented yet.
+`paqet-gui` is in pre-release validation. The repository contains the functional Tauri/Svelte client: native profile persistence, Windows network discovery, deterministic paqet configuration, supervised process lifecycle and logs, typed IPC, and the accessible one-page interface are implemented and covered by automated actual-WebView workflows.
 
-There are no supported binaries or installers. Do not treat the current application shell as a functional paqet client.
+The release packaging configuration produces an unsigned Windows 11 x64 NSIS installer for verification. There are no published or supported binaries yet; install, launch, and uninstall qualification must complete before the first supported release.
 
 ## Planned V1 Scope
 
-- Windows 10 and Windows 11 on x64.
+- Windows 11 on x64.
 - One fixed-size desktop window for local paqet client operation.
 - Locally persisted server profiles containing a server address, port, and encryption key.
 - Windows interface discovery and derivation of the interface, Npcap GUID, local address, and gateway MAC required by paqet.
@@ -33,9 +33,9 @@ The detailed source commit, artifact hashes, supported configuration fields, pro
 
 Running the completed V1 application will require:
 
-- Windows 10 or Windows 11 x64.
+- Windows 11 x64.
 - [Npcap](https://npcap.com/) installed separately.
-- Microsoft Edge WebView2 Runtime. The planned offline-capable installer will install the Evergreen runtime when it is absent.
+- Microsoft Edge WebView2 Runtime. The offline-capable installer embeds Microsoft's Evergreen standalone installer and runs it when the runtime is absent.
 - Connection details for a compatible remote paqet server.
 
 `paqet-gui` does not install, detect, configure, or troubleshoot Npcap in V1.
@@ -48,7 +48,7 @@ For users who need to set up their own Linux VPS, we recommend the community-mai
 
 ## Data And Security
 
-The planned application stores profiles, including paqet encryption keys, as versioned plaintext JSON in the current user's application configuration directory. Generated `config.yaml` is also plaintext and is stored separately in the current user's local application data because paqet requires it. These files rely on the Windows user profile's access controls and are not encrypted by the application.
+The application stores profiles, including paqet encryption keys, as versioned plaintext JSON in the current user's application configuration directory. Generated `config.yaml` is also plaintext and is stored separately in the current user's local application data because paqet requires it. These files rely on the Windows user profile's access controls and are not encrypted by the application.
 
 Keys must not be included in logs, diagnostics, issues, or vulnerability reports. See [SECURITY.md](SECURITY.md) for the vulnerability reporting policy.
 
@@ -67,15 +67,22 @@ Install the locked frontend dependencies:
 npm.cmd ci
 ```
 
-Start the current development shell:
+Start the development application:
 
 ```powershell
 npm.cmd run tauri -- dev
 ```
 
-The visible shell is a development placeholder and is not yet wired through IPC to the native paqet supervisor.
+Release maintainers stage the checksum-pinned upstream executable separately. Routine development and CI do not download or commit it. To regenerate audited license resources and build the unsigned x64 NSIS installer, install the pinned license generator and run:
 
-Release maintainers stage the checksum-pinned upstream executable separately and run `npm.cmd run tauri:sidecar`. Routine development and CI remain networkless and do not download or commit the upstream artifact.
+```powershell
+cargo install cargo-about --version 0.8.4 --locked
+npm.cmd run licenses:paqet
+npm.cmd run licenses:rust
+npm.cmd run package
+```
+
+`npm.cmd run package` verifies the staged sidecar before and after the Tauri build, extracts the resulting setup payload, checks release configuration and required notices, confirms the installer is unsigned, and prints its size and SHA-256. It does not install or run the package.
 
 ## Validation
 
@@ -88,6 +95,7 @@ npm.cmd run lint
 npm.cmd run check
 npm.cmd run test:run
 npm.cmd run test:sidecar
+node --test scripts/verify-release.test.mjs
 npm.cmd run build
 cargo fmt --manifest-path src-tauri/Cargo.toml --check
 cargo test --manifest-path src-tauri/Cargo.toml --locked
@@ -103,4 +111,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations and pull re
 
 `paqet-gui` is available under the [MIT License](LICENSE).
 
-paqet and other third-party components remain governed by their own licenses. The pinned paqet attribution and license text are preserved in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). A complete dependency-license inventory for the bundled upstream executable is still required before any distribution.
+paqet and other third-party components remain governed by their own licenses. Attribution and the installed release-notice layout are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Complete license inventories for the pinned paqet executable, Windows Rust production graph, frontend runtime, and bundled fonts are included with the installer.

@@ -10,3 +10,4 @@ package-lock.json
 AGENTS.md
 README.md
 src/assets/fonts/*_OFL.txt
+licenses/*.txt

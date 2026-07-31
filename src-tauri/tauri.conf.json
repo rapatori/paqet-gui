@@ -36,16 +36,32 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "paqet-gui contributors",
+    "homepage": "https://github.com/rapatori/paqet-gui",
+    "copyright": "Copyright (c) 2026 paqet-gui contributors",
+    "licenseFile": "../LICENSE",
+    "shortDescription": "A lightweight Windows desktop client for paqet",
     "icon": ["icons/icon.ico"],
     "resources": {
+      "../LICENSE": "licenses/PAQET_GUI_LICENSE.txt",
       "../THIRD_PARTY_NOTICES.md": "licenses/THIRD_PARTY_NOTICES.md",
+      "../licenses/FRONTEND_THIRD_PARTY_LICENSES.txt": "licenses/FRONTEND_THIRD_PARTY_LICENSES.txt",
+      "../licenses/PAQET_THIRD_PARTY_LICENSES.txt": "licenses/PAQET_THIRD_PARTY_LICENSES.txt",
+      "../licenses/RUST_THIRD_PARTY_LICENSES.txt": "licenses/RUST_THIRD_PARTY_LICENSES.txt",
       "../src/assets/fonts/SPACE_GROTESK_OFL.txt": "licenses/fonts/SPACE_GROTESK_OFL.txt",
       "../src/assets/fonts/JETBRAINS_MONO_OFL.txt": "licenses/fonts/JETBRAINS_MONO_OFL.txt"
     },
-    "targets": "all",
+    "targets": ["nsis"],
     "windows": {
+      "allowDowngrades": false,
       "webviewInstallMode": {
         "type": "offlineInstaller"
+      },
+      "nsis": {
+        "compression": "lzma",
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "languages": ["English"]
       }
     }
   }

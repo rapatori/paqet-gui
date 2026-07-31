@@ -1,0 +1,17 @@
+Third-Party Rust Licenses ========================= This inventory is generated
+from `src-tauri/Cargo.lock` for the `x86_64-pc-windows-msvc` production
+dependency graph. Build-only and test-only dependencies are excluded.
+
+{{#each licenses}}
+  -------------------------------------------------------------------------------
+  {{{name}}}
+  ({{id}}) Used by:
+  {{#each used_by}}
+    -
+    {{crate.name}}
+    {{crate.version}}{{#if crate.repository}} ({{crate.repository}}){{/if}}
+  {{/each}}
+
+  {{{text}}}
+
+{{/each}}

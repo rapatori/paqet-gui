@@ -36,7 +36,16 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-The pinned upstream release archive does not include its `LICENSE` file, so this notice preserves the license text from the pinned source commit. A dependency-license inventory for the bundled executable must be completed before distribution because upstream does not publish an SBOM or dependency notice bundle.
+The pinned upstream release archive does not include its `LICENSE` file, so this notice preserves the license text from the pinned source commit. Upstream does not publish an SBOM or dependency notice bundle. `licenses/PAQET_THIRD_PARTY_LICENSES.txt` records the complete module inventory embedded in the pinned executable, the exact reviewed module versions and license texts, and the Go standard-library license.
+
+## Application Runtime Dependencies
+
+The Windows application and local frontend assets include open-source runtime dependencies in addition to paqet and the fonts below:
+
+- `licenses/RUST_THIRD_PARTY_LICENSES.txt` is generated from the locked `x86_64-pc-windows-msvc` production dependency graph. Build-only and test-only crates are excluded.
+- `licenses/FRONTEND_THIRD_PARTY_LICENSES.txt` covers the Svelte and Tauri API code included in the production frontend bundle. Build, lint, and test-only npm packages are excluded.
+
+The installer embeds the Microsoft Edge WebView2 Evergreen standalone installer so installation can complete offline when WebView2 is absent. WebView2 remains Microsoft software governed by the terms presented or incorporated by its installer; it is not relicensed by `paqet-gui`.
 
 ## Bundled Fonts
 
@@ -45,4 +54,6 @@ The interface bundles Latin variable-font subsets retrieved from the official Go
 - Space Grotesk, copyright 2020 The Space Grotesk Project Authors, licensed under the SIL Open Font License 1.1. Project source: <https://github.com/google/fonts/tree/main/ofl/spacegrotesk>. Exact Google Fonts artifact: <https://fonts.gstatic.com/s/spacegrotesk/v22/V8mDoQDjQSkFtoMM3T6r8E7mPbF4Cw.woff2>. Bundled artifact SHA-256: `0640890476fc1198ab4de571fb658de443c4d85b66466ec09534a8737ab1ce9d`.
 - JetBrains Mono, copyright 2020 The JetBrains Mono Project Authors, licensed under the SIL Open Font License 1.1. Project source: <https://github.com/google/fonts/tree/main/ofl/jetbrainsmono>. Exact Google Fonts artifact: <https://fonts.gstatic.com/s/jetbrainsmono/v24/tDbv2o-flEEny0FZhsfKu5WU4zr3E_BX0PnT8RD8yKwBNntkaToggR7BYRbKPxDcwg.woff2>. Bundled artifact SHA-256: `83c005d49d8a6a50474c73a5a36ac0468076e9c4a29da7bdb14995d80560a5be`.
 
-The complete licenses are stored in source as `src/assets/fonts/SPACE_GROTESK_OFL.txt` and `src/assets/fonts/JETBRAINS_MONO_OFL.txt`. Application bundles include this notice as `licenses/THIRD_PARTY_NOTICES.md` and both font licenses under `licenses/fonts/`.
+The complete licenses are stored in source as `src/assets/fonts/SPACE_GROTESK_OFL.txt` and `src/assets/fonts/JETBRAINS_MONO_OFL.txt`.
+
+Application bundles install this notice, the `paqet-gui` MIT license, the paqet/frontend/Rust inventories above, and both font licenses under `licenses/`.

@@ -2335,7 +2335,14 @@ describe('fixed-window responsive and preference contracts', () => {
       expect(license).toContain('DISCLAIMER');
     }
     expect(tauriConfig.bundle.resources).toEqual({
+      '../LICENSE': 'licenses/PAQET_GUI_LICENSE.txt',
       '../THIRD_PARTY_NOTICES.md': 'licenses/THIRD_PARTY_NOTICES.md',
+      '../licenses/FRONTEND_THIRD_PARTY_LICENSES.txt':
+        'licenses/FRONTEND_THIRD_PARTY_LICENSES.txt',
+      '../licenses/PAQET_THIRD_PARTY_LICENSES.txt':
+        'licenses/PAQET_THIRD_PARTY_LICENSES.txt',
+      '../licenses/RUST_THIRD_PARTY_LICENSES.txt':
+        'licenses/RUST_THIRD_PARTY_LICENSES.txt',
       '../src/assets/fonts/SPACE_GROTESK_OFL.txt':
         'licenses/fonts/SPACE_GROTESK_OFL.txt',
       '../src/assets/fonts/JETBRAINS_MONO_OFL.txt':
