@@ -32,6 +32,7 @@
     }
   ],
   "selectedInterfaceGuid": "\\Device\\NPF_{AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE}",
+  "socksPort": 1080,
   "advancedSettings": {
     "logLevel": "debug",
     "pcapSocketBuffer": 1048576,

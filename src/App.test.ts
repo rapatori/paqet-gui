@@ -120,6 +120,7 @@ function snapshot(
     selectedProfile,
     interfaces: [ethernetInterface, wifiInterface],
     selectedInterfaceGuid: ethernetInterface.guid,
+    socksPort: 1080,
     advancedSettings: {
       logLevel: null,
       pcapSocketBuffer: null,
@@ -174,6 +175,7 @@ function mockApi(initialSnapshot = snapshot()): AppApi {
     selectProfile: vi.fn().mockResolvedValue(initialSnapshot),
     refreshInterfaces: vi.fn().mockResolvedValue(initialSnapshot),
     selectInterface: vi.fn().mockResolvedValue(initialSnapshot),
+    setSocksPort: vi.fn().mockResolvedValue(initialSnapshot),
     replaceAdvancedSettings: vi.fn().mockResolvedValue(initialSnapshot),
     connect: vi.fn().mockResolvedValue(initialSnapshot),
     disconnect: vi.fn().mockResolvedValue(initialSnapshot),
@@ -211,6 +213,10 @@ describe('application shell', () => {
       'Disconnected',
     );
     expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled();
+    expect(screen.getByRole('textbox', { name: 'SOCKS port' })).toHaveValue(
+      '1080',
+    );
+    expect(screen.getByText('Listens on 127.0.0.1')).toBeInTheDocument();
     expect(
       screen.getByRole('log', { name: 'Connection logs' }),
     ).toHaveTextContent('Connection output will appear here.');
@@ -238,6 +244,110 @@ describe('application shell', () => {
     expect(screen.getByText('Ethernet · 192.0.2.20')).toBeInTheDocument();
     expect(screen.getByText(ethernetInterface.guid)).toBeInTheDocument();
     expect(screen.getByText('00:11:22:33:44:55')).toBeInTheDocument();
+  });
+
+  it('validates and commits the global SOCKS port on blur and Enter', async () => {
+    const api = mockApi();
+    vi.mocked(api.setSocksPort).mockImplementation(async (port) =>
+      snapshot(primaryProfile, { revision: '13', socksPort: port }),
+    );
+    const { user } = await renderLoaded(api);
+    const port = screen.getByRole('textbox', { name: 'SOCKS port' });
+
+    await user.clear(port);
+    await user.type(port, '0');
+    await user.tab();
+    expect(
+      await screen.findByText('SOCKS port must be between 1 and 65535.'),
+    ).toBeInTheDocument();
+    expect(api.setSocksPort).not.toHaveBeenCalled();
+    expect(port).toHaveValue('0');
+
+    await user.clear(port);
+    await user.type(port, '020080{Enter}');
+    await waitFor(() => expect(api.setSocksPort).toHaveBeenCalledWith(20_080));
+    expect(port).toHaveValue('20080');
+    expect(port).not.toHaveFocus();
+  });
+
+  it('preserves malformed SOCKS drafts across unrelated snapshots', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    const port = screen.getByRole('textbox', { name: 'SOCKS port' });
+
+    await user.clear(port);
+    await user.type(port, '1e3');
+    await user.tab();
+    expect(
+      await screen.findByText(
+        'Enter a whole-number port using decimal digits.',
+      ),
+    ).toBeInTheDocument();
+
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Selected server profile' }),
+      backupProfile.id,
+    );
+    expect(port).toHaveValue('1e3');
+  });
+
+  it('commits a just-blurred SOCKS port before connecting', async () => {
+    const api = mockApi();
+    const pending = deferred<AppSnapshot>();
+    vi.mocked(api.setSocksPort).mockReturnValueOnce(pending.promise);
+    const { user } = await renderLoaded(api);
+    const port = screen.getByRole('textbox', { name: 'SOCKS port' });
+
+    await user.clear(port);
+    await user.type(port, '20080');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+    await waitFor(() => expect(api.setSocksPort).toHaveBeenCalledWith(20_080));
+    expect(api.connect).not.toHaveBeenCalled();
+    expect(port).toBeDisabled();
+
+    pending.resolve(
+      snapshot(primaryProfile, { revision: '13', socksPort: 20_080 }),
+    );
+    await waitFor(() => expect(api.connect).toHaveBeenCalledOnce());
+  });
+
+  it('blocks Connect when the just-blurred SOCKS port is invalid', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    const port = screen.getByRole('textbox', { name: 'SOCKS port' });
+
+    await user.clear(port);
+    await user.type(port, '65536');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+
+    expect(api.setSocksPort).not.toHaveBeenCalled();
+    expect(api.connect).not.toHaveBeenCalled();
+    expect(
+      await screen.findByText(
+        'Correct the invalid SOCKS port before connecting.',
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(port).toHaveFocus());
+  });
+
+  it('preserves a SOCKS draft and blocks Connect after storage failure', async () => {
+    const api = mockApi();
+    vi.mocked(api.setSocksPort).mockRejectedValue({ kind: 'settingsStorage' });
+    const { user } = await renderLoaded(api);
+    const port = screen.getByRole('textbox', { name: 'SOCKS port' });
+
+    await user.clear(port);
+    await user.type(port, '20080');
+    await user.click(screen.getByRole('button', { name: 'Connect' }));
+
+    expect(api.connect).not.toHaveBeenCalled();
+    expect(port).toHaveValue('20080');
+    expect(
+      await screen.findByText(
+        'The SOCKS port could not be saved. Your entry has been preserved.',
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(port).toHaveFocus());
   });
 
   it('drives canonical connection controls through all process-aware lifecycle states', async () => {

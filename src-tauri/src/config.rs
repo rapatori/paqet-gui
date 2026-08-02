@@ -138,6 +138,7 @@ pub enum ConfigField {
     LocalAddress,
     GatewayMac,
     ServerAddress,
+    SocksPort,
     EncryptionKey,
     PcapSocketBuffer,
     LocalTcpFlags,
@@ -167,6 +168,7 @@ impl fmt::Display for ConfigField {
             Self::LocalAddress => "local IPv4 address",
             Self::GatewayMac => "gateway MAC address",
             Self::ServerAddress => "server address",
+            Self::SocksPort => "SOCKS port",
             Self::EncryptionKey => "encryption key",
             Self::PcapSocketBuffer => "PCAP socket buffer",
             Self::LocalTcpFlags => "local TCP flags",
@@ -269,9 +271,16 @@ impl fmt::Debug for GeneratedConfig {
 pub fn generate(
     profile: &Profile,
     interface: &NetworkInterface,
+    socks_port: u16,
     settings: &AdvancedSettings,
 ) -> Result<GeneratedConfig, ConfigError> {
     validate_required_values(profile, interface)?;
+    if socks_port == 0 {
+        return Err(validation(
+            ConfigField::SocksPort,
+            ConfigValidationKind::OutOfRange,
+        ));
+    }
     validate_settings(settings)?;
 
     let pcap = settings
@@ -293,7 +302,7 @@ pub fn generate(
             level: settings.log_level.unwrap_or_default(),
         },
         socks5: [Socks5Config {
-            listen: "127.0.0.1:1080",
+            listen: format!("127.0.0.1:{socks_port}"),
         }],
         network: NetworkConfig {
             interface: &interface.interface_name,
@@ -600,7 +609,7 @@ struct LogConfig {
 
 #[derive(Serialize)]
 struct Socks5Config {
-    listen: &'static str,
+    listen: String,
 }
 
 #[derive(Serialize)]
@@ -902,6 +911,7 @@ mod tests {
         let generated = generate(
             profiles.selected_profile().unwrap(),
             &interface(),
+            1080,
             &AdvancedSettings::default(),
         )
         .unwrap();
@@ -909,6 +919,7 @@ mod tests {
 
         assert_eq!(document["role"], "client");
         assert_eq!(document["log"]["level"], "info");
+        assert_eq!(document["socks5"][0]["listen"], "127.0.0.1:1080");
         assert_eq!(document["network"]["ipv4"]["addr"], "192.0.2.10:0");
         assert_eq!(document["transport"]["protocol"], "kcp");
         assert_eq!(document["transport"]["kcp"]["key"], SECRET);
@@ -928,6 +939,7 @@ mod tests {
         let generated = generate(
             profiles.selected_profile().unwrap(),
             &interface(),
+            1080,
             &settings,
         )
         .unwrap();
@@ -981,7 +993,7 @@ mod tests {
 
         for settings in cases {
             assert!(matches!(
-                generate(profile, &interface, &settings),
+                generate(profile, &interface, 1080, &settings),
                 Err(ConfigError::Validation { .. })
             ));
         }
@@ -1002,14 +1014,14 @@ mod tests {
         };
 
         assert!(matches!(
-            generate(profile, &interface, &stream_too_large),
+            generate(profile, &interface, 1080, &stream_too_large),
             Err(ConfigError::Validation {
                 field: ConfigField::StreamBuffer,
                 kind: ConfigValidationKind::InvalidCombination
             })
         ));
         assert!(matches!(
-            generate(profile, &interface, &timeout_too_short),
+            generate(profile, &interface, 1080, &timeout_too_short),
             Err(ConfigError::Validation {
                 field: ConfigField::SmuxTimeout,
                 kind: ConfigValidationKind::InvalidCombination
@@ -1027,7 +1039,7 @@ mod tests {
         assert_eq!(invalid.interface_name.len(), 16);
 
         assert!(matches!(
-            generate(profile, &invalid, &AdvancedSettings::default()),
+            generate(profile, &invalid, 1080, &AdvancedSettings::default()),
             Err(ConfigError::Validation {
                 field: ConfigField::InterfaceName,
                 ..
@@ -1037,7 +1049,7 @@ mod tests {
         invalid.interface_name = "Ethernet".to_owned();
         invalid.guid = "not-a-guid".to_owned();
         assert!(matches!(
-            generate(profile, &invalid, &AdvancedSettings::default()),
+            generate(profile, &invalid, 1080, &AdvancedSettings::default()),
             Err(ConfigError::Validation {
                 field: ConfigField::InterfaceGuid,
                 ..
@@ -1047,7 +1059,7 @@ mod tests {
         invalid = interface();
         invalid.local_address = Ipv4Addr::UNSPECIFIED;
         assert!(matches!(
-            generate(profile, &invalid, &AdvancedSettings::default()),
+            generate(profile, &invalid, 1080, &AdvancedSettings::default()),
             Err(ConfigError::Validation {
                 field: ConfigField::LocalAddress,
                 ..
@@ -1057,7 +1069,7 @@ mod tests {
         invalid = interface();
         invalid.gateway_mac = "00:00:00:00:00:00".to_owned();
         assert!(matches!(
-            generate(profile, &invalid, &AdvancedSettings::default()),
+            generate(profile, &invalid, 1080, &AdvancedSettings::default()),
             Err(ConfigError::Validation {
                 field: ConfigField::GatewayMac,
                 ..
@@ -1071,7 +1083,7 @@ mod tests {
         let mut profile = profiles.selected_profile().unwrap().clone();
         profile.port = 0;
         assert!(matches!(
-            generate(&profile, &interface(), &AdvancedSettings::default()),
+            generate(&profile, &interface(), 1080, &AdvancedSettings::default()),
             Err(ConfigError::Validation {
                 field: ConfigField::ServerAddress,
                 ..
@@ -1081,7 +1093,7 @@ mod tests {
         profile.port = 9999;
         profile.server_host = "2001:db8::1".to_owned();
         assert!(matches!(
-            generate(&profile, &interface(), &AdvancedSettings::default()),
+            generate(&profile, &interface(), 1080, &AdvancedSettings::default()),
             Err(ConfigError::Validation {
                 field: ConfigField::ServerAddress,
                 ..
@@ -1095,6 +1107,7 @@ mod tests {
         let generated = generate(
             profiles.selected_profile().unwrap(),
             &interface(),
+            1080,
             &AdvancedSettings::default(),
         )
         .unwrap();
@@ -1105,6 +1118,7 @@ mod tests {
         let error = generate(
             profiles.selected_profile().unwrap(),
             &invalid,
+            1080,
             &AdvancedSettings::default(),
         )
         .unwrap_err();
@@ -1119,6 +1133,7 @@ mod tests {
         let first = generate(
             first_profiles.selected_profile().unwrap(),
             &interface(),
+            1080,
             &AdvancedSettings::default(),
         )
         .unwrap();
@@ -1133,6 +1148,7 @@ mod tests {
         let second = generate(
             second_profiles.selected_profile().unwrap(),
             &interface(),
+            1080,
             &AdvancedSettings::default(),
         )
         .unwrap();
@@ -1158,6 +1174,7 @@ mod tests {
                 let config = generate(
                     profiles.selected_profile().unwrap(),
                     &interface(),
+                    1080,
                     &AdvancedSettings::default(),
                 )
                 .unwrap();

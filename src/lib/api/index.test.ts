@@ -1,6 +1,7 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import snapshotFixture from '../../../src-tauri/tests/fixtures/ipc/app-snapshot.json';
 import configErrorFixture from '../../../src-tauri/tests/fixtures/ipc/error-config-validation.json';
+import settingsErrorFixture from '../../../src-tauri/tests/fixtures/ipc/error-settings-validation.json';
 import errorFixture from '../../../src-tauri/tests/fixtures/ipc/error-profile-validation.json';
 import bootstrapFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-bootstrap.json';
 import gapFixture from '../../../src-tauri/tests/fixtures/ipc/runtime-gap.json';
@@ -19,6 +20,7 @@ import {
   replaceAdvancedSettings,
   selectInterface,
   selectProfile,
+  setSocksPort,
   subscribeRuntimeEvents,
   updateProfile,
 } from './index';
@@ -62,6 +64,7 @@ describe('Tauri API', () => {
     await selectProfile('profile-id');
     await refreshInterfaces();
     await selectInterface('interface-guid');
+    await setSocksPort(20_080);
     await replaceAdvancedSettings(snapshot.advancedSettings);
     await connect();
     await disconnect();
@@ -83,6 +86,7 @@ describe('Tauri API', () => {
       ['select_profile', { id: 'profile-id' }],
       ['refresh_interfaces'],
       ['select_interface', { guid: 'interface-guid' }],
+      ['set_socks_port', { port: 20_080 }],
       ['replace_advanced_settings', { settings: snapshot.advancedSettings }],
       ['connect'],
       ['disconnect'],
@@ -149,6 +153,7 @@ describe('Tauri API', () => {
       'representative-test-key',
     );
     expect(snapshot.advancedSettings.tcpBuffer).toBe('9007199254740993');
+    expect(snapshot.socksPort).toBe(1080);
     expect(snapshot.lifecycle).toEqual({
       status: 'disconnected',
       process: 'absent',
@@ -169,6 +174,11 @@ describe('Tauri API', () => {
       kind: 'configValidation',
       field: 'streamBuffer',
       issue: 'invalidCombination',
+    });
+    expect(settingsErrorFixture as IpcError).toEqual({
+      kind: 'settingsValidation',
+      field: 'socksPort',
+      issue: 'outOfRange',
     });
   });
 

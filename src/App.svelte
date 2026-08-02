@@ -28,6 +28,7 @@
     selectProfile(id: ProfileId): Promise<AppSnapshot>;
     refreshInterfaces(): Promise<AppSnapshot>;
     selectInterface(guid: string): Promise<AppSnapshot>;
+    setSocksPort(port: number): Promise<AppSnapshot>;
     replaceAdvancedSettings(settings: AdvancedSettings): Promise<AppSnapshot>;
     connect(): Promise<AppSnapshot>;
     disconnect(): Promise<AppSnapshot>;
@@ -89,6 +90,7 @@
     'kcpMode' | 'kcpBlock'
   >;
   type SettingsField = CommonSettingField | KcpSettingField;
+  type SnapshotSyncField = SettingsField | 'socksPort';
   type KcpDraft = Record<KcpTextField, string>;
   type KcpErrors = Partial<Record<KcpTextField, string>>;
   type ProfileInput = Omit<ProfileDraft, 'port'> & { port: string };
@@ -125,6 +127,12 @@
   let saving = $state(false);
   let interfaceOperation = $state<InterfaceOperation>(null);
   let interfaceMessage = $state('');
+  let socksPortDraft = $state('1080');
+  let socksPortError = $state('');
+  let socksPortMessage = $state('');
+  let socksPortDraftVersion = $state(0);
+  let socksPortBusy = $state(false);
+  let socksPortCommitFailed = $state(false);
   let settingsOperation = $state<SettingsField | null>(null);
   let kcpModeQueued = $state(false);
   let settingsMessage = $state('');
@@ -163,6 +171,7 @@
   let serverHostInput = $state<HTMLInputElement>();
   let portInput = $state<HTMLInputElement>();
   let encryptionKeyInput = $state<HTMLInputElement>();
+  let socksPortInput = $state<HTMLInputElement>();
   let commonFieldInputs: Partial<Record<CommonTextField, HTMLInputElement>> =
     {};
   let kcpFieldInputs: Partial<Record<KcpTextField, HTMLInputElement>> = {};
@@ -190,7 +199,9 @@
   const editorOpen = $derived(editorMode !== 'view');
   const interfaceBusy = $derived(interfaceOperation !== null);
   const settingsBusy = $derived(settingsOperation !== null);
-  const mutationBusy = $derived(saving || interfaceBusy || settingsBusy);
+  const mutationBusy = $derived(
+    saving || interfaceBusy || socksPortBusy || settingsBusy,
+  );
   const draftChanged = $derived(
     editorMode === 'create'
       ? Object.values(draft).some((value) => value.length > 0)
@@ -332,7 +343,7 @@
   function applySnapshot(
     nextSnapshot: AppSnapshot,
     resetProfileEditor = false,
-    fieldToSync: SettingsField | 'all' | null = null,
+    fieldToSync: SnapshotSyncField | 'all' | null = null,
   ): boolean {
     if (snapshot && BigInt(nextSnapshot.revision) < BigInt(snapshot.revision)) {
       return false;
@@ -359,6 +370,12 @@
         : emptyProfileInput();
     }
     if (fieldToSync) {
+      if (fieldToSync === 'all' || fieldToSync === 'socksPort') {
+        socksPortDraft = String(nextSnapshot.socksPort);
+        socksPortError = '';
+        socksPortMessage = '';
+        socksPortCommitFailed = false;
+      }
       if (fieldToSync === 'all' || isCommonSettingField(fieldToSync)) {
         syncCommonDraft(nextSnapshot.advancedSettings, fieldToSync);
       }
@@ -1127,6 +1144,13 @@
       await scheduledDraftCommits;
       await settingsQueue;
       if (action !== connectionAction.kind) return;
+      if (action === 'connect' && (socksPortError || socksPortCommitFailed)) {
+        connectionMessage = socksPortError
+          ? 'Correct the invalid SOCKS port before connecting.'
+          : 'Save the SOCKS port before connecting.';
+        window.setTimeout(() => socksPortInput?.focus(), 0);
+        return;
+      }
       if (
         action === 'connect' &&
         (Object.keys(commonErrors).length > 0 ||
@@ -1355,6 +1379,91 @@
 
   function interfaceOptionLabel(networkInterface: NetworkInterface): string {
     return `${networkInterface.friendlyName} · ${networkInterface.localAddress}`;
+  }
+
+  function scheduleSocksPortCommit(): void {
+    scheduledDraftCommits = scheduledDraftCommits.then(commitSocksPortDraft);
+  }
+
+  async function commitSocksPortDraft(): Promise<void> {
+    const input = socksPortDraft;
+    const draftVersion = socksPortDraftVersion;
+    await queueSettingsMutation(async () => {
+      if (!snapshot || !settingsEditable) return;
+      const parsed = parseSocksPort(input);
+      if (typeof parsed === 'string') {
+        socksPortError = parsed;
+        return;
+      }
+      socksPortError = '';
+      if (snapshot.socksPort === parsed.value) {
+        if (socksPortDraftVersion === draftVersion) {
+          socksPortDraft = parsed.normalized;
+        }
+        socksPortCommitFailed = false;
+        return;
+      }
+
+      socksPortBusy = true;
+      socksPortMessage = '';
+      socksPortCommitFailed = false;
+      try {
+        applySnapshot(
+          await api.setSocksPort(parsed.value),
+          false,
+          socksPortDraftVersion === draftVersion ? 'socksPort' : null,
+        );
+      } catch (error) {
+        presentSocksPortError(error);
+      } finally {
+        socksPortBusy = false;
+        resolveMutationIdle();
+      }
+    });
+  }
+
+  function handleSocksPortInput(): void {
+    socksPortDraftVersion += 1;
+    socksPortError = '';
+    socksPortMessage = '';
+    socksPortCommitFailed = false;
+    connectionMessage = '';
+  }
+
+  function handleSocksPortKeydown(event: KeyboardEvent): void {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    (event.currentTarget as HTMLInputElement).blur();
+  }
+
+  function parseSocksPort(
+    input: string,
+  ): string | { value: number; normalized: string } {
+    const value = input.trim();
+    if (!/^\d+$/.test(value)) {
+      return 'Enter a whole-number port using decimal digits.';
+    }
+    const parsed = BigInt(value);
+    if (parsed < 1n || parsed > 65_535n) {
+      return 'SOCKS port must be between 1 and 65535.';
+    }
+    return { value: Number(parsed), normalized: parsed.toString() };
+  }
+
+  function presentSocksPortError(error: unknown): void {
+    socksPortCommitFailed = true;
+    if (
+      isIpcError(error) &&
+      error.kind === 'settingsValidation' &&
+      error.field === 'socksPort'
+    ) {
+      socksPortError = 'SOCKS port must be between 1 and 65535.';
+      return;
+    }
+    socksPortMessage =
+      isIpcError(error) && error.kind === 'settingsLocked'
+        ? 'SOCKS settings are locked while paqet is active.'
+        : 'The SOCKS port could not be saved. Your entry has been preserved.';
   }
 
   async function toggleCommonOverride(
@@ -2174,7 +2283,12 @@
   }
 
   function resolveMutationIdle(): void {
-    if (saving || interfaceOperation !== null || settingsOperation !== null) {
+    if (
+      saving ||
+      interfaceOperation !== null ||
+      socksPortBusy ||
+      settingsOperation !== null
+    ) {
       return;
     }
     const resolvers = mutationIdleResolvers;
@@ -3079,6 +3193,39 @@
       </p>
     {/if}
     <h2 id="connection-heading" class="sr-only">Connection</h2>
+    {#if snapshot}
+      <div class="socks-setting">
+        <div>
+          <label for="socks-port">SOCKS port</label>
+          <p id="socks-port-hint" class="field-hint">Listens on 127.0.0.1</p>
+        </div>
+        <input
+          id="socks-port"
+          class:invalid={socksPortError}
+          bind:this={socksPortInput}
+          bind:value={socksPortDraft}
+          type="text"
+          inputmode="numeric"
+          autocomplete="off"
+          disabled={!settingsEditable || connectionBusy || mutationBusy}
+          aria-invalid={socksPortError ? 'true' : undefined}
+          aria-describedby={socksPortError
+            ? 'socks-port-hint socks-port-error'
+            : 'socks-port-hint'}
+          oninput={handleSocksPortInput}
+          onchange={scheduleSocksPortCommit}
+          onkeydown={handleSocksPortKeydown}
+        />
+      </div>
+      {#if socksPortError}
+        <p id="socks-port-error" class="field-error" role="alert">
+          {socksPortError}
+        </p>
+      {/if}
+      {#if socksPortMessage}
+        <p class="field-error" role="alert">{socksPortMessage}</p>
+      {/if}
+    {/if}
     <button
       class:disconnect-action={connectionAction.kind === 'disconnect'}
       class:connection-pending={connectionAction.kind === 'waiting'}

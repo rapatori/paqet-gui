@@ -8,6 +8,7 @@ use serde_json::Value;
 const SNAPSHOT_FIXTURE: &str = include_str!("fixtures/ipc/app-snapshot.json");
 const ERROR_FIXTURE: &str = include_str!("fixtures/ipc/error-profile-validation.json");
 const CONFIG_ERROR_FIXTURE: &str = include_str!("fixtures/ipc/error-config-validation.json");
+const SETTINGS_ERROR_FIXTURE: &str = include_str!("fixtures/ipc/error-settings-validation.json");
 const RUNTIME_BOOTSTRAP_FIXTURE: &str = include_str!("fixtures/ipc/runtime-bootstrap.json");
 const RUNTIME_OUTPUT_FIXTURE: &str = include_str!("fixtures/ipc/runtime-output.json");
 const RUNTIME_GAP_FIXTURE: &str = include_str!("fixtures/ipc/runtime-gap.json");
@@ -19,6 +20,7 @@ fn representative_snapshot_matches_the_rust_wire_contract() {
 
     let value: Value = serde_json::from_str(SNAPSHOT_FIXTURE).unwrap();
     assert_eq!(value["revision"], "12");
+    assert_eq!(value["socksPort"], 1080);
     assert_eq!(value["advancedSettings"]["tcpBuffer"], "9007199254740993");
     assert_eq!(value["profiles"][0].get("encryptionKey"), None);
     assert_eq!(
@@ -31,6 +33,7 @@ fn representative_snapshot_matches_the_rust_wire_contract() {
 fn representative_error_matches_the_rust_wire_contract() {
     assert_typed_round_trip::<IpcError>(ERROR_FIXTURE);
     assert_typed_round_trip::<IpcError>(CONFIG_ERROR_FIXTURE);
+    assert_typed_round_trip::<IpcError>(SETTINGS_ERROR_FIXTURE);
 }
 
 #[test]

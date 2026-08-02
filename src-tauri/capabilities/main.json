@@ -12,6 +12,7 @@
     "allow-select-profile",
     "allow-refresh-interfaces",
     "allow-select-interface",
+    "allow-set-socks-port",
     "allow-replace-advanced-settings",
     "allow-connect",
     "allow-disconnect",

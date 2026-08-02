@@ -17,6 +17,7 @@ The release packaging configuration produces an unsigned Windows 11 x64 NSIS ins
 - Windows 11 on x64.
 - One fixed-size desktop window for local paqet client operation.
 - Locally persisted server profiles containing a server address, port, and encryption key.
+- One persisted global SOCKS port, bound only to `127.0.0.1` and defaulting to `1080`.
 - Windows interface discovery and derivation of the interface, Npcap GUID, local address, and gateway MAC required by paqet.
 - Deterministic generation of the supported paqet client configuration.
 - Start, monitor, and stop one bundled paqet child process.
@@ -48,7 +49,7 @@ For users who need to set up their own Linux VPS, we recommend the community-mai
 
 ## Data And Security
 
-The application stores profiles, including paqet encryption keys, as versioned plaintext JSON in the current user's application configuration directory. Generated `config.yaml` is also plaintext and is stored separately in the current user's local application data because paqet requires it. These files rely on the Windows user profile's access controls and are not encrypted by the application.
+The application stores profiles, including paqet encryption keys, as versioned plaintext JSON in the current user's application configuration directory. It stores the global SOCKS port separately in versioned plaintext `settings.json` in the same directory. Generated `config.yaml` is also plaintext and is stored separately in the current user's local application data because paqet requires it. These files rely on the Windows user profile's access controls and are not encrypted by the application.
 
 Keys must not be included in logs, diagnostics, issues, or vulnerability reports. See [SECURITY.md](SECURITY.md) for the vulnerability reporting policy.
 

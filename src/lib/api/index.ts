@@ -44,6 +44,10 @@ export function selectInterface(guid: string): Promise<AppSnapshot> {
   return invoke<AppSnapshot>('select_interface', { guid });
 }
 
+export function setSocksPort(port: number): Promise<AppSnapshot> {
+  return invoke<AppSnapshot>('set_socks_port', { port });
+}
+
 export function replaceAdvancedSettings(
   settings: AdvancedSettings,
 ): Promise<AppSnapshot> {

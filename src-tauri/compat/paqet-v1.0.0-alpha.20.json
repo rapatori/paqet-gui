@@ -33,7 +33,9 @@
     "clientAddressPort": 0
   },
   "applicationAcceptedValues": {
-    "logLevels": ["debug", "info"]
+    "logLevels": ["debug", "info"],
+    "socks5BindAddress": "127.0.0.1",
+    "socks5PortRange": [1, 65535]
   },
   "acceptedValues": {
     "logLevels": ["none", "debug", "info", "warn", "error", "fatal"],

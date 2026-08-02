@@ -2,7 +2,7 @@ role: client
 log:
   level: debug
 socks5:
-- listen: 127.0.0.1:1080
+- listen: 127.0.0.1:20080
 network:
   interface: Ethernet
   guid: \Device\NPF_{12345678-1234-1234-1234-123456789ABC}

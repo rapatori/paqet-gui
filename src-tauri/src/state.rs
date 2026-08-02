@@ -22,6 +22,7 @@ use crate::{
         SupervisorEvent, resolve_paqet_executable,
     },
     profiles::{Profile, ProfileCollection, ProfileDraft, ProfileError, ProfileId, ProfileStore},
+    settings::{ApplicationSettings, ApplicationSettingsError, ApplicationSettingsStore},
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -73,6 +74,7 @@ pub struct AppSnapshot {
     pub selected_profile: Option<Profile>,
     pub interfaces: Vec<NetworkInterface>,
     pub selected_interface_guid: Option<String>,
+    pub socks_port: u16,
     pub advanced_settings: AdvancedSettings,
     pub lifecycle: LifecycleSnapshot,
 }
@@ -201,6 +203,7 @@ pub enum StateError {
     Profile(ProfileError),
     Network(NetworkError),
     Config(ConfigError),
+    Settings(ApplicationSettingsError),
     Process(ProcessError),
     Subscription,
     Unavailable,
@@ -219,6 +222,7 @@ impl fmt::Display for StateError {
             Self::Profile(error) => error.fmt(formatter),
             Self::Network(error) => error.fmt(formatter),
             Self::Config(error) => error.fmt(formatter),
+            Self::Settings(error) => error.fmt(formatter),
             Self::Process(error) => error.fmt(formatter),
             Self::Subscription => formatter.write_str("the runtime event channel is unavailable"),
             Self::Unavailable => formatter.write_str("application state is unavailable"),
@@ -232,6 +236,7 @@ impl std::error::Error for StateError {
             Self::Profile(error) => Some(error),
             Self::Network(error) => Some(error),
             Self::Config(error) => Some(error),
+            Self::Settings(error) => Some(error),
             Self::Process(error) => Some(error),
             Self::Locked
             | Self::InterfaceNotFound
@@ -259,6 +264,12 @@ impl From<NetworkError> for StateError {
 impl From<ConfigError> for StateError {
     fn from(error: ConfigError) -> Self {
         Self::Config(error)
+    }
+}
+
+impl From<ApplicationSettingsError> for StateError {
+    fn from(error: ApplicationSettingsError) -> Self {
+        Self::Settings(error)
     }
 }
 
@@ -292,6 +303,7 @@ impl RuntimeProcess for SupervisedPaqet {
 type RuntimeLauncher =
     Arc<dyn Fn(&Path) -> Result<Box<dyn RuntimeProcess>, ProcessError> + Send + Sync>;
 type InterfaceProvider = Arc<dyn Fn() -> Result<Vec<NetworkInterface>, NetworkError> + Send + Sync>;
+type PersistedApplicationSettings = (ApplicationSettingsStore, ApplicationSettings);
 
 enum RuntimeControl {
     Disconnect {
@@ -309,6 +321,8 @@ struct StateData {
     revision: u64,
     profiles: ProfileCollection,
     profile_store: ProfileStore,
+    application_settings: ApplicationSettings,
+    application_settings_store: ApplicationSettingsStore,
     interfaces: Vec<NetworkInterface>,
     selected_interface_guid: Option<String>,
     advanced_settings: AdvancedSettings,
@@ -339,6 +353,7 @@ impl StateData {
             selected_profile: self.profiles.selected_profile().cloned(),
             interfaces: self.interfaces.clone(),
             selected_interface_guid: self.selected_interface_guid.clone(),
+            socks_port: self.application_settings.socks_port(),
             advanced_settings: self.advanced_settings.clone(),
             lifecycle: self.lifecycle.into(),
         }
@@ -361,6 +376,17 @@ impl StateData {
         mutation(&mut candidate)?;
         self.profile_store.save(&candidate)?;
         self.profiles = candidate;
+        self.advance_revision();
+        Ok(self.snapshot())
+    }
+
+    fn commit_application_settings(
+        &mut self,
+        settings: ApplicationSettings,
+    ) -> Result<AppSnapshot, StateError> {
+        self.ensure_editable()?;
+        self.application_settings_store.save(&settings)?;
+        self.application_settings = settings;
         self.advance_revision();
         Ok(self.snapshot())
     }
@@ -462,12 +488,18 @@ impl AppState {
     pub fn from_app_handle<R: Runtime>(app: &AppHandle<R>) -> Result<Self, StateError> {
         let test_data_directory = test_data_directory();
         let test_storage_paths = test_data_directory.as_deref().map(test_storage_paths);
-        let profile_store = if let Some((profile_path, _)) = &test_storage_paths {
-            ProfileStore::new(profile_path.clone())
+        let profile_store = if let Some(paths) = &test_storage_paths {
+            ProfileStore::new(paths.profiles.clone())
         } else {
             ProfileStore::from_app_handle(app)?
         };
         let profiles = profile_store.load()?;
+        let application_settings_store = if let Some(paths) = &test_storage_paths {
+            ApplicationSettingsStore::new(paths.settings.clone())
+        } else {
+            ApplicationSettingsStore::from_app_handle(app)?
+        };
+        let application_settings = application_settings_store.load()?;
         let allow_persisted_profiles = test_harness_mode(
             test_data_directory.as_deref(),
             std::env::var_os("PAQET_GUI_TEST_ALLOW_PERSISTED_PROFILES"),
@@ -483,8 +515,8 @@ impl AppState {
             std::env::var_os("PAQET_GUI_TEST_NETWORK_FIXTURE"),
         );
         let interfaces = interface_provider()?;
-        let config_store = if let Some((_, config_path)) = test_storage_paths {
-            RuntimeConfigStore::new(config_path)
+        let config_store = if let Some(paths) = test_storage_paths {
+            RuntimeConfigStore::new(paths.runtime_config)
         } else {
             RuntimeConfigStore::from_app_handle(app)?
         };
@@ -510,6 +542,7 @@ impl AppState {
         Ok(Self::from_parts(
             profile_store,
             profiles,
+            (application_settings_store, application_settings),
             interfaces,
             config_store,
             interface_provider,
@@ -523,6 +556,13 @@ impl AppState {
         interfaces: Vec<NetworkInterface>,
     ) -> Result<Self, StateError> {
         let profiles = profile_store.load()?;
+        let settings_path = profile_store
+            .path()
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("settings.json");
+        let application_settings_store = ApplicationSettingsStore::new(settings_path);
+        let application_settings = application_settings_store.load()?;
         let config_store = RuntimeConfigStore::new(
             profile_store
                 .path()
@@ -538,6 +578,7 @@ impl AppState {
         Ok(Self::from_parts(
             profile_store,
             profiles,
+            (application_settings_store, application_settings),
             interfaces.clone(),
             config_store,
             fixed_interface_provider(interfaces),
@@ -548,17 +589,21 @@ impl AppState {
     fn from_parts(
         profile_store: ProfileStore,
         profiles: ProfileCollection,
+        persisted_application_settings: PersistedApplicationSettings,
         interfaces: Vec<NetworkInterface>,
         config_store: RuntimeConfigStore,
         interface_provider: InterfaceProvider,
         launcher: RuntimeLauncher,
     ) -> Self {
+        let (application_settings_store, application_settings) = persisted_application_settings;
         let selected_interface_guid = interfaces.first().map(|interface| interface.guid.clone());
         Self {
             inner: Arc::new(Mutex::new(StateData {
                 revision: 0,
                 profiles,
                 profile_store,
+                application_settings,
+                application_settings_store,
                 interfaces,
                 selected_interface_guid,
                 advanced_settings: AdvancedSettings::default(),
@@ -629,6 +674,13 @@ impl AppState {
         Ok(state.snapshot())
     }
 
+    pub fn set_socks_port(&self, port: u32) -> Result<AppSnapshot, StateError> {
+        let mut state = self.lock()?;
+        state.ensure_editable()?;
+        let settings = ApplicationSettings::with_socks_port(port)?;
+        state.commit_application_settings(settings)
+    }
+
     pub fn replace_advanced_settings(
         &self,
         settings: AdvancedSettings,
@@ -668,7 +720,7 @@ impl AppState {
     }
 
     pub fn connect(&self) -> Result<AppSnapshot, StateError> {
-        let (session_id, profile, interface, settings) = {
+        let (session_id, profile, interface, socks_port, settings) = {
             let mut state = self.lock()?;
             if state.shutdown_requested || !state.lifecycle.can_connect() {
                 return Err(StateError::CommandConflict);
@@ -700,11 +752,12 @@ impl AppState {
                 session_id,
                 profile,
                 interface,
+                state.application_settings.socks_port(),
                 state.advanced_settings.clone(),
             )
         };
 
-        let generated = generate(&profile, &interface, &settings)
+        let generated = generate(&profile, &interface, socks_port, &settings)
             .map_err(|error| self.fail_connect(session_id, error.into()))?;
         self.config_store
             .write(&generated)
@@ -1082,11 +1135,19 @@ fn wait_for_test_launch_gate(gate: &Path, timeout: Duration) -> Result<(), Proce
     }
 }
 
-fn test_storage_paths(directory: &Path) -> (PathBuf, PathBuf) {
-    (
-        directory.join("config").join("profiles.json"),
-        directory.join("local").join("config.yaml"),
-    )
+#[derive(Debug, Eq, PartialEq)]
+struct TestStoragePaths {
+    profiles: PathBuf,
+    settings: PathBuf,
+    runtime_config: PathBuf,
+}
+
+fn test_storage_paths(directory: &Path) -> TestStoragePaths {
+    TestStoragePaths {
+        profiles: directory.join("config").join("profiles.json"),
+        settings: directory.join("config").join("settings.json"),
+        runtime_config: directory.join("local").join("config.yaml"),
+    }
 }
 
 fn coordinate_runtime(
@@ -1297,13 +1358,14 @@ mod tests {
     }
 
     #[test]
-    fn test_data_override_redirects_both_secret_bearing_stores() {
+    fn test_data_override_redirects_all_native_stores() {
         assert_eq!(
             test_storage_paths(Path::new("isolated")),
-            (
-                PathBuf::from("isolated/config/profiles.json"),
-                PathBuf::from("isolated/local/config.yaml")
-            )
+            TestStoragePaths {
+                profiles: PathBuf::from("isolated/config/profiles.json"),
+                settings: PathBuf::from("isolated/config/settings.json"),
+                runtime_config: PathBuf::from("isolated/local/config.yaml"),
+            }
         );
     }
 
@@ -1439,6 +1501,10 @@ mod tests {
         let state = AppState::from_parts(
             ProfileStore::new(directory.path().to_owned()),
             ProfileCollection::default(),
+            (
+                ApplicationSettingsStore::new(directory.path().join("settings.json")),
+                ApplicationSettings::default(),
+            ),
             Vec::new(),
             RuntimeConfigStore::new(directory.path().join("config.yaml")),
             fixed_interface_provider(Vec::new()),
@@ -1525,6 +1591,60 @@ mod tests {
     }
 
     #[test]
+    fn socks_port_defaults_validates_persists_and_reloads() {
+        let directory = TestDirectory::new();
+        let profile_path = directory.path().join("profiles.json");
+        let state =
+            AppState::load_with_interfaces(ProfileStore::new(profile_path.clone()), Vec::new())
+                .unwrap();
+        assert_eq!(state.snapshot().unwrap().socks_port, 1080);
+
+        let updated = state.set_socks_port(20_080).unwrap();
+        assert_eq!(updated.revision, 1);
+        assert_eq!(updated.socks_port, 20_080);
+        let reloaded =
+            AppState::load_with_interfaces(ProfileStore::new(profile_path), Vec::new()).unwrap();
+        assert_eq!(reloaded.snapshot().unwrap().socks_port, 20_080);
+
+        let before = reloaded.snapshot().unwrap();
+        for invalid in [0, 65_536] {
+            assert!(matches!(
+                reloaded.set_socks_port(invalid),
+                Err(StateError::Settings(
+                    ApplicationSettingsError::Validation { .. }
+                ))
+            ));
+            assert_eq!(reloaded.snapshot().unwrap(), before);
+        }
+        assert_eq!(reloaded.set_socks_port(1).unwrap().socks_port, 1);
+        assert_eq!(reloaded.set_socks_port(65_535).unwrap().socks_port, 65_535);
+    }
+
+    #[test]
+    fn failed_settings_write_leaves_memory_unchanged() {
+        let directory = TestDirectory::new();
+        let state = AppState::from_parts(
+            ProfileStore::new(directory.path().join("profiles.json")),
+            ProfileCollection::default(),
+            (
+                ApplicationSettingsStore::new(directory.path().to_owned()),
+                ApplicationSettings::default(),
+            ),
+            Vec::new(),
+            RuntimeConfigStore::new(directory.path().join("config.yaml")),
+            fixed_interface_provider(Vec::new()),
+            unavailable_launcher(),
+        );
+        let before = state.snapshot().unwrap();
+
+        assert!(matches!(
+            state.set_socks_port(20_080),
+            Err(StateError::Settings(ApplicationSettingsError::Io { .. }))
+        ));
+        assert_eq!(state.snapshot().unwrap(), before);
+    }
+
+    #[test]
     fn every_disconnected_mutation_is_rejected_after_connect_begins() {
         let directory = TestDirectory::new();
         let factory = Arc::new(FakeRuntimeFactory::default());
@@ -1562,6 +1682,10 @@ mod tests {
             Err(StateError::Locked)
         ));
         assert!(matches!(
+            state.set_socks_port(20_080),
+            Err(StateError::Locked)
+        ));
+        assert!(matches!(
             state
                 .lock()
                 .unwrap()
@@ -1583,6 +1707,7 @@ mod tests {
         state
             .create_profile(draft("Existing", "existing-key"))
             .unwrap();
+        state.set_socks_port(20_080).unwrap();
 
         let connected = state.connect().unwrap();
         assert_eq!(connected.lifecycle.status, LifecycleStatus::Connecting);
@@ -1591,6 +1716,7 @@ mod tests {
         assert_eq!(factory.launches.load(Ordering::SeqCst), 1);
         let yaml = fs::read_to_string(&factory.config_paths.lock().unwrap()[0]).unwrap();
         assert!(yaml.contains("existing-key"));
+        assert!(yaml.contains("127.0.0.1:20080"));
 
         factory.send(
             0,
@@ -2052,6 +2178,10 @@ mod tests {
         AppState::from_parts(
             profile_store,
             profiles,
+            (
+                ApplicationSettingsStore::new(directory.path().join("settings.json")),
+                ApplicationSettings::default(),
+            ),
             interfaces.clone(),
             RuntimeConfigStore::new(directory.path().join("config.yaml")),
             fixed_interface_provider(interfaces),

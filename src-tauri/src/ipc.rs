@@ -6,6 +6,9 @@ use tauri::{State, Window, ipc::Channel};
 use crate::{
     config::{AdvancedSettings, ConfigError, ConfigField, ConfigValidationKind},
     profiles::{ProfileDraft, ProfileError, ProfileField, ProfileId, ValidationKind},
+    settings::{
+        ApplicationSettingsError, ApplicationSettingsField, ApplicationSettingsValidationKind,
+    },
     state::{AppSnapshot, AppState, RuntimeEvent, StateError, WindowCloseRequest},
 };
 
@@ -81,6 +84,7 @@ pub enum ConfigFieldName {
     LocalAddress,
     GatewayMac,
     ServerAddress,
+    SocksPort,
     EncryptionKey,
     PcapSocketBuffer,
     LocalTcpFlags,
@@ -110,6 +114,7 @@ impl From<ConfigField> for ConfigFieldName {
             ConfigField::LocalAddress => Self::LocalAddress,
             ConfigField::GatewayMac => Self::GatewayMac,
             ConfigField::ServerAddress => Self::ServerAddress,
+            ConfigField::SocksPort => Self::SocksPort,
             ConfigField::EncryptionKey => Self::EncryptionKey,
             ConfigField::PcapSocketBuffer => Self::PcapSocketBuffer,
             ConfigField::LocalTcpFlags => Self::LocalTcpFlags,
@@ -163,6 +168,15 @@ pub enum IpcError {
     },
     ProfileDataInvalid,
     ProfileStorage,
+    SettingsValidation {
+        field: SettingsFieldName,
+        issue: ValidationIssue,
+    },
+    SettingsDataUnsupported {
+        version: u32,
+    },
+    SettingsDataInvalid,
+    SettingsStorage,
     NetworkDiscovery,
     ConfigValidation {
         field: ConfigFieldName,
@@ -186,9 +200,36 @@ impl From<StateError> for IpcError {
             StateError::Profile(error) => Self::from(error),
             StateError::Network(_) => Self::NetworkDiscovery,
             StateError::Config(error) => Self::from(error),
+            StateError::Settings(error) => Self::from(error),
             StateError::Process(_) => Self::ProcessLaunch,
             StateError::Subscription => Self::RuntimeSubscription,
             StateError::Unavailable => Self::StateUnavailable,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SettingsFieldName {
+    SocksPort,
+}
+
+impl From<ApplicationSettingsError> for IpcError {
+    fn from(error: ApplicationSettingsError) -> Self {
+        match error {
+            ApplicationSettingsError::Validation { field, kind } => Self::SettingsValidation {
+                field: match field {
+                    ApplicationSettingsField::SocksPort => SettingsFieldName::SocksPort,
+                },
+                issue: match kind {
+                    ApplicationSettingsValidationKind::OutOfRange => ValidationIssue::OutOfRange,
+                },
+            },
+            ApplicationSettingsError::UnsupportedSchemaVersion(version) => {
+                Self::SettingsDataUnsupported { version }
+            }
+            ApplicationSettingsError::CorruptData => Self::SettingsDataInvalid,
+            ApplicationSettingsError::Io { .. } => Self::SettingsStorage,
         }
     }
 }
@@ -286,6 +327,14 @@ pub fn select_interface(
     app_state(&state)?
         .select_interface(&guid)
         .map_err(Into::into)
+}
+
+#[tauri::command]
+pub fn set_socks_port(
+    state: State<'_, ManagedAppState>,
+    port: u32,
+) -> Result<AppSnapshot, IpcError> {
+    app_state(&state)?.set_socks_port(port).map_err(Into::into)
 }
 
 #[tauri::command]
@@ -397,6 +446,23 @@ mod tests {
                 "kind": "profileValidation",
                 "field": "serverHost",
                 "issue": "invalidFormat"
+            })
+        );
+    }
+
+    #[test]
+    fn settings_validation_errors_preserve_stable_field_details() {
+        let error = IpcError::from(StateError::Settings(ApplicationSettingsError::Validation {
+            field: ApplicationSettingsField::SocksPort,
+            kind: ApplicationSettingsValidationKind::OutOfRange,
+        }));
+
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            serde_json::json!({
+                "kind": "settingsValidation",
+                "field": "socksPort",
+                "issue": "outOfRange"
             })
         );
     }

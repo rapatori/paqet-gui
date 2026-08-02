@@ -22,7 +22,7 @@ static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn generated_baseline_matches_pinned_golden_file() {
-    let generated = generate(&profile(), &interface(), &AdvancedSettings::default()).unwrap();
+    let generated = generate(&profile(), &interface(), 1080, &AdvancedSettings::default()).unwrap();
 
     assert_eq!(written_yaml(&generated), BASELINE);
 }
@@ -55,7 +55,7 @@ fn generated_all_overrides_matches_pinned_golden_file() {
         smux_keepalive: Some(5),
         smux_timeout: Some(15),
     };
-    let generated = generate(&profile(), &interface(), &settings).unwrap();
+    let generated = generate(&profile(), &interface(), 20_080, &settings).unwrap();
 
     assert_eq!(written_yaml(&generated), ALL_OVERRIDES);
 }
@@ -76,6 +76,14 @@ fn generated_values_remain_within_the_machine_readable_pin() {
     assert_eq!(
         baseline["socks5"][0]["listen"].as_str(),
         contract["applicationDefaults"]["socks5Listen"].as_str()
+    );
+    assert_eq!(
+        contract["applicationAcceptedValues"]["socks5BindAddress"],
+        "127.0.0.1"
+    );
+    assert_eq!(
+        contract["applicationAcceptedValues"]["socks5PortRange"],
+        serde_json::json!([1, 65_535])
     );
     assert_eq!(
         baseline["transport"]["protocol"].as_str(),

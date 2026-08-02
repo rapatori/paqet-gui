@@ -3,6 +3,7 @@ pub mod ipc;
 pub mod network;
 pub mod process;
 pub mod profiles;
+pub mod settings;
 pub mod state;
 
 use std::sync::{
@@ -34,6 +35,7 @@ pub fn run() {
             ipc::select_profile,
             ipc::refresh_interfaces,
             ipc::select_interface,
+            ipc::set_socks_port,
             ipc::replace_advanced_settings,
             ipc::connect,
             ipc::disconnect,

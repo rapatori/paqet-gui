@@ -11,6 +11,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import os from 'node:os';
+import { createServer } from 'node:net';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +45,24 @@ const permittedSecretPaths = new Set([
   'app-data/local/config.yaml',
 ]);
 let secretSentinels = [];
+
+async function availableLoopbackPort() {
+  const server = createServer();
+  server.unref();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  check(
+    address && typeof address !== 'string',
+    'Could not allocate a loopback port',
+  );
+  await new Promise((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return address.port;
+}
 
 function textSecretRepresentations(sentinel) {
   return [
@@ -799,10 +818,11 @@ async function verifyKeyboard(client, child) {
     indexes.push(descriptor.index);
   }
   check(
-    focused.length === 3 &&
+    focused.length === 4 &&
       focused[0].includes('.compact-button.secondary-button') &&
       focused[1].includes('.secondary-button') &&
-      focused[2].includes('.disclosure-button'),
+      focused[2].includes('.disclosure-button') &&
+      focused[3].includes('#socks-port'),
     `Unexpected disconnected focus cycle: ${focused.join(' -> ')}`,
   );
   check(
@@ -1392,6 +1412,7 @@ async function verifyAccessibilityShell(client) {
     ['combobox', 'Selected server profile', true],
     ['form', 'Server profile', true],
     ['button', 'Advanced', false],
+    ['textbox', 'SOCKS port', true],
     ['button', 'Connect', true],
     ['log', 'Connection logs', true],
   ];
@@ -1967,6 +1988,7 @@ async function verifySidecarWorkflows() {
     port: 9999,
     key: secretSentinels[0],
   };
+  const socksPort = await availableLoopbackPort();
   const sessions = new Set();
   const sidecarIdentities = [];
   let interrupted;
@@ -2012,7 +2034,11 @@ async function verifySidecarWorkflows() {
     webViewVersion = rejection.version.product;
     await createProfile(rejection.client, profile);
     await rejection.client.evaluate(
-      domAction(`clickButton('Connect');`),
+      domAction(`
+        const input = setInput('#socks-port', ${JSON.stringify(String(socksPort))});
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        clickButton('Connect');
+      `),
       'connect with wrong sidecar identity',
     );
     await waitForValue(
@@ -2070,7 +2096,8 @@ async function verifySidecarWorkflows() {
         return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connected' &&
           document.querySelector('.connect-button')?.textContent.trim() === 'Disconnect' &&
           log?.textContent.includes('Client started:') &&
-          log?.textContent.includes('SOCKS5 server listening on 127.0.0.1:1080');
+          document.querySelector('#socks-port')?.value === ${JSON.stringify(String(socksPort))} &&
+          log?.textContent.includes(${JSON.stringify(`SOCKS5 server listening on 127.0.0.1:${socksPort}`)});
       })()`,
       'initial real paqet connection',
     );
@@ -2231,7 +2258,7 @@ async function verifySidecarWorkflows() {
     `APP-001C identity: wrong copied SHA-256 rejected before spawn; restored sidecar verified at ${pinnedSidecarSize} bytes / ${pinnedSidecarSha256}`,
   );
   console.log(
-    'APP-001C lifecycle: real pinned paqet startup marker, SOCKS listener, requested disconnect, unexpected exit recovery, and reconnect verified',
+    'APP-001C lifecycle: persisted custom loopback SOCKS port, real pinned paqet startup marker/listener, requested disconnect, unexpected exit recovery, and reconnect verified',
   );
   console.log(
     `APP-001C close/cleanup: supervised active close confirmed; ${uniqueIdentities(sidecarIdentities).length} recorded sidecar-tree identities exited; sentinels restricted to ${permittedPaths.join(', ')}; temporary root deleted`,
@@ -2250,6 +2277,7 @@ async function verifyDisconnectedWorkflows() {
   const appData = path.join(testRoot, 'app-data');
   const fixturePath = path.join(appData, 'network-interfaces.json');
   const configPath = path.join(appData, 'local', 'config.yaml');
+  const settingsPath = path.join(appData, 'config', 'settings.json');
   const releaseGate = path.join(appData, 'release-launch-failure');
   const interfaces = [
     {
@@ -2276,6 +2304,7 @@ async function verifyDisconnectedWorkflows() {
     gatewayMac: '02:00:00:00:02:99',
   };
   const refreshedInterfaces = [interfaces[0], refreshedSecondInterface];
+  const socksPort = 20_080;
   const primary = {
     name: 'Primary',
     host: '192.0.2.80',
@@ -2446,7 +2475,52 @@ async function verifyDisconnectedWorkflows() {
       'canonical connection count',
     );
 
-    await client1.evaluate(domAction(`clickButton('Connect');`), 'connect');
+    const defaultSocksPort = await client1.evaluate(
+      `document.querySelector('#socks-port')?.value`,
+      'default SOCKS port',
+    );
+    check(
+      defaultSocksPort === '1080',
+      'Fresh SOCKS port did not default to 1080',
+    );
+    await client1.evaluate(
+      domAction(`
+        const input = setInput('#socks-port', '0');
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      `),
+      'invalid SOCKS port draft',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('#socks-port')?.getAttribute('aria-invalid') === 'true' && document.querySelector('#socks-port')?.value === '0'`,
+      'invalid SOCKS port validation',
+    );
+    sendNativeInput(launch1.child, 'zoom-in', 5);
+    await delay(500);
+    const invalidZoom = await readMetrics(client1);
+    assertNoHorizontalOverflow(invalidZoom, 'Invalid SOCKS port at 200% zoom');
+    await assertReachable(client1, '#socks-port-error', 'SOCKS port error');
+    await assertReachable(
+      client1,
+      '.connect-button',
+      'Primary connection action',
+    );
+    await assertReachable(
+      client1,
+      '[aria-label="Connection logs"]',
+      'Log surface',
+    );
+    sendNativeInput(launch1.child, 'zoom-reset');
+    await delay(300);
+    await client1.evaluate(
+      domAction(`
+        const input = setInput('#socks-port', ${JSON.stringify(String(socksPort))});
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        clickButton('Connect');
+      `),
+      'commit SOCKS port and connect',
+    );
+
     const connecting = await waitForValue(
       client1,
       `(() => {
@@ -2460,6 +2534,7 @@ async function verifyDisconnectedWorkflows() {
         const readonlyInputs = controls.filter((control) => control instanceof HTMLInputElement && control.readOnly);
         return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connecting' &&
           button?.textContent.trim() === 'Connecting…' && button.disabled &&
+          document.querySelector('#socks-port')?.disabled && document.querySelector('#socks-port')?.value === ${JSON.stringify(String(socksPort))} &&
           editableControls.length > 10 && editableControls.every((control) => control.disabled) &&
           readonlyInputs.length >= 4;
       })()`,
@@ -2468,6 +2543,7 @@ async function verifyDisconnectedWorkflows() {
     check(connecting === true, 'Configuration controls were not locked');
 
     await waitForPath(configPath, launch1.child, 'generated config.yaml');
+    await waitForPath(settingsPath, launch1.child, 'persisted settings.json');
     const generatedConfig = await readFile(configPath, 'utf8');
     check(
       generatedConfig.includes(
@@ -2484,6 +2560,7 @@ async function verifyDisconnectedWorkflows() {
         generatedConfig.includes(
           `router_mac: ${refreshedSecondInterface.gatewayMac}`,
         ) &&
+        generatedConfig.includes(`listen: 127.0.0.1:${socksPort}`) &&
         generatedConfig.includes('conn: 3'),
       'Generated configuration does not contain the selected canonical values',
     );
@@ -2506,6 +2583,7 @@ async function verifyDisconnectedWorkflows() {
           !document.querySelector('#profile-select')?.disabled &&
           !Array.from(document.querySelectorAll('.profile-toolbar button')).find((candidate) => candidate.textContent.trim() === 'Edit')?.disabled &&
           !document.querySelector('#interface-select')?.disabled &&
+          !document.querySelector('#socks-port')?.disabled && document.querySelector('#socks-port')?.value === ${JSON.stringify(String(socksPort))} &&
           !document.querySelector('#connection-count')?.disabled &&
           log?.querySelectorAll('.log-record, .log-gap').length === 0 &&
           log?.textContent.trim() === 'Connection output will appear here.';
@@ -2581,6 +2659,8 @@ async function verifyDisconnectedWorkflows() {
           countChecked: countToggle?.checked,
           countDisabled: countInput?.disabled,
           countValue: countInput?.value,
+          socksPort: document.querySelector('#socks-port')?.value,
+          socksPortDisabled: document.querySelector('#socks-port')?.disabled,
           logRecords: log?.querySelectorAll('.log-record, .log-gap').length,
           logText: log?.textContent.trim()
         };
@@ -2593,6 +2673,8 @@ async function verifyDisconnectedWorkflows() {
         restartState.countChecked === false &&
         restartState.countDisabled === true &&
         restartState.countValue === '1' &&
+        restartState.socksPort === String(socksPort) &&
+        restartState.socksPortDisabled === false &&
         restartState.logRecords === 0 &&
         restartState.logText === 'Connection output will appear here.',
       'Restart did not reset interface-independent session state',
@@ -2667,7 +2749,7 @@ async function verifyDisconnectedWorkflows() {
     'APP-001A clipboard/fonts: secure write API available (non-mutating); Space Grotesk interface and JetBrains Mono logs loaded',
   );
   console.log(
-    'APP-001B launch 1: real profile create/select/edit/delete, two-interface refresh with GUID preservation, connection-count override, Connecting locks, generated YAML, exact launch failure, editable recovery, and empty logs verified',
+    'APP-001B launch 1: real profile create/select/edit/delete, persisted global SOCKS validation/commit, two-interface refresh with GUID preservation, connection-count override, Connecting locks, generated YAML, exact launch failure, editable recovery, and empty logs verified',
   );
   console.log(
     'APP-001B launch 2: persisted selected profiles and masked updated key restored; interface selection, Advanced override, lifecycle, and logs reset verified',

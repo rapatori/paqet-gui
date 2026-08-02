@@ -151,6 +151,7 @@ export interface AppSnapshot {
   selectedProfile: Profile | null;
   interfaces: NetworkInterface[];
   selectedInterfaceGuid: string | null;
+  socksPort: number;
   advancedSettings: AdvancedSettings;
   lifecycle: LifecycleSnapshot;
 }
@@ -173,6 +174,7 @@ export type ConfigFieldName =
   | 'localAddress'
   | 'gatewayMac'
   | 'serverAddress'
+  | 'socksPort'
   | 'encryptionKey'
   | 'pcapSocketBuffer'
   | 'localTcpFlags'
@@ -209,6 +211,14 @@ export type IpcError =
   | { kind: 'profileDataUnsupported'; version: number }
   | { kind: 'profileDataInvalid' }
   | { kind: 'profileStorage' }
+  | {
+      kind: 'settingsValidation';
+      field: 'socksPort';
+      issue: ValidationIssue;
+    }
+  | { kind: 'settingsDataUnsupported'; version: number }
+  | { kind: 'settingsDataInvalid' }
+  | { kind: 'settingsStorage' }
   | { kind: 'networkDiscovery' }
   | {
       kind: 'configValidation';
