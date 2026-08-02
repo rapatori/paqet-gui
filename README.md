@@ -8,9 +8,9 @@ This project is not affiliated with or endorsed by the upstream paqet project.
 
 ## Project Status
 
-`paqet-gui` is in pre-release validation. The repository contains the functional Tauri/Svelte client: native profile persistence, Windows network discovery, deterministic paqet configuration, supervised process lifecycle and logs, typed IPC, and the accessible one-page interface are implemented and covered by automated actual-WebView workflows.
+`paqet-gui` has completed its initial Windows 11 x64 implementation and pre-release qualification. The repository contains the functional Tauri/Svelte client: native profile persistence, Windows network discovery, deterministic paqet configuration, supervised process lifecycle and logs, typed IPC, and the accessible one-page interface are implemented and covered by automated actual-WebView workflows.
 
-The release packaging configuration produces an unsigned Windows 11 x64 NSIS installer for verification. There are no published or supported binaries yet; install, launch, and uninstall qualification must complete before the first supported release.
+The release packaging configuration produces a qualified unsigned Windows 11 x64 NSIS installer. There are no published or supported binaries yet; the first supported release requires explicit publication of the qualified artifact.
 
 ## Planned V1 Scope
 
