@@ -1,16 +1,16 @@
-# paqet-gui
+# PaqetGUI
 
 [![CI](https://github.com/rapatori/paqet-gui/actions/workflows/ci.yml/badge.svg)](https://github.com/rapatori/paqet-gui/actions/workflows/ci.yml)
 
-`paqet-gui` is an independent, unofficial Windows desktop companion for the [`hanselime/paqet`](https://github.com/hanselime/paqet) client. It is intended to provide a small graphical workflow for managing server profiles, selecting a local network interface, generating a compatible client configuration, controlling the local paqet process, and viewing its output.
+PaqetGUI is an independent, unofficial Windows desktop companion for the [`hanselime/paqet`](https://github.com/hanselime/paqet) client. It is intended to provide a small graphical workflow for managing server profiles, selecting a local network interface, generating a compatible client configuration, controlling the local paqet process, and viewing its output.
 
 This project is not affiliated with or endorsed by the upstream paqet project.
 
 ## Project Status
 
-`paqet-gui` has completed its initial Windows 11 x64 implementation and pre-release qualification. The repository contains the functional Tauri/Svelte client: native profile persistence, Windows network discovery, deterministic paqet configuration, supervised process lifecycle and logs, typed IPC, and the accessible one-page interface are implemented and covered by automated actual-WebView workflows.
+PaqetGUI has completed its initial Windows 11 x64 implementation and pre-release qualification. The repository contains the functional Tauri/Svelte client: native profile persistence, Windows network discovery, deterministic paqet configuration, supervised process lifecycle and logs, typed IPC, and the accessible one-page interface are implemented and covered by automated actual-WebView workflows.
 
-The release packaging configuration produces a qualified unsigned Windows 11 x64 NSIS installer. There are no published or supported binaries yet; the first supported release requires explicit publication of the qualified artifact.
+The release packaging configuration produces an unsigned Windows 11 x64 NSIS installer. A previously qualified package is retained as historical evidence while accepted product updates are implemented and requalified. There are no published or supported binaries yet.
 
 ## Planned V1 Scope
 
@@ -38,13 +38,13 @@ Running the completed V1 application will require:
 - A present, serviced [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/consumer/). Windows 11 normally includes it, but modified, damaged, or managed systems may need to install or repair it from Microsoft's official page.
 - Connection details for a compatible remote paqet server.
 
-The `paqet-gui` installer does not embed, download, install, update, or repair WebView2. The application uses the shared Evergreen Runtime serviced by Microsoft; compatibility with every historical runtime version is not guaranteed, and no precise minimum is currently claimed. `paqet-gui` also does not install, detect, configure, or troubleshoot Npcap in V1.
+The PaqetGUI installer does not embed, download, install, update, or repair WebView2. The application uses the shared Evergreen Runtime serviced by Microsoft; compatibility with every historical runtime version is not guaranteed, and no precise minimum is currently claimed. PaqetGUI also does not install, detect, configure, or troubleshoot Npcap in V1.
 
 ### Server Setup
 
-For users who need to set up their own Linux VPS, we recommend the community-maintained [`SamNet-dev/paqctl`](https://github.com/SamNet-dev/paqctl) project. Follow its **Paqet server** setup workflow, then use `paqctl info` to obtain the server address, port, and encryption key for your `paqet-gui` profile.
+For users who need to set up their own Linux VPS, we recommend the community-maintained [`SamNet-dev/paqctl`](https://github.com/SamNet-dev/paqctl) project. Follow its **Paqet server** setup workflow, then use `paqctl info` to obtain the server address, port, and encryption key for your PaqetGUI profile.
 
-`paqctl` is an independent third-party project and also supports backends that are outside this application's scope. `paqet-gui` supports Paqet only, not GFW-Knocker. Ensure the server is running the compatible Paqet `v1.0.0-alpha.20` release documented above; do not allow an automatic upgrade to select a different version without checking the compatibility contract.
+`paqctl` is an independent third-party project and also supports backends that are outside this application's scope. PaqetGUI supports Paqet only, not GFW-Knocker. Ensure the server is running the compatible Paqet `v1.0.0-alpha.20` release documented above; do not allow an automatic upgrade to select a different version without checking the compatibility contract.
 
 ## Data And Security
 
@@ -109,6 +109,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations and pull re
 
 ## License And Notices
 
-`paqet-gui` is available under the [MIT License](LICENSE).
+PaqetGUI is available under the [MIT License](LICENSE).
 
 paqet and other third-party components remain governed by their own licenses. Attribution and the installed release-notice layout are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Complete license inventories for the pinned paqet executable, Windows Rust production graph, frontend runtime, and bundled fonts are included with the installer.

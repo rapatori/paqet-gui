@@ -375,7 +375,7 @@ async function findPage(port, child) {
       const page = pages.find((candidate) => {
         if (
           candidate.type !== 'page' ||
-          candidate.title !== 'paqet' ||
+          candidate.title !== 'PaqetGUI' ||
           typeof candidate.webSocketDebuggerUrl !== 'string'
         ) {
           return false;
@@ -1388,7 +1388,7 @@ async function verifyAccessibilityShell(client) {
   await client.send('Accessibility.enable');
   const nodes = await readAccessibilityTree(client);
   const requiredNodes = [
-    ['heading', 'paqet', true],
+    ['heading', 'PaqetGUI', true],
     ['combobox', 'Selected server profile', true],
     ['form', 'Server profile', true],
     ['button', 'Advanced', false],
@@ -1516,7 +1516,7 @@ async function verifyDialogAccessibility(client, child, expected) {
   );
   check(
     [
-      ['heading', 'paqet'],
+      ['heading', 'PaqetGUI'],
       ['form', 'Server profile'],
       ['button', 'Connect'],
       ['log', 'Connection logs'],

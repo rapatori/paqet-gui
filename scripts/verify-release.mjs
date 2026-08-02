@@ -16,7 +16,7 @@ const installer = path.join(
   release,
   'bundle',
   'nsis',
-  'paqet_0.1.0_x64-setup.exe',
+  'PaqetGUI_0.1.0_x64-setup.exe',
 );
 const generatedScript = path.join(release, 'nsis', 'x64', 'installer.nsi');
 
@@ -67,8 +67,56 @@ export function verifyWebviewConfiguration(config) {
   );
 }
 
+export function verifyProductIdentity(config) {
+  assert(
+    config.productName === 'PaqetGUI',
+    'Release product name must be PaqetGUI',
+  );
+  assert(
+    config.app?.windows?.length === 1 &&
+      config.app.windows[0]?.label === 'main' &&
+      config.app.windows[0]?.title === 'PaqetGUI',
+    'Main window title must be PaqetGUI',
+  );
+  assert(
+    config.bundle?.shortDescription ===
+      'PaqetGUI is a lightweight Windows desktop client for paqet',
+    'Release description must identify PaqetGUI',
+  );
+  assert(
+    config.identifier === 'io.github.rapatori.paqet-gui',
+    'Technical bundle identifier must remain stable',
+  );
+}
+
 function nsisDefinition(script, name) {
   return script.match(new RegExp(`^!define ${name} "([^"]*)"$`, 'm'))?.[1];
+}
+
+export function verifyGeneratedProductIdentity(script) {
+  assert(
+    nsisDefinition(script, 'PRODUCTNAME') === 'PaqetGUI',
+    'Generated NSIS product name must be PaqetGUI',
+  );
+  assert(
+    nsisDefinition(script, 'MAINBINARYNAME') === 'paqet-gui',
+    'Generated NSIS main binary name must remain paqet-gui',
+  );
+  assert(
+    nsisDefinition(script, 'BUNDLEID') === 'io.github.rapatori.paqet-gui',
+    'Generated NSIS bundle identifier must remain stable',
+  );
+  for (const declaration of [
+    'VIAddVersionKey "ProductName" "${PRODUCTNAME}"',
+    'VIAddVersionKey "FileDescription" "${PRODUCTNAME}"',
+    'WriteRegStr SHCTX "${UNINSTKEY}" "DisplayName" "${PRODUCTNAME}"',
+    'CreateShortcut "$SMPROGRAMS\\${PRODUCTNAME}.lnk" "$INSTDIR\\${MAINBINARYNAME}.exe"',
+  ]) {
+    assert(
+      script.includes(declaration),
+      `Generated NSIS identity declaration is missing: ${declaration}`,
+    );
+  }
 }
 
 export function verifyGeneratedWebviewConfiguration(script) {
@@ -107,6 +155,27 @@ async function assertSameFile(expected, actual, label) {
   assert(
     (await sha256File(actual)) === (await sha256File(expected)),
     `Extracted ${label} does not match its release input`,
+  );
+}
+
+async function readWindowsVersionInfo(file) {
+  const command = `$info = (Get-Item -LiteralPath '${file.replaceAll("'", "''")}').VersionInfo; @{ FileDescription = $info.FileDescription; ProductName = $info.ProductName } | ConvertTo-Json -Compress`;
+  return JSON.parse(
+    (
+      await run('powershell.exe', ['-NoProfile', '-Command', command])
+    ).stdout.trim(),
+  );
+}
+
+async function assertWindowsProductIdentity(file, label) {
+  const info = await readWindowsVersionInfo(file);
+  assert(
+    info.ProductName === 'PaqetGUI',
+    `${label} Windows ProductName must be PaqetGUI`,
+  );
+  assert(
+    info.FileDescription === 'PaqetGUI',
+    `${label} Windows FileDescription must be PaqetGUI`,
   );
 }
 
@@ -168,6 +237,7 @@ async function verifyConfiguration() {
     JSON.stringify(config.bundle?.targets) === JSON.stringify(['nsis']),
     'Release bundle target must be NSIS only',
   );
+  verifyProductIdentity(config);
   verifyWebviewConfiguration(config);
   assert(
     config.bundle?.windows?.nsis?.installMode === 'currentUser',
@@ -297,6 +367,7 @@ async function verifyArtifact() {
   try {
     await run(path7z, ['x', '-y', `-o${extraction}`, installer]);
     const script = await readFile(generatedScript, 'utf8');
+    verifyGeneratedProductIdentity(script);
     verifyGeneratedWebviewConfiguration(script);
     const declarations = [
       '!define ARCH "x64"',
@@ -353,6 +424,11 @@ async function verifyArtifact() {
     await assertPackagedApplication(
       path.join(release, 'paqet-gui.exe'),
       path.join(extraction, 'paqet-gui.exe'),
+    );
+    await assertWindowsProductIdentity(installer, 'Installer');
+    await assertWindowsProductIdentity(
+      path.join(extraction, 'paqet-gui.exe'),
+      'Packaged application',
     );
     const extractedPaths = (await readdir(extraction, { recursive: true }))
       .map((entry) => entry.toString())

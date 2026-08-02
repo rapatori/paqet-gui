@@ -1,7 +1,7 @@
 [package]
 name = "paqet-gui"
 version = "0.1.0"
-description = "A lightweight Windows desktop client for paqet"
+description = "PaqetGUI is a lightweight Windows desktop client for paqet"
 authors = ["paqet-gui contributors"]
 edition = "2024"
 license = "MIT"

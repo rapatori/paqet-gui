@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "paqet",
+  "productName": "PaqetGUI",
   "version": "0.1.0",
   "identifier": "io.github.rapatori.paqet-gui",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "paqet",
+        "title": "PaqetGUI",
         "width": 440,
         "height": 760,
         "minWidth": 320,
@@ -40,7 +40,7 @@
     "homepage": "https://github.com/rapatori/paqet-gui",
     "copyright": "Copyright (c) 2026 paqet-gui contributors",
     "licenseFile": "../LICENSE",
-    "shortDescription": "A lightweight Windows desktop client for paqet",
+    "shortDescription": "PaqetGUI is a lightweight Windows desktop client for paqet",
     "icon": ["icons/icon.ico"],
     "resources": {
       "../LICENSE": "licenses/PAQET_GUI_LICENSE.txt",

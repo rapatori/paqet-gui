@@ -14,5 +14,5 @@ fn main() {
             "subscribe_runtime_events",
         ]),
     ))
-    .expect("failed to build paqet");
+    .expect("failed to build PaqetGUI");
 }

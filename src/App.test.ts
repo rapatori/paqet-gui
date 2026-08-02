@@ -205,7 +205,7 @@ describe('application shell', () => {
 
     expect(api.getAppSnapshot).toHaveBeenCalledOnce();
     expect(
-      screen.getByRole('heading', { level: 1, name: 'paqet' }),
+      screen.getByRole('heading', { level: 1, name: 'PaqetGUI' }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText('Connection status')).toHaveTextContent(
       'Disconnected',

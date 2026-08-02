@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-`paqet-gui` is in early development and has not published a supported release. The current source tree receives security fixes on a best-effort basis. No binary or installer should currently be treated as production-ready.
+PaqetGUI is in early development and has not published a supported release. The current source tree receives security fixes on a best-effort basis. No binary or installer should currently be treated as production-ready.
 
 This policy will be updated with explicit supported release lines before the first public release.
 

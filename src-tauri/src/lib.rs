@@ -15,7 +15,7 @@ use tauri::{Manager, RunEvent, WindowEvent};
 use ipc::IpcError;
 use state::AppState;
 
-pub const APP_NAME: &str = "paqet";
+pub const APP_NAME: &str = "PaqetGUI";
 pub const MAIN_WINDOW_LABEL: &str = "main";
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -73,7 +73,7 @@ pub fn run() {
             }
         })
         .build(tauri::generate_context!())
-        .expect("failed to build paqet");
+        .expect("failed to build PaqetGUI");
     let shutdown_started = Arc::new(AtomicBool::new(false));
     app.run(move |handle, event| {
         let RunEvent::ExitRequested { api, .. } = event else {
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn application_name_is_stable() {
-        assert_eq!(APP_NAME, "paqet");
+        assert_eq!(APP_NAME, "PaqetGUI");
         assert_eq!(MAIN_WINDOW_LABEL, "main");
     }
 }

@@ -1,6 +1,6 @@
 # Contributing
 
-Thank you for considering a contribution to `paqet-gui`. The project is an early-stage, Windows-only desktop companion for a pinned paqet client release. Changes should preserve that deliberately narrow boundary unless an issue or maintainer discussion explicitly expands it.
+Thank you for considering a contribution to PaqetGUI. The project is an early-stage, Windows-only desktop companion for a pinned paqet client release. Changes should preserve that deliberately narrow boundary unless an issue or maintainer discussion explicitly expands it.
 
 ## Before Starting
 

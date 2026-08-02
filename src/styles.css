@@ -1006,6 +1006,11 @@ input[aria-invalid='true'] {
     padding: 8px;
   }
 
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
   .configuration,
   .connection {
     padding-right: 9px;

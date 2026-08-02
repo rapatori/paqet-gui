@@ -2,7 +2,7 @@
 
 ## paqet
 
-`paqet-gui` is an independent, unofficial companion for the `paqet` project. It is not affiliated with or endorsed by the upstream project.
+PaqetGUI is an independent, unofficial companion for the `paqet` project. It is not affiliated with or endorsed by the upstream project.
 
 - Project: `hanselime/paqet`
 - Source: <https://github.com/hanselime/paqet>
@@ -45,7 +45,7 @@ The Windows application and local frontend assets include open-source runtime de
 - `licenses/RUST_THIRD_PARTY_LICENSES.txt` is generated from the locked `x86_64-pc-windows-msvc` production dependency graph. Build-only and test-only crates are excluded.
 - `licenses/FRONTEND_THIRD_PARTY_LICENSES.txt` covers the Svelte and Tauri API code included in the production frontend bundle. Build, lint, and test-only npm packages are excluded.
 
-The application uses the separately installed Microsoft Edge WebView2 Evergreen Runtime. The `paqet-gui` installer does not redistribute, download, install, update, or repair WebView2. WebView2 remains Microsoft software under Microsoft's terms and is serviced independently from `paqet-gui`; Microsoft's official runtime download and repair page is <https://developer.microsoft.com/microsoft-edge/webview2/consumer/>.
+The application uses the separately installed Microsoft Edge WebView2 Evergreen Runtime. The PaqetGUI installer does not redistribute, download, install, update, or repair WebView2. WebView2 remains Microsoft software under Microsoft's terms and is serviced independently from PaqetGUI; Microsoft's official runtime download and repair page is <https://developer.microsoft.com/microsoft-edge/webview2/consumer/>.
 
 ## Bundled Fonts
 

@@ -323,7 +323,7 @@
       applySnapshot(await api.getAppSnapshot(), true, 'all');
     } catch {
       message =
-        'The application state could not be loaded. Restart paqet and try again.';
+        'The application state could not be loaded. Restart PaqetGUI and try again.';
     } finally {
       loading = false;
     }
@@ -376,7 +376,7 @@
     } catch {
       runtimeReady = false;
       connectionMessage =
-        'Live connection state is unavailable. Restart paqet and try again.';
+        'Live connection state is unavailable. Restart PaqetGUI and try again.';
     }
   }
 
@@ -387,7 +387,7 @@
     } catch {
       closeReady = false;
       connectionMessage =
-        'Window-close confirmation is unavailable. Restart paqet and try again.';
+        'Window-close confirmation is unavailable. Restart PaqetGUI and try again.';
     }
   }
 
@@ -2186,7 +2186,7 @@
 <svelte:head>
   <meta
     name="description"
-    content="A lightweight Windows desktop client for paqet."
+    content="PaqetGUI is a lightweight Windows desktop client for paqet."
   />
 </svelte:head>
 
@@ -2198,7 +2198,7 @@
   <header class="topbar">
     <div class="wordmark">
       <span class="wordmark-mark" aria-hidden="true"></span>
-      <h1>paqet</h1>
+      <h1>PaqetGUI</h1>
     </div>
     <p
       class:status-failed={statusLabel === 'Failed'}
