@@ -35,10 +35,10 @@ Running the completed V1 application will require:
 
 - Windows 11 x64.
 - [Npcap](https://npcap.com/) installed separately.
-- Microsoft Edge WebView2 Runtime. The offline-capable installer embeds Microsoft's Evergreen standalone installer and runs it when the runtime is absent.
+- A present, serviced [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/consumer/). Windows 11 normally includes it, but modified, damaged, or managed systems may need to install or repair it from Microsoft's official page.
 - Connection details for a compatible remote paqet server.
 
-`paqet-gui` does not install, detect, configure, or troubleshoot Npcap in V1.
+The `paqet-gui` installer does not embed, download, install, update, or repair WebView2. The application uses the shared Evergreen Runtime serviced by Microsoft; compatibility with every historical runtime version is not guaranteed, and no precise minimum is currently claimed. `paqet-gui` also does not install, detect, configure, or troubleshoot Npcap in V1.
 
 ### Server Setup
 
@@ -59,7 +59,7 @@ Development and validation currently run on Windows with:
 - Node.js `24.16.x` and npm `12.0.1`.
 - Rust `1.97.0` with the `x86_64-pc-windows-msvc` target, `rustfmt`, and Clippy. The repository's `rust-toolchain.toml` installs these through rustup.
 - Microsoft C++ Build Tools and the Windows SDK required by Tauri.
-- Microsoft Edge WebView2 Runtime for launching the desktop shell.
+- A present, serviced [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/consumer/) for launching the desktop shell.
 
 Install the locked frontend dependencies:
 

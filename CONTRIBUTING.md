@@ -19,7 +19,7 @@ Development is supported on Windows 11 x64. Install:
 - Node.js `24.16.x` and npm `12.0.1`.
 - [rustup](https://rustup.rs/). The repository pins Rust `1.97.0`, the MSVC target, `rustfmt`, and Clippy in `rust-toolchain.toml`.
 - Microsoft C++ Build Tools and the Windows SDK required by Tauri.
-- Microsoft Edge WebView2 Runtime.
+- A present, serviced [Microsoft Edge WebView2 Evergreen Runtime](https://developer.microsoft.com/microsoft-edge/webview2/consumer/). Windows 11 normally includes it; use Microsoft's official page to install or repair a missing, damaged, or stale runtime.
 
 Install locked frontend dependencies with:
 
@@ -68,7 +68,7 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --featu
 npm.cmd run tauri -- build --debug --no-bundle
 ```
 
-Release packaging additionally requires the checksum-pinned paqet sidecar and `cargo-about 0.8.4`. Use the documented commands in [README.md](README.md); do not publish an installer until its separate install, launch, and uninstall qualification is complete.
+Release packaging additionally requires the checksum-pinned paqet sidecar and `cargo-about 0.8.4`. Use the documented commands in [README.md](README.md). The package must leave WebView2 to Microsoft's separate Evergreen servicing: do not add an embedded, downloaded, installed, updated, or repaired runtime path, or claim a precise minimum version without compatibility evidence. Do not publish an installer until its separate install, launch, and uninstall qualification is complete.
 
 Pull requests should explain the user-visible or technical problem, the chosen solution, relevant security or compatibility implications, and the exact validation performed. CI must pass before merge.
 

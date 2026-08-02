@@ -55,7 +55,7 @@
     "windows": {
       "allowDowngrades": false,
       "webviewInstallMode": {
-        "type": "offlineInstaller"
+        "type": "skip"
       },
       "nsis": {
         "compression": "lzma",

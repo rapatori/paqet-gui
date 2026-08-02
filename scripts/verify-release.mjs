@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
-import { mkdir, readFile, rm, stat } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -53,6 +53,54 @@ async function run(command, arguments_, options = {}) {
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+export function verifyWebviewConfiguration(config) {
+  const windows = config.bundle?.windows;
+  assert(
+    windows?.webviewInstallMode?.type === 'skip',
+    'Release installer must skip WebView2 deployment',
+  );
+  assert(
+    !Object.hasOwn(windows, 'minimumWebview2Version'),
+    'Release installer must not configure a minimum WebView2 update path',
+  );
+}
+
+function nsisDefinition(script, name) {
+  return script.match(new RegExp(`^!define ${name} "([^"]*)"$`, 'm'))?.[1];
+}
+
+export function verifyGeneratedWebviewConfiguration(script) {
+  assert(
+    nsisDefinition(script, 'INSTALLWEBVIEW2MODE') === '',
+    'Generated NSIS script must render skip mode as no WebView2 deployment mode',
+  );
+  assert(
+    nsisDefinition(script, 'MINIMUMWEBVIEW2VERSION') === '',
+    'Generated NSIS script must not configure a minimum WebView2 update',
+  );
+  for (const name of [
+    'WEBVIEW2BOOTSTRAPPERPATH',
+    'WEBVIEW2INSTALLERPATH',
+    'WEBVIEW2FIXEDRUNTIMEPATH',
+  ]) {
+    const value = nsisDefinition(script, name);
+    assert(
+      value === undefined || value === '',
+      `Generated NSIS script has an active WebView2 deployment input: ${name}`,
+    );
+  }
+}
+
+export function verifyNoWebviewPayload(relativePaths) {
+  const webviewPayload = relativePaths.find((relative) =>
+    /(?:webview2|msedgewebview|embeddedbrowserwebview)/i.test(relative),
+  );
+  assert(
+    webviewPayload === undefined,
+    `Release payload contains WebView2 deployment content: ${webviewPayload}`,
+  );
 }
 
 async function assertSameFile(expected, actual, label) {
@@ -120,10 +168,7 @@ async function verifyConfiguration() {
     JSON.stringify(config.bundle?.targets) === JSON.stringify(['nsis']),
     'Release bundle target must be NSIS only',
   );
-  assert(
-    config.bundle?.windows?.webviewInstallMode?.type === 'offlineInstaller',
-    'Release installer must embed offline Evergreen WebView2 support',
-  );
+  verifyWebviewConfiguration(config);
   assert(
     config.bundle?.windows?.nsis?.installMode === 'currentUser',
     'NSIS installer must use current-user mode',
@@ -252,17 +297,16 @@ async function verifyArtifact() {
   try {
     await run(path7z, ['x', '-y', `-o${extraction}`, installer]);
     const script = await readFile(generatedScript, 'utf8');
+    verifyGeneratedWebviewConfiguration(script);
     const declarations = [
       '!define ARCH "x64"',
       '!define INSTALLMODE "currentUser"',
-      '!define INSTALLWEBVIEW2MODE "offlineInstaller"',
       '!define ALLOWDOWNGRADES "false"',
       'File /a "/oname=paqet_windows_amd64.exe"',
       'File /a "/oname=licenses\\PAQET_GUI_LICENSE.txt"',
       'File /a "/oname=licenses\\PAQET_THIRD_PARTY_LICENSES.txt"',
       'File /a "/oname=licenses\\RUST_THIRD_PARTY_LICENSES.txt"',
       'File /a "/oname=licenses\\FRONTEND_THIRD_PARTY_LICENSES.txt"',
-      'File "/oname=$TEMP\\MicrosoftEdgeWebView2RuntimeInstaller.exe"',
     ];
     for (const declaration of declarations) {
       assert(
@@ -310,21 +354,10 @@ async function verifyArtifact() {
       path.join(release, 'paqet-gui.exe'),
       path.join(extraction, 'paqet-gui.exe'),
     );
-
-    const webviewPath = script.match(
-      /^!define WEBVIEW2INSTALLERPATH "([^"]+)"$/m,
-    )?.[1];
-    assert(webviewPath, 'Generated NSIS script has no offline WebView2 input');
-    const extractedWebview = path.join(
-      extraction,
-      '$TEMP',
-      'MicrosoftEdgeWebView2RuntimeInstaller.exe',
-    );
-    await assertSameFile(
-      webviewPath,
-      extractedWebview,
-      'offline WebView2 installer',
-    );
+    const extractedPaths = (await readdir(extraction, { recursive: true }))
+      .map((entry) => entry.toString())
+      .sort();
+    verifyNoWebviewPayload(extractedPaths);
 
     const expectedSidecarHash = await sha256File(
       path.join(
@@ -335,7 +368,6 @@ async function verifyArtifact() {
       ),
     );
     const installerMetadata = await stat(installer);
-    const webviewMetadata = await stat(extractedWebview);
     const signature = await run('powershell.exe', [
       '-NoProfile',
       '-Command',
@@ -350,10 +382,7 @@ async function verifyArtifact() {
     console.log(`SHA-256: ${await sha256File(installer)}`);
     console.log('Authenticode: NotSigned');
     console.log(`Sidecar SHA-256: ${expectedSidecarHash}`);
-    console.log(`Offline WebView2 payload: ${webviewMetadata.size} bytes`);
-    console.log(
-      `Offline WebView2 SHA-256: ${await sha256File(extractedWebview)}`,
-    );
+    console.log('WebView2 deployment: skipped; no payload');
     console.log('Release payload: source-identical');
   } finally {
     await rm(extraction, { recursive: true, force: true });
