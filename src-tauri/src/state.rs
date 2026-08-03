@@ -826,7 +826,7 @@ impl AppState {
         if state.shutdown_requested {
             return Ok(WindowCloseDecision::Shutdown);
         }
-        if state.lifecycle.settings_editable() {
+        if state.lifecycle.settings_editable() && state.close_subscriber.is_none() {
             state.shutdown_requested = true;
             state.pending_close_request_id = None;
             return Ok(WindowCloseDecision::Allow);
@@ -1853,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn window_close_requires_confirmation_only_while_state_is_locked() {
+    fn subscribed_window_close_is_frontend_coordinated_in_every_lifecycle() {
         let directory = TestDirectory::new();
         let factory = Arc::new(FakeRuntimeFactory::default());
         let disconnected = runtime_state(&directory, vec![valid_interface()], Arc::clone(&factory));
@@ -1876,7 +1876,6 @@ mod tests {
         state
             .create_profile(draft("Existing", "existing-key"))
             .unwrap();
-        state.connect().unwrap();
         let received = Arc::new(Mutex::new(Vec::<WindowCloseRequest>::new()));
         let target = Arc::clone(&received);
         state
@@ -1886,13 +1885,25 @@ mod tests {
             }))
             .unwrap();
 
+        let WindowCloseDecision::Confirm(disconnected_request) =
+            state.request_window_close().unwrap()
+        else {
+            panic!("a subscribed disconnected window must coordinate frontend close");
+        };
+        assert!(disconnected_request.lifecycle.settings_editable);
+        state
+            .cancel_window_close(disconnected_request.request_id)
+            .unwrap();
+        received.lock().unwrap().clear();
+        state.connect().unwrap();
+
         let first = state.request_window_close().unwrap();
         let repeated = state.request_window_close().unwrap();
         assert_eq!(first, repeated);
         let WindowCloseDecision::Confirm(request) = first else {
             panic!("a running process must require close confirmation");
         };
-        assert_eq!(request.request_id, 1);
+        assert_eq!(request.request_id, 2);
         assert_eq!(request.lifecycle.process, ProcessPresence::Running);
         assert_eq!(received.lock().unwrap().as_slice(), &[request, request]);
 
@@ -1904,7 +1915,7 @@ mod tests {
         let WindowCloseDecision::Confirm(retried) = state.request_window_close().unwrap() else {
             panic!("a running process must require close confirmation");
         };
-        assert_eq!(retried.request_id, 2);
+        assert_eq!(retried.request_id, 3);
         assert!(matches!(
             state.confirm_window_close(request.request_id),
             Err(StateError::CommandConflict)
@@ -2043,10 +2054,11 @@ mod tests {
             snapshot.lifecycle.process == ProcessPresence::Absent
         });
 
-        assert_eq!(
-            state.request_window_close().unwrap(),
-            WindowCloseDecision::Allow
-        );
+        let WindowCloseDecision::Confirm(retried) = state.request_window_close().unwrap() else {
+            panic!("a subscribed disconnected window must receive a fresh close request");
+        };
+        assert_eq!(retried.request_id, request.request_id + 1);
+        assert!(retried.lifecycle.settings_editable);
         assert!(matches!(
             state.confirm_window_close(request.request_id),
             Err(StateError::CommandConflict)

@@ -177,7 +177,7 @@ async function waitForValue(
 
 function domAction(body) {
   return `(() => {
-    const findButton = (label, root = document) => Array.from(root.querySelectorAll('button')).find((button) => button.textContent.trim() === label);
+    const findButton = (label, root = document) => Array.from(root.querySelectorAll('button')).find((button) => button.textContent.trim() === label || button.getAttribute('aria-label') === label);
     const setInput = (selector, value) => {
       const input = document.querySelector(selector);
       if (!(input instanceof HTMLInputElement)) throw new Error('Missing input ' + selector);
@@ -207,12 +207,27 @@ function domAction(body) {
 
 async function createProfile(client, profile) {
   await client.evaluate(
-    domAction(`clickButton('New');`),
-    'open new profile editor',
+    `(() => {
+      if (document.querySelector('.server-management')) return true;
+      const summary = document.querySelector('.server-summary');
+      summary?.focus();
+      summary?.click();
+      return false;
+    })()`,
+    'open server management',
   );
   await waitForValue(
     client,
-    `document.querySelector('.profile-form button[type="submit"]')?.textContent.trim() === 'Save profile'`,
+    `document.querySelector('.server-management')`,
+    'server management',
+  );
+  await client.evaluate(
+    domAction(`clickButton('Add server');`),
+    'open new server editor',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('.profile-form button[type="submit"]')?.textContent.trim() === 'Save profile' && document.activeElement?.id === 'profile-name'`,
     'new profile editor',
   );
   await client.evaluate(
@@ -228,9 +243,7 @@ async function createProfile(client, profile) {
   await waitForValue(
     client,
     `(() => {
-      const select = document.querySelector('#profile-select');
-      return select instanceof HTMLSelectElement &&
-        Array.from(select.options).some((option) => option.textContent.trim() === ${JSON.stringify(profile.name)}) &&
+      return Array.from(document.querySelectorAll('.server-card-copy strong')).some((element) => element.textContent.trim() === ${JSON.stringify(profile.name)}) &&
         !document.querySelector('.profile-form button[type="submit"]');
     })()`,
     `${profile.name} canonical profile`,
@@ -239,24 +252,45 @@ async function createProfile(client, profile) {
 
 async function selectProfileByName(client, name) {
   await client.evaluate(
+    `document.querySelector('.server-management') ? true : document.querySelector('.server-summary')?.click()`,
+    'open server management for selection',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('.server-management')`,
+    'server management selection',
+  );
+  await client.evaluate(
     domAction(`
-      const select = document.querySelector('#profile-select');
-      const option = Array.from(select.options).find((candidate) => candidate.textContent.trim() === ${JSON.stringify(name)});
-      if (!option) throw new Error('Missing profile option');
-      setSelect('#profile-select', option.value);
+      const card = Array.from(document.querySelectorAll('.server-card')).find((candidate) => candidate.querySelector('strong')?.textContent.trim() === ${JSON.stringify(name)});
+      const button = card?.querySelector('.server-card-select');
+      if (!(button instanceof HTMLButtonElement)) throw new Error('Missing server card');
+      button.click();
     `),
     `select ${name} profile`,
   );
   await waitForValue(
     client,
-    `document.querySelector('#profile-name')?.value === ${JSON.stringify(name)}`,
+    `document.querySelector('.server-summary-copy strong')?.textContent.trim() === ${JSON.stringify(name)} && !document.querySelector('.server-management')`,
     `${name} profile selection`,
   );
 }
 
 async function editSelectedProfile(client, profile) {
   await client.evaluate(
-    domAction(`clickButton('Edit');`),
+    `document.querySelector('.server-summary')?.click()`,
+    'open server management for edit',
+  );
+  await waitForValue(
+    client,
+    `document.querySelector('.server-management')`,
+    'server management edit',
+  );
+  await client.evaluate(
+    domAction(`
+      const selectedName = document.querySelector('.selected-server strong')?.textContent.trim();
+      clickButton('Edit ' + selectedName);
+    `),
     'open profile editor',
   );
   await waitForValue(
@@ -277,9 +311,7 @@ async function editSelectedProfile(client, profile) {
   await waitForValue(
     client,
     `(() => {
-      const select = document.querySelector('#profile-select');
-      return document.querySelector('#profile-name')?.value === ${JSON.stringify(profile.name)} &&
-        select?.selectedOptions[0]?.textContent.trim() === ${JSON.stringify(profile.name)} &&
+      return Array.from(document.querySelectorAll('.server-card-copy strong')).some((element) => element.textContent.trim() === ${JSON.stringify(profile.name)}) &&
         !document.querySelector('.profile-form button[type="submit"]');
     })()`,
     'updated profile canonical UI',
@@ -288,16 +320,16 @@ async function editSelectedProfile(client, profile) {
 
 async function deleteSelectedProfile(client, name) {
   await client.evaluate(
-    domAction(`clickButton('Edit');`),
-    'open delete editor',
+    `document.querySelector('.server-management') ? true : document.querySelector('.server-summary')?.click()`,
+    'open server management for deletion',
   );
   await waitForValue(
     client,
-    `document.querySelector('.profile-form button[type="submit"]')?.textContent.trim() === 'Save changes'`,
-    'delete profile editor',
+    `document.querySelector('.server-management')`,
+    'server management deletion',
   );
   await client.evaluate(
-    domAction(`clickButton('Delete profile');`),
+    domAction(`clickButton(${JSON.stringify(`Delete ${name}`)});`),
     'request profile deletion',
   );
   await waitForValue(
@@ -314,9 +346,7 @@ async function deleteSelectedProfile(client, name) {
   await waitForValue(
     client,
     `(() => {
-      const select = document.querySelector('#profile-select');
-      return select instanceof HTMLSelectElement &&
-        !Array.from(select.options).some((option) => option.textContent.trim() === ${JSON.stringify(name)}) &&
+      return !Array.from(document.querySelectorAll('.server-card-copy strong')).some((element) => element.textContent.trim() === ${JSON.stringify(name)}) &&
         !document.querySelector('.dialog');
     })()`,
     'deleted profile removal',
@@ -325,16 +355,10 @@ async function deleteSelectedProfile(client, name) {
 
 function profileViewExpression() {
   return `(() => {
-    const select = document.querySelector('#profile-select');
-    const key = document.querySelector('#encryption-key');
     return {
-      names: select instanceof HTMLSelectElement ? Array.from(select.options).map((option) => option.textContent.trim()) : [],
-      selectedName: select?.selectedOptions[0]?.textContent.trim() ?? '',
-      name: document.querySelector('#profile-name')?.value ?? '',
-      host: document.querySelector('#server-host')?.value ?? '',
-      port: document.querySelector('#server-port')?.value ?? '',
-      keyType: key?.type ?? '',
-      keyLength: key?.value?.length ?? 0
+      names: Array.from(document.querySelectorAll('.server-card-copy strong')).map((element) => element.textContent.trim()),
+      selectedName: document.querySelector('.selected-server strong')?.textContent.trim() ?? document.querySelector('.server-summary-copy strong')?.textContent.trim() ?? '',
+      keyOnMain: Boolean(document.querySelector('#encryption-key'))
     };
   })()`;
 }
@@ -762,6 +786,24 @@ function sendNativeInput(child, mode, count = 1) {
   return result.stdout.trim();
 }
 
+function retryNativeInput(child, mode, count = 1) {
+  let lastError;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return sendNativeInput(child, mode, count);
+    } catch (error) {
+      lastError = error;
+      spawnSync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        'Start-Sleep -Milliseconds 200',
+      ]);
+    }
+  }
+  throw lastError;
+}
+
 async function verifyKeyboard(client, child) {
   await client.evaluate(
     `(() => {
@@ -818,11 +860,10 @@ async function verifyKeyboard(client, child) {
     indexes.push(descriptor.index);
   }
   check(
-    focused.length === 4 &&
-      focused[0].includes('.compact-button.secondary-button') &&
-      focused[1].includes('.secondary-button') &&
-      focused[2].includes('.disclosure-button') &&
-      focused[3].includes('#socks-port'),
+    focused.length === 3 &&
+      focused[0].includes('.server-summary') &&
+      focused[1].includes('.disclosure-button') &&
+      focused[2].includes('#socks-port'),
     `Unexpected disconnected focus cycle: ${focused.join(' -> ')}`,
   );
   check(
@@ -1409,8 +1450,7 @@ async function verifyAccessibilityShell(client) {
   const nodes = await readAccessibilityTree(client);
   const requiredNodes = [
     ['heading', 'PaqetGUI', true],
-    ['combobox', 'Selected server profile', true],
-    ['form', 'Server profile', true],
+    ['button', 'Manage servers.', false],
     ['button', 'Advanced', false],
     ['textbox', 'SOCKS port', true],
     ['button', 'Connect', true],
@@ -1493,6 +1533,7 @@ async function verifyEmulatedPreferences(client, child) {
       const style = element instanceof HTMLElement ? getComputedStyle(element) : null;
       return {
         text: element?.textContent?.trim() ?? '',
+        classes: Array.from(element?.classList ?? []),
         outlineWidth: style ? Number.parseFloat(style.outlineWidth) || 0 : 0,
         outlineStyle: style?.outlineStyle ?? 'none'
       };
@@ -1500,7 +1541,7 @@ async function verifyEmulatedPreferences(client, child) {
     'forced-colors focus ring',
   );
   check(
-    focus.text === 'New' &&
+    focus.classes.includes('server-summary') &&
       focus.outlineWidth >= 2 &&
       focus.outlineStyle !== 'none',
     'Forced-colors keyboard focus ring is missing or out of order',
@@ -1538,7 +1579,7 @@ async function verifyDialogAccessibility(client, child, expected) {
   check(
     [
       ['heading', 'PaqetGUI'],
-      ['form', 'Server profile'],
+      ['region', 'Servers'],
       ['button', 'Connect'],
       ['log', 'Connection logs'],
     ].every(([role, name]) => !findAxNode(nodes, role, name)),
@@ -1599,29 +1640,29 @@ async function verifyDialogAccessibility(client, child, expected) {
 
 async function verifyDeleteDialog(client, child) {
   await client.evaluate(
-    domAction(`clickButton('Edit');`),
-    'open profile editor for delete dialog',
+    `document.querySelector('.server-summary')?.click()`,
+    'open server management for delete dialog',
   );
   await waitForValue(
     client,
-    `document.activeElement?.id === 'profile-name' && Array.from(document.querySelectorAll('.profile-form button')).some((button) => button.textContent.trim() === 'Delete profile')`,
-    'profile editor delete action',
+    `document.querySelector('.server-management')`,
+    'server management delete dialog',
   );
   await client.evaluate(
     domAction(`
-      const button = findButton('Delete profile');
-      if (!(button instanceof HTMLButtonElement)) throw new Error('Missing button Delete profile');
+      const button = findButton('Delete Accessibility fixture');
+      if (!(button instanceof HTMLButtonElement)) throw new Error('Missing delete action');
       button.focus();
     `),
     'focus delete dialog invoker',
   );
   await waitForValue(
     client,
-    `document.activeElement?.textContent.trim() === 'Delete profile'`,
+    `document.activeElement?.getAttribute('aria-label') === 'Delete Accessibility fixture'`,
     'focused delete dialog invoker',
   );
   await client.evaluate(
-    domAction(`clickButton('Delete profile');`),
+    domAction(`clickButton('Delete Accessibility fixture');`),
     'open delete dialog',
   );
   await verifyDialogAccessibility(client, child, {
@@ -1631,12 +1672,12 @@ async function verifyDeleteDialog(client, child) {
     initialFocus: 'Delete profile',
     label: 'Delete profile',
     last: 'Delete profile',
-    returnFocus: '.profile-form .danger-button',
+    returnFocus: '.delete-icon-button',
     title: 'Delete “Accessibility fixture”?',
   });
   await client.evaluate(
-    domAction(`clickButton('Cancel');`),
-    'leave profile editor',
+    domAction(`clickButton('Back to connection');`),
+    'leave server management',
   );
 }
 
@@ -1789,6 +1830,15 @@ async function verifyAccessibilityWorkflows(destructiveClipboard) {
       name: 'Accessibility fixture',
       port: 4901,
     });
+    await session.client.evaluate(
+      domAction(`clickButton('Back to connection');`),
+      'return to accessibility connection view',
+    );
+    await waitForValue(
+      session.client,
+      `document.querySelector('.server-summary') && !document.querySelector('.server-management')`,
+      'accessibility connection view',
+    );
     await verifyAccessibilityShell(session.client);
     await verifyDeleteDialog(session.client, session.child);
     await verifyUnsafeBlockDialog(session.client, session.child);
@@ -2034,6 +2084,15 @@ async function verifySidecarWorkflows() {
     webViewVersion = rejection.version.product;
     await createProfile(rejection.client, profile);
     await rejection.client.evaluate(
+      domAction(`clickButton('Back to connection');`),
+      'return from rejected sidecar server setup',
+    );
+    await waitForValue(
+      rejection.client,
+      `document.querySelector('#socks-port') && !document.querySelector('.server-management')`,
+      'rejected sidecar connection view',
+    );
+    await rejection.client.evaluate(
       domAction(`
         const input = setInput('#socks-port', ${JSON.stringify(String(socksPort))});
         input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -2114,8 +2173,7 @@ async function verifySidecarWorkflows() {
       `(() => {
         const button = document.querySelector('.connect-button');
         return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
-          button?.textContent.trim() === 'Connect' && !button.disabled &&
-          !document.querySelector('#profile-select')?.disabled;
+          button?.textContent.trim() === 'Connect' && !button.disabled;
       })()`,
       'requested disconnect completion',
     );
@@ -2151,8 +2209,7 @@ async function verifySidecarWorkflows() {
         const button = document.querySelector('.connect-button');
         return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
           failure?.textContent.includes('exited unexpectedly') &&
-          button?.textContent.trim() === 'Connect' && !button.disabled &&
-          !document.querySelector('#profile-select')?.disabled;
+          button?.textContent.trim() === 'Connect' && !button.disabled;
       })()`,
       'unexpected paqet exit recovery',
     );
@@ -2345,6 +2402,7 @@ async function verifyDisconnectedWorkflows() {
   process.once('SIGTERM', terminateOnSignal);
   process.once('SIGBREAK', terminateOnSignal);
   let app001aEvidence;
+  let serverCardZoom;
   let webViewVersion;
   let permittedPaths = [];
   let failure;
@@ -2383,6 +2441,191 @@ async function verifyDisconnectedWorkflows() {
         JSON.stringify([primary.name, backupUpdated.name]) &&
         finalLaunch1Profiles.selectedName === backupUpdated.name,
       'Launch 1 did not end with exactly Primary and selected Backup updated',
+    );
+    await client1.evaluate(
+      domAction(
+        `clickButton(${JSON.stringify(`Edit ${backupUpdated.name}`)});`,
+      ),
+      'open editor for dirty close evidence',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('#profile-name') && document.activeElement?.id === 'profile-name'`,
+      'editor for dirty close evidence',
+    );
+    await client1.evaluate(
+      domAction(`
+        const input = setInput('#profile-name', 'Unsaved close check');
+        input.focus();
+      `),
+      'prepare dirty editor close evidence',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('#profile-name')?.value === 'Unsaved close check'`,
+      'dirty editor close draft',
+    );
+    sendNativeInput(launch1.child, 'close');
+    await waitForValue(
+      client1,
+      `document.querySelector('.dialog h2')?.textContent.trim() === 'Discard changes and close?'`,
+      'dirty editor window-close confirmation',
+    );
+    await client1.evaluate(
+      domAction(`clickButton('Keep editing');`),
+      'cancel dirty editor window close',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('#profile-name')?.value === 'Unsaved close check' && !document.querySelector('.dialog')`,
+      'preserved draft after canceled window close',
+    );
+    await client1.evaluate(
+      domAction(`clickButton('Cancel');`),
+      'request close-check draft discard',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('.dialog h2')?.textContent.trim() === 'Discard your changes?'`,
+      'close-check draft discard dialog',
+    );
+    await client1.evaluate(
+      domAction(`clickButton('Discard changes');`),
+      'confirm close-check draft discard',
+    );
+    await waitForValue(
+      client1,
+      `!document.querySelector('#profile-name') && !document.querySelector('.dialog')`,
+      'discarded close-check draft',
+    );
+    await client1.evaluate(
+      domAction(`clickButton('Back to connection');`),
+      'return to connection after server workflow',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('.server-summary') && !document.querySelector('.server-management')`,
+      'connection view after server workflow',
+    );
+    await client1.evaluate(
+      `document.querySelector('.server-summary')?.click()`,
+      'open servers for zoom evidence',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('.server-management')`,
+      'server view for zoom evidence',
+    );
+    sendNativeInput(launch1.child, 'zoom-in', 5);
+    await delay(500);
+    const serverZoom = await readMetrics(client1);
+    assertNoHorizontalOverflow(serverZoom, 'Server management at 200% zoom');
+    await assertReachable(
+      client1,
+      '.management-header',
+      'Server management header',
+    );
+    const lastServerReachable = await client1.evaluate(
+      `(async () => {
+        const scroller = document.querySelector('.server-management');
+        const action = document.querySelector('.server-card:last-of-type .server-card-select');
+        if (!(scroller instanceof HTMLElement) || !(action instanceof HTMLElement)) return false;
+        scroller.scrollTop = scroller.scrollHeight;
+        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        const viewport = scroller.getBoundingClientRect();
+        const bounds = action.getBoundingClientRect();
+        return bounds.top >= viewport.top - 1 && bounds.bottom <= viewport.bottom + 1;
+      })()`,
+      'last saved server card nested reachability',
+    );
+    check(
+      lastServerReachable,
+      'Last saved server card action is not reachable in the server view',
+    );
+    const serverActionsVisible = await client1.evaluate(
+      `(() => {
+        const actions = document.querySelector('.server-card:last-of-type .server-card-actions');
+        if (!(actions instanceof HTMLElement)) return false;
+        const bounds = actions.getBoundingClientRect();
+        return bounds.left >= -1 && bounds.right <= innerWidth + 1;
+      })()`,
+      'last saved server card action visibility',
+    );
+    check(
+      serverActionsVisible,
+      'Last saved server card actions are horizontally clipped',
+    );
+    serverCardZoom = await client1.evaluate(
+      `(() => {
+        const card = document.querySelector('.server-card:last-of-type');
+        const select = card?.querySelector('.server-card-select');
+        const copy = card?.querySelector('.server-card-copy');
+        const name = copy?.querySelector('strong');
+        const actions = card?.querySelector('.server-card-actions');
+        const text = name?.firstChild;
+        if (!(select instanceof HTMLElement) || !(copy instanceof HTMLElement) ||
+            !(name instanceof HTMLElement) || !(actions instanceof HTMLElement) ||
+            !(text instanceof Text)) return null;
+        const charactersByLine = new Map();
+        for (let index = 0; index < text.length; index += 1) {
+          if (/\\s/.test(text.data[index] ?? '')) continue;
+          const range = document.createRange();
+          range.setStart(text, index);
+          range.setEnd(text, index + 1);
+          const top = Math.round(range.getBoundingClientRect().top);
+          charactersByLine.set(top, (charactersByLine.get(top) ?? 0) + 1);
+        }
+        return {
+          actionWidth: actions.getBoundingClientRect().width,
+          copyWidth: copy.getBoundingClientRect().width,
+          lineCount: charactersByLine.size,
+          maxCharactersOnLine: Math.max(0, ...charactersByLine.values()),
+          name: name.textContent.trim(),
+          selectWidth: select.getBoundingClientRect().width
+        };
+      })()`,
+      'selected server card text layout at 200% zoom',
+    );
+    check(serverCardZoom, 'Selected server card layout could not be measured');
+    check(
+      serverCardZoom.copyWidth >= 72 &&
+        serverCardZoom.selectWidth >= 150 &&
+        serverCardZoom.actionWidth >= 150 &&
+        serverCardZoom.maxCharactersOnLine >= 3 &&
+        serverCardZoom.lineCount <=
+          Math.ceil(serverCardZoom.name.replace(/\\s/g, '').length / 2),
+      `Selected server name collapsed at 200% zoom: ${JSON.stringify(serverCardZoom)}`,
+    );
+    await client1.evaluate(
+      domAction(`
+        const selectedName = document.querySelector('.selected-server strong')?.textContent.trim();
+        clickButton('Edit ' + selectedName);
+      `),
+      'open selected server editor at 200% zoom',
+    );
+    await waitForValue(
+      client1,
+      `document.querySelector('.server-editor') && document.activeElement?.id === 'profile-name'`,
+      'server editor at 200% zoom',
+    );
+    assertNoHorizontalOverflow(
+      await readMetrics(client1),
+      'Server editor at 200% zoom',
+    );
+    await assertReachable(
+      client1,
+      '.server-editor .form-actions',
+      'Server editor actions',
+    );
+    await client1.evaluate(
+      domAction(`clickButton('Cancel');`),
+      'close zoomed server editor',
+    );
+    retryNativeInput(launch1.child, 'zoom-reset');
+    await delay(300);
+    await client1.evaluate(
+      domAction(`clickButton('Back to connection');`),
+      'return after server zoom evidence',
     );
 
     await client1.evaluate(
@@ -2525,22 +2768,39 @@ async function verifyDisconnectedWorkflows() {
       client1,
       `(() => {
         const button = document.querySelector('.connect-button');
-        const configuration = document.querySelector('.configuration');
-        const controls = Array.from(configuration?.querySelectorAll('button, select, input, textarea') ?? []);
-        const editableControls = controls.filter((control) =>
-          !control.matches('.disclosure-button, .reveal-button') &&
-          !(control instanceof HTMLInputElement && control.readOnly)
-        );
-        const readonlyInputs = controls.filter((control) => control instanceof HTMLInputElement && control.readOnly);
         return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connecting' &&
           button?.textContent.trim() === 'Connecting…' && button.disabled &&
           document.querySelector('#socks-port')?.disabled && document.querySelector('#socks-port')?.value === ${JSON.stringify(String(socksPort))} &&
-          editableControls.length > 10 && editableControls.every((control) => control.disabled) &&
-          readonlyInputs.length >= 4;
+          !document.querySelector('.server-summary')?.disabled &&
+          document.querySelector('#interface-select')?.disabled &&
+          document.querySelector('#connection-count')?.disabled;
       })()`,
       'canonical Connecting lock state',
     );
     check(connecting === true, 'Configuration controls were not locked');
+    await client1.evaluate(
+      `document.querySelector('.server-summary')?.click()`,
+      'inspect servers while Connecting',
+    );
+    const connectingServerLocks = await waitForValue(
+      client1,
+      `(() => {
+        const management = document.querySelector('.server-management');
+        const lockedActions = Array.from(management?.querySelectorAll('.add-server-button, .server-card-select, .server-card-actions button') ?? []);
+        return Boolean(management?.querySelector('.management-lock')) &&
+          lockedActions.length >= 4 && lockedActions.every((control) => control.disabled) &&
+          !management.querySelector('.back-button')?.disabled;
+      })()`,
+      'Connecting server management locks',
+    );
+    check(
+      connectingServerLocks,
+      'Server management mutations were not locked while Connecting',
+    );
+    await client1.evaluate(
+      domAction(`clickButton('Back to connection');`),
+      'return from Connecting server inspection',
+    );
 
     await waitForPath(configPath, launch1.child, 'generated config.yaml');
     await waitForPath(settingsPath, launch1.child, 'persisted settings.json');
@@ -2580,8 +2840,6 @@ async function verifyDisconnectedWorkflows() {
         const log = document.querySelector('[aria-label="Connection logs"]');
         return Boolean(message) && status?.textContent.trim() === 'Disconnected' &&
           button?.textContent.trim() === 'Connect' && !button.disabled &&
-          !document.querySelector('#profile-select')?.disabled &&
-          !Array.from(document.querySelectorAll('.profile-toolbar button')).find((candidate) => candidate.textContent.trim() === 'Edit')?.disabled &&
           !document.querySelector('#interface-select')?.disabled &&
           !document.querySelector('#socks-port')?.disabled && document.querySelector('#socks-port')?.value === ${JSON.stringify(String(socksPort))} &&
           !document.querySelector('#connection-count')?.disabled &&
@@ -2614,23 +2872,37 @@ async function verifyDisconnectedWorkflows() {
       'restart persisted profiles',
     );
     check(
-      JSON.stringify(launch2Profiles.names) ===
-        JSON.stringify([primary.name, backupUpdated.name]) &&
+      JSON.stringify(launch2Profiles.names) === JSON.stringify([]) &&
         launch2Profiles.selectedName === backupUpdated.name &&
-        launch2Profiles.name === backupUpdated.name &&
-        launch2Profiles.host === backupUpdated.host &&
-        launch2Profiles.port === String(backupUpdated.port) &&
-        launch2Profiles.keyType === 'password' &&
-        launch2Profiles.keyLength === backupUpdated.key.length,
-      'Restart did not restore the selected updated profile in masked form',
+        !launch2Profiles.keyOnMain,
+      'Restart did not restore the selected updated server summary safely',
+    );
+    await client2.evaluate(
+      `document.querySelector('.server-summary')?.click()`,
+      'open restart servers',
+    );
+    await waitForValue(
+      client2,
+      `document.querySelector('.server-management')`,
+      'restart server management',
+    );
+    await client2.evaluate(
+      domAction(
+        `clickButton(${JSON.stringify(`Edit ${backupUpdated.name}`)});`,
+      ),
+      'open restart server editor',
     );
     const restartKeyMatches = await client2.evaluate(
-      `document.querySelector('#encryption-key')?.value === ${JSON.stringify(backupUpdated.key)}`,
-      'restart encryption key verification',
+      `document.querySelector('#encryption-key')?.type === 'password' && document.querySelector('#encryption-key')?.value === ${JSON.stringify(backupUpdated.key)}`,
+      'restart masked encryption key verification',
     );
     check(
       restartKeyMatches,
-      'Restart did not restore the updated encryption key',
+      'Restart did not restore the updated encryption key in masked editor',
+    );
+    await client2.evaluate(
+      domAction(`clickButton('Cancel'); clickButton('Back to connection');`),
+      'leave restart server editor',
     );
 
     await client2.evaluate(
@@ -2743,6 +3015,9 @@ async function verifyDisconnectedWorkflows() {
   );
   console.log(
     `APP-001A zoom: ${Math.round(zoomRatio * 100)}%, viewport ${zoomed.innerWidth}x${zoomed.innerHeight} CSS px, document ${zoomed.scrollWidth}x${zoomed.scrollHeight}, no horizontal overflow; primary and log surfaces reachable`,
+  );
+  console.log(
+    `UI-005 server zoom: selected card copy/select/actions ${Math.round(serverCardZoom.copyWidth)}/${Math.round(serverCardZoom.selectWidth)}/${Math.round(serverCardZoom.actionWidth)} CSS px, ${serverCardZoom.lineCount} name lines with up to ${serverCardZoom.maxCharactersOnLine} non-space characters per line`,
   );
   console.log(`APP-001A keyboard: ${focused.join(' -> ')}`);
   console.log(

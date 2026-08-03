@@ -110,12 +110,16 @@ function snapshot(
   return {
     revision: '12',
     profiles: selectedProfile
-      ? profiles.map((profile) => ({
-          id: profile.id,
-          name: profile.name,
-          serverHost: profile.serverHost,
-          port: profile.port,
-        }))
+      ? profiles.map((profile) => {
+          const value =
+            profile.id === selectedProfile.id ? selectedProfile : profile;
+          return {
+            id: value.id,
+            name: value.name,
+            serverHost: value.serverHost,
+            port: value.port,
+          };
+        })
       : [],
     selectedProfile,
     interfaces: [ethernetInterface, wifiInterface],
@@ -197,12 +201,19 @@ function closeCallback(api: AppApi): (request: WindowCloseRequest) => void {
 async function renderLoaded(api = mockApi()) {
   const user = userEvent.setup();
   render(App, { props: { api } });
-  await screen.findByRole('combobox', { name: 'Selected server profile' });
+  await screen.findByRole('button', { name: /Manage servers|Add a server/ });
   return { api, user };
 }
 
+async function openServers(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(
+    screen.getByRole('button', { name: /Manage servers|Add a server/ }),
+  );
+  await screen.findByRole('heading', { name: 'Servers' });
+}
+
 describe('application shell', () => {
-  it('loads the selected profile into a calm disconnected shell with the key masked', async () => {
+  it('loads a calm disconnected shell without exposing the selected key on the main view', async () => {
     const { api, user } = await renderLoaded();
 
     expect(api.getAppSnapshot).toHaveBeenCalledOnce();
@@ -221,10 +232,23 @@ describe('application shell', () => {
       screen.getByRole('log', { name: 'Connection logs' }),
     ).toHaveTextContent('Connection output will appear here.');
 
+    expect(screen.queryByLabelText('Encryption key')).not.toBeInTheDocument();
+    expect(
+      screen.getByRole('button', {
+        name: 'Manage servers. Selected Primary, 198.51.100.10:9999',
+      }),
+    ).toBeEnabled();
+
+    await openServers(user);
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Back to connection' }),
+      ).toHaveFocus(),
+    );
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
     const key = screen.getByLabelText('Encryption key');
     expect(key).toHaveAttribute('type', 'password');
     expect(key).toHaveValue('representative-test-key');
-    expect(key).toHaveAttribute('readonly');
 
     await user.click(
       screen.getByRole('button', { name: 'Reveal encryption key' }),
@@ -233,6 +257,11 @@ describe('application shell', () => {
     expect(
       screen.getByRole('button', { name: 'Conceal encryption key' }),
     ).toHaveAttribute('aria-pressed', 'true');
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Back to connection' }),
+    );
 
     const advanced = screen.getByRole('button', { name: /Advanced/ });
     expect(advanced).toHaveAttribute('aria-expanded', 'false');
@@ -284,9 +313,14 @@ describe('application shell', () => {
       ),
     ).toBeInTheDocument();
 
-    await user.selectOptions(
-      screen.getByRole('combobox', { name: 'Selected server profile' }),
-      backupProfile.id,
+    vi.mocked(api.selectProfile).mockResolvedValue(
+      snapshot(backupProfile, { revision: '13' }),
+    );
+    await openServers(user);
+    await user.click(
+      screen.getByRole('button', {
+        name: 'Use Backup, backup.example.com:443',
+      }),
     );
     expect(port).toHaveValue('1e3');
   });
@@ -447,8 +481,8 @@ describe('application shell', () => {
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Disconnect' })).toBeEnabled();
     expect(
-      screen.getByRole('combobox', { name: 'Selected server profile' }),
-    ).toBeDisabled();
+      screen.getByRole('button', { name: /Manage servers/ }),
+    ).toBeEnabled();
   });
 
   it('renders ordered replay gaps, stderr, and truncation and copies visible logs', async () => {
@@ -584,6 +618,135 @@ describe('application shell', () => {
       await screen.findByRole('button', { name: 'Disconnect and close' }),
     );
     expect(api.confirmWindowClose).toHaveBeenCalledWith(request.requestId);
+  });
+
+  it('confirms before a disconnected window close discards a dirty editor', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Unsaved');
+
+    const request: WindowCloseRequest = {
+      requestId: '10',
+      lifecycle: snapshot().lifecycle,
+    };
+    closeCallback(api)(request);
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Discard changes and close?',
+    });
+    expect(
+      within(dialog).getByRole('button', { name: 'Keep editing' }),
+    ).toHaveFocus();
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Keep editing' }),
+    );
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Unsaved');
+
+    closeCallback(api)(request);
+    await user.click(
+      await screen.findByRole('button', { name: 'Discard and close' }),
+    );
+    expect(api.confirmWindowClose).toHaveBeenCalledWith(request.requestId);
+  });
+
+  it('preserves a dirty editor when native window-close confirmation fails', async () => {
+    const api = mockApi();
+    vi.mocked(api.confirmWindowClose).mockRejectedValue({
+      kind: 'commandConflict',
+    });
+    const { user } = await renderLoaded(api);
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Still unsaved');
+
+    closeCallback(api)({ requestId: '10', lifecycle: snapshot().lifecycle });
+    await user.click(
+      await screen.findByRole('button', { name: 'Discard and close' }),
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'PaqetGUI could not close',
+    );
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Still unsaved');
+    expect(
+      screen.getByRole('button', { name: 'Discard and close' }),
+    ).toBeEnabled();
+  });
+
+  it('immediately confirms a disconnected window close when no draft is dirty', async () => {
+    const api = mockApi();
+    await renderLoaded(api);
+
+    closeCallback(api)({ requestId: '12', lifecycle: snapshot().lifecycle });
+    expect(api.confirmWindowClose).toHaveBeenCalledWith('12');
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+  });
+
+  it('combines dirty-editor and active-process close confirmation', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Unsaved');
+    const request: WindowCloseRequest = {
+      requestId: '11',
+      lifecycle: {
+        status: 'connected',
+        process: 'running',
+        failure: null,
+        settingsEditable: false,
+      },
+    };
+
+    closeCallback(api)(request);
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Discard changes and close?',
+    });
+    expect(dialog).toHaveTextContent('stop the supervised paqet process');
+    await user.keyboard('{Escape}');
+    expect(api.cancelWindowClose).toHaveBeenCalledWith(request.requestId);
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Unsaved');
+
+    closeCallback(api)(request);
+    await user.click(
+      await screen.findByRole('button', { name: 'Discard and close' }),
+    );
+    expect(api.confirmWindowClose).toHaveBeenCalledWith(request.requestId);
+  });
+
+  it('keeps a newer dirty close request actionable after stale cancellation', async () => {
+    const api = mockApi();
+    const cancellation = deferred<void>();
+    vi.mocked(api.cancelWindowClose).mockReturnValue(cancellation.promise);
+    const { user } = await renderLoaded(api);
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Unsaved');
+    const first = { requestId: '1', lifecycle: snapshot().lifecycle };
+    const second = { ...first, requestId: '2' };
+
+    closeCallback(api)(first);
+    await user.click(
+      await screen.findByRole('button', { name: 'Keep editing' }),
+    );
+    closeCallback(api)(second);
+    cancellation.resolve();
+
+    const dialog = await screen.findByRole('alertdialog', {
+      name: 'Discard changes and close?',
+    });
+    expect(
+      within(dialog).getByRole('button', { name: 'Keep editing' }),
+    ).toBeEnabled();
+    await user.click(
+      within(dialog).getByRole('button', { name: 'Discard and close' }),
+    );
+    expect(api.confirmWindowClose).toHaveBeenCalledWith('2');
   });
 
   it('does not let an older close cancellation dismiss a newer request', async () => {
@@ -754,10 +917,10 @@ describe('application shell', () => {
   it('presents an actionable empty state without inventing persisted data', async () => {
     const { user } = await renderLoaded(mockApi(snapshot(null)));
 
-    expect(screen.getByText('No profiles saved')).toBeInTheDocument();
-    await user.click(
-      screen.getByRole('button', { name: 'Add server profile' }),
-    );
+    expect(screen.getByRole('button', { name: 'Add a server' })).toBeEnabled();
+    await openServers(user);
+    expect(screen.getByText('No servers yet')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Add a server' }));
 
     expect(screen.getByLabelText('Profile name')).toHaveFocus();
     expect(screen.getByRole('button', { name: 'Save profile' })).toBeEnabled();
@@ -774,9 +937,8 @@ describe('application shell', () => {
   it('validates on blur and focuses the first invalid field on submit', async () => {
     const api = mockApi(snapshot(null));
     const { user } = await renderLoaded(api);
-    await user.click(
-      screen.getByRole('button', { name: 'Add server profile' }),
-    );
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Add a server' }));
 
     const name = screen.getByLabelText('Profile name');
     await user.click(screen.getByLabelText('Server IP or host'));
@@ -798,9 +960,8 @@ describe('application shell', () => {
     const api = mockApi(snapshot(null));
     vi.mocked(api.createProfile).mockResolvedValue(created);
     const { user } = await renderLoaded(api);
-    await user.click(
-      screen.getByRole('button', { name: 'Add server profile' }),
-    );
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Add a server' }));
 
     await user.type(screen.getByLabelText('Profile name'), 'Primary');
     await user.type(
@@ -820,10 +981,90 @@ describe('application shell', () => {
     await waitFor(() =>
       expect(api.createProfile).toHaveBeenCalledWith(expectedDraft),
     );
-    expect(screen.getByRole('button', { name: 'Edit' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Edit Primary' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Edit Primary' })).toHaveFocus();
     expect(
       screen.queryByRole('button', { name: 'Save profile' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('focuses a newly created card even when another server remains selected', async () => {
+    const additionalProfile: Profile = {
+      id: '33333333-3333-4333-8333-333333333333',
+      name: 'Additional',
+      serverHost: '203.0.113.20',
+      port: 8443,
+      encryptionKey: 'additional-key',
+    };
+    const api = mockApi();
+    vi.mocked(api.createProfile).mockResolvedValue(
+      snapshot(primaryProfile, {
+        revision: '13',
+        profiles: [
+          ...snapshot().profiles,
+          {
+            id: additionalProfile.id,
+            name: additionalProfile.name,
+            serverHost: additionalProfile.serverHost,
+            port: additionalProfile.port,
+          },
+        ],
+      }),
+    );
+    const { user } = await renderLoaded(api);
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
+    await user.type(
+      screen.getByLabelText('Profile name'),
+      additionalProfile.name,
+    );
+    await user.type(
+      screen.getByLabelText('Server IP or host'),
+      additionalProfile.serverHost,
+    );
+    await user.type(
+      screen.getByLabelText('Port'),
+      String(additionalProfile.port),
+    );
+    await user.type(
+      screen.getByLabelText('Encryption key'),
+      additionalProfile.encryptionKey,
+    );
+    await user.click(screen.getByRole('button', { name: 'Save profile' }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Edit Additional' }),
+      ).toHaveFocus(),
+    );
+    expect(
+      screen.getByRole('button', {
+        name: 'Use Primary, 198.51.100.10:9999',
+      }),
+    ).toHaveAttribute('aria-current', 'true');
+  });
+
+  it('confirms before Cancel discards a dirty editor', async () => {
+    const { user } = await renderLoaded();
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Unsaved');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+
+    expect(
+      screen.getByRole('alertdialog', { name: 'Discard your changes?' }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Keep editing' }));
+    expect(screen.getByLabelText('Profile name')).toHaveValue('Unsaved');
+
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await user.click(screen.getByRole('button', { name: 'Discard changes' }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Edit Primary' }),
+      ).toHaveFocus(),
+    );
   });
 
   it('preserves entries and associates backend validation with its field', async () => {
@@ -834,9 +1075,8 @@ describe('application shell', () => {
       issue: 'invalidFormat',
     });
     const { user } = await renderLoaded(api);
-    await user.click(
-      screen.getByRole('button', { name: 'Add server profile' }),
-    );
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Add a server' }));
     await user.type(screen.getByLabelText('Profile name'), 'Primary');
     await user.type(
       screen.getByLabelText('Server IP or host'),
@@ -868,7 +1108,8 @@ describe('application shell', () => {
     const api = mockApi();
     vi.mocked(api.updateProfile).mockResolvedValue(snapshot(normalizedProfile));
     const { user } = await renderLoaded(api);
-    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
     await user.clear(screen.getByLabelText('Profile name'));
     await user.type(screen.getByLabelText('Profile name'), ' Renamed ');
     await user.clear(screen.getByLabelText('Server IP or host'));
@@ -889,10 +1130,9 @@ describe('application shell', () => {
         encryptionKey: primaryProfile.encryptionKey,
       }),
     );
-    expect(screen.getByLabelText('Profile name')).toHaveValue('Renamed');
-    expect(screen.getByLabelText('Server IP or host')).toHaveValue(
-      'server.example.com',
-    );
+    expect(screen.getByRole('button', { name: 'Edit Renamed' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Edit Renamed' })).toHaveFocus();
+    expect(screen.getByText('server.example.com:443')).toBeInTheDocument();
   });
 
   it('preserves an existing profile draft when a duplicate name is rejected', async () => {
@@ -901,7 +1141,8 @@ describe('application shell', () => {
       kind: 'profileDuplicateName',
     });
     const { user } = await renderLoaded(api);
-    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
     await user.clear(screen.getByLabelText('Profile name'));
     await user.type(screen.getByLabelText('Profile name'), 'Backup');
 
@@ -919,13 +1160,15 @@ describe('application shell', () => {
     const api = mockApi();
     vi.mocked(api.selectProfile).mockResolvedValue(snapshot(backupProfile));
     const { user } = await renderLoaded(api);
-    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
     await user.clear(screen.getByLabelText('Profile name'));
     await user.type(screen.getByLabelText('Profile name'), 'Changed');
 
-    await user.selectOptions(
-      screen.getByRole('combobox', { name: 'Selected server profile' }),
-      backupProfile.id,
+    await user.click(
+      screen.getByRole('button', {
+        name: 'Use Backup, backup.example.com:443',
+      }),
     );
 
     const dialog = screen.getByRole('alertdialog', {
@@ -940,23 +1183,89 @@ describe('application shell', () => {
     await waitFor(() =>
       expect(api.selectProfile).toHaveBeenCalledWith(backupProfile.id),
     );
-    expect(screen.getByLabelText('Profile name')).toHaveValue('Backup');
+    expect(
+      screen.getByRole('button', {
+        name: 'Manage servers. Selected Backup, backup.example.com:443',
+      }),
+    ).toHaveFocus();
+  });
+
+  it('does not open the old profile when a selection response loses a revision race', async () => {
+    const api = mockApi();
+    vi.mocked(api.selectProfile).mockResolvedValue(
+      snapshot(backupProfile, { revision: '12' }),
+    );
+    const { user } = await renderLoaded(api);
+    await openServers(user);
+
+    runtimeCallback(api)({
+      kind: 'lifecycle',
+      revision: '13',
+      sessionId: null,
+      lifecycle: snapshot().lifecycle,
+    });
+    await user.click(screen.getByRole('button', { name: 'Edit Backup' }));
+
+    expect(screen.queryByRole('form', { name: 'Edit server' })).toBeNull();
+    expect(
+      await screen.findByText(
+        'The server selection changed before it could be opened.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByDisplayValue(primaryProfile.encryptionKey)).toBeNull();
+  });
+
+  it('allows a confirmed dirty exit after lifecycle locking begins', async () => {
+    const api = mockApi();
+    const { user } = await renderLoaded(api);
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
+    await user.clear(screen.getByLabelText('Profile name'));
+    await user.type(screen.getByLabelText('Profile name'), 'Unsaved');
+    await user.click(
+      screen.getByRole('button', { name: 'Back to connection' }),
+    );
+
+    runtimeCallback(api)({
+      kind: 'lifecycle',
+      revision: '13',
+      sessionId: '1',
+      lifecycle: {
+        status: 'connecting',
+        process: 'absent',
+        failure: null,
+        settingsEditable: false,
+      },
+    });
+    await user.click(screen.getByRole('button', { name: 'Discard changes' }));
+
+    expect(
+      await screen.findByRole('button', { name: /Manage servers/ }),
+    ).toHaveFocus();
+    expect(screen.queryByLabelText('Profile name')).toBeNull();
   });
 
   it('prevents Edit from replacing an active create or edit draft', async () => {
     const { user } = await renderLoaded();
-    const edit = screen.getByRole('button', { name: 'Edit' });
+    await openServers(user);
+    const edit = screen.getByRole('button', { name: 'Edit Primary' });
 
-    await user.click(screen.getByRole('button', { name: 'New' }));
+    await user.click(screen.getByRole('button', { name: 'Add server' }));
     await user.type(screen.getByLabelText('Profile name'), 'Unsaved');
-    expect(edit).toBeDisabled();
+    expect(edit).toBeEnabled();
+    await user.click(edit);
+    expect(
+      screen.getByRole('alertdialog', { name: 'Discard your changes?' }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Keep editing' }));
     expect(screen.getByLabelText('Profile name')).toHaveValue('Unsaved');
 
     await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await user.click(screen.getByRole('button', { name: 'Discard changes' }));
     await user.click(edit);
     await user.clear(screen.getByLabelText('Profile name'));
     await user.type(screen.getByLabelText('Profile name'), 'Edited');
-    expect(edit).toBeDisabled();
+    expect(edit).toBeEnabled();
     expect(screen.getByLabelText('Profile name')).toHaveValue('Edited');
   });
 
@@ -964,8 +1273,8 @@ describe('application shell', () => {
     const api = mockApi();
     vi.mocked(api.deleteProfile).mockResolvedValue(snapshot(backupProfile));
     const { user } = await renderLoaded(api);
-    await user.click(screen.getByRole('button', { name: 'Edit' }));
-    await user.click(screen.getByRole('button', { name: 'Delete profile' }));
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Delete Primary' }));
 
     expect(
       screen.getByRole('alertdialog', { name: 'Delete “Primary”?' }),
@@ -985,11 +1294,11 @@ describe('application shell', () => {
     expect(api.deleteProfile).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(
-        screen.getByRole('button', { name: 'Delete profile' }),
+        screen.getByRole('button', { name: 'Delete Primary' }),
       ).toHaveFocus(),
     );
 
-    await user.click(screen.getByRole('button', { name: 'Delete profile' }));
+    await user.click(screen.getByRole('button', { name: 'Delete Primary' }));
     await user.click(
       screen.getAllByRole('button', { name: 'Delete profile' }).at(-1)!,
     );
@@ -1000,13 +1309,18 @@ describe('application shell', () => {
 
   it('uses standard keyboard activation for editor and disclosure controls', async () => {
     const { user } = await renderLoaded();
-    const edit = screen.getByRole('button', { name: 'Edit' });
+    await openServers(user);
+    const edit = screen.getByRole('button', { name: 'Edit Primary' });
     edit.focus();
     await user.keyboard('{Enter}');
     expect(
       screen.getByRole('button', { name: 'Save changes' }),
     ).toBeInTheDocument();
 
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Back to connection' }),
+    );
     const advanced = screen.getByRole('button', { name: /Advanced/ });
     advanced.focus();
     await user.keyboard(' ');
@@ -1025,7 +1339,11 @@ describe('application shell', () => {
       'The application state could not be loaded.',
     );
     await user.click(screen.getByRole('button', { name: 'Try again' }));
-    expect(await screen.findByLabelText('Profile name')).toHaveValue('Primary');
+    expect(
+      await screen.findByRole('button', {
+        name: 'Manage servers. Selected Primary, 198.51.100.10:9999',
+      }),
+    ).toBeEnabled();
     expect(api.getAppSnapshot).toHaveBeenCalledTimes(2);
   });
 
@@ -1058,7 +1376,7 @@ describe('application shell', () => {
     expect(screen.getByText(wifiInterface.gatewayMac)).toBeInTheDocument();
   });
 
-  it('refreshes canonical interfaces without discarding an active profile draft', async () => {
+  it('refreshes canonical interfaces after a confirmed profile-draft discard', async () => {
     const refreshedEthernet = {
       ...ethernetInterface,
       localAddress: '192.0.2.44',
@@ -1072,18 +1390,24 @@ describe('application shell', () => {
       }),
     );
     const { user } = await renderLoaded(api);
-    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    await openServers(user);
+    await user.click(screen.getByRole('button', { name: 'Edit Primary' }));
     await user.clear(screen.getByLabelText('Profile name'));
     await user.type(screen.getByLabelText('Profile name'), 'Unsaved name');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(
+      screen.getByRole('alertdialog', { name: 'Discard your changes?' }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Discard changes' }));
+    await user.click(
+      screen.getByRole('button', { name: 'Back to connection' }),
+    );
     await user.click(screen.getByRole('button', { name: /Advanced/ }));
     await user.click(screen.getByRole('button', { name: 'Refresh' }));
 
     await waitFor(() => expect(api.refreshInterfaces).toHaveBeenCalledOnce());
     expect(screen.getByText('192.0.2.44')).toBeInTheDocument();
-    expect(screen.getByLabelText('Profile name')).toHaveValue('Unsaved name');
-    expect(
-      screen.getByRole('button', { name: 'Save changes' }),
-    ).toBeInTheDocument();
+    expect(screen.queryByLabelText('Profile name')).not.toBeInTheDocument();
   });
 
   it('does not regress canonical state when an older interface snapshot arrives', async () => {
@@ -1114,14 +1438,11 @@ describe('application shell', () => {
     ).not.toBeInTheDocument();
   });
 
-  it('serializes a pending interface mutation and preserves the profile draft', async () => {
+  it('serializes a pending interface mutation and keeps server navigation available', async () => {
     const pendingSelection = deferred<AppSnapshot>();
     const api = mockApi();
     vi.mocked(api.selectInterface).mockReturnValue(pendingSelection.promise);
     const { user } = await renderLoaded(api);
-    await user.click(screen.getByRole('button', { name: 'Edit' }));
-    await user.clear(screen.getByLabelText('Profile name'));
-    await user.type(screen.getByLabelText('Profile name'), 'Pending draft');
     await user.click(screen.getByRole('button', { name: /Advanced/ }));
 
     await user.selectOptions(
@@ -1134,14 +1455,9 @@ describe('application shell', () => {
     );
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
     expect(screen.getByRole('combobox', { name: 'Interface' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Save changes' })).toBeDisabled();
     expect(
-      screen.getByRole('button', { name: 'Delete profile' }),
-    ).toBeDisabled();
-    expect(
-      screen.getByRole('combobox', { name: 'Selected server profile' }),
-    ).toBeDisabled();
-    expect(screen.getByLabelText('Profile name')).toHaveValue('Pending draft');
+      screen.getByRole('button', { name: /Manage servers/ }),
+    ).toBeEnabled();
     expect(api.refreshInterfaces).not.toHaveBeenCalled();
 
     pendingSelection.resolve(
@@ -1157,8 +1473,6 @@ describe('application shell', () => {
       ),
     );
     expect(screen.queryByText('Selecting network interface…')).toBeNull();
-    expect(screen.getByLabelText('Profile name')).toHaveValue('Pending draft');
-    expect(screen.getByRole('button', { name: 'Save changes' })).toBeEnabled();
   });
 
   it('distinguishes an empty interface result from refresh failure', async () => {
@@ -1195,8 +1509,17 @@ describe('application shell', () => {
     });
     const { user } = await renderLoaded(mockApi(locked));
 
-    expect(screen.getByRole('button', { name: 'New' })).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled();
+    await openServers(user);
+    expect(screen.getByRole('button', { name: 'Add server' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Edit Primary' })).toBeDisabled();
+    expect(
+      screen.getByRole('button', {
+        name: 'Use Primary, 198.51.100.10:9999',
+      }),
+    ).toBeDisabled();
+    await user.click(
+      screen.getByRole('button', { name: 'Back to connection' }),
+    );
     await user.click(screen.getByRole('button', { name: /Advanced/ }));
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
     expect(screen.getByRole('combobox', { name: 'Interface' })).toBeDisabled();
@@ -1351,12 +1674,12 @@ describe('application shell', () => {
     expect(api.connect).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(
-        screen.getByRole('region', { name: 'Server profile' }),
+        screen.getByRole('region', { name: 'Connection setup' }),
       ).toHaveAttribute('aria-busy', 'true'),
     );
     expect(
-      screen.getByRole('combobox', { name: 'Selected server profile' }),
-    ).toBeDisabled();
+      screen.getByRole('button', { name: /Manage servers/ }),
+    ).toBeEnabled();
     replacement.resolve(updated);
     await waitFor(() => expect(api.connect).toHaveBeenCalledOnce());
   });
@@ -1476,9 +1799,8 @@ describe('application shell', () => {
     );
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
     expect(
-      screen.getByRole('combobox', { name: 'Selected server profile' }),
-    ).toBeDisabled();
-    expect(screen.getByRole('button', { name: 'Edit' })).toBeDisabled();
+      screen.getByRole('button', { name: /Manage servers/ }),
+    ).toBeEnabled();
     const overrideCheckboxes = screen.getAllByRole('checkbox');
     expect(
       overrideCheckboxes.filter((control) => control.hasAttribute('disabled')),
@@ -1700,7 +2022,7 @@ describe('application shell', () => {
     expect(screen.getByText(/Connection count must be/)).toBeInTheDocument();
   });
 
-  it('waits for a pending Advanced update before confirming profile deletion', async () => {
+  it('blocks profile deletion while an Advanced settings mutation is pending', async () => {
     const pendingSettings = deferred<AppSnapshot>();
     const api = mockApi(
       snapshot(primaryProfile, {
@@ -1711,25 +2033,33 @@ describe('application shell', () => {
       pendingSettings.promise,
     );
     const { user } = await renderLoaded(api);
-    await user.click(screen.getByRole('button', { name: 'Edit' }));
     await user.click(screen.getByRole('button', { name: /Advanced/ }));
     const buffer = screen.getByLabelText('TCP buffer');
     await user.clear(buffer);
     await user.type(buffer, '16384');
-    await user.click(screen.getByRole('button', { name: 'Delete profile' }));
+    buffer.blur();
     await waitFor(() =>
       expect(api.replaceAdvancedSettings).toHaveBeenCalledOnce(),
     );
-
-    await user.click(
-      screen.getAllByRole('button', { name: 'Delete profile' }).at(-1)!,
-    );
+    await user.click(screen.getByRole('button', { name: /Manage servers/ }));
+    expect(
+      screen.getByRole('button', { name: 'Delete Primary' }),
+    ).toBeDisabled();
     expect(api.deleteProfile).not.toHaveBeenCalled();
     pendingSettings.resolve(
       snapshot(primaryProfile, {
         revision: '13',
         advancedSettings: advancedSettings({ tcpBuffer: '16384' }),
       }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Delete Primary' }),
+      ).toBeEnabled(),
+    );
+    await user.click(screen.getByRole('button', { name: 'Delete Primary' }));
+    await user.click(
+      screen.getAllByRole('button', { name: 'Delete profile' }).at(-1)!,
     );
     await waitFor(() =>
       expect(api.deleteProfile).toHaveBeenCalledWith(primaryProfile.id),
@@ -2385,7 +2715,12 @@ describe('fixed-window responsive and preference contracts', () => {
     expect(styles).not.toContain('min-width: 320px');
     expect(styles).toMatch(/body\s*{\s*overflow-y: auto;/);
     expect(styles).toMatch(/\.configuration\s*{[^}]*overflow-x: hidden;/s);
-    expect(styles).toMatch(/\.profile-toolbar\s*{\s*flex-wrap: wrap;/);
+    expect(styles).toMatch(/\.server-management\s*{[^}]*overflow-x: hidden;/s);
+    expect(styles).toContain('grid-template-columns: minmax(0, 1fr) auto');
+    expect(styles).toContain('.server-card-actions');
+    expect(styles).toMatch(
+      /@media \(max-width: 280px\)\s*{.*\.server-card\s*{\s*grid-template-columns: minmax\(0, 1fr\);.*\.server-card-actions\s*{[^}]*border-top: 1px solid var\(--border-muted\);[^}]*border-left: 0;/s,
+    );
     expect(styles).toContain('grid-template-columns: minmax(0, 1fr)');
     expect(styles).toContain('overflow-wrap: anywhere');
     expect(styles).toContain('grid-template-columns: 104px minmax(0, 1fr)');

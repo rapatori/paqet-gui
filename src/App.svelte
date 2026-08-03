@@ -16,6 +16,7 @@
     ProfileDraft,
     ProfileFieldName,
     ProfileId,
+    ProfileSummary,
     RuntimeEvent,
     WindowCloseRequest,
   } from './lib/api';
@@ -43,6 +44,14 @@
   }
 
   type EditorMode = 'view' | 'create' | 'edit';
+  type AppView = 'connection' | 'servers';
+  type ProfileIntent =
+    | { kind: 'select'; profileId: ProfileId }
+    | { kind: 'edit'; profileId: ProfileId }
+    | { kind: 'delete'; profile: ProfileSummary }
+    | { kind: 'create' }
+    | { kind: 'closeEditor' }
+    | { kind: 'leave' };
   type InterfaceOperation = 'refresh' | 'select' | null;
   type CommonSettingField =
     | 'logLevel'
@@ -104,10 +113,10 @@
         nextAvailable: string;
       };
   type DialogState =
-    | { kind: 'discardSelection'; profileId: ProfileId }
-    | { kind: 'discardCreate' }
-    | { kind: 'delete'; profile: Profile }
+    | { kind: 'discard'; intent: ProfileIntent }
+    | { kind: 'delete'; profile: ProfileSummary }
     | { kind: 'unsafeBlock'; value: 'none' | 'null' }
+    | { kind: 'dirtyWindowClose'; request: WindowCloseRequest }
     | { kind: 'windowClose'; request: WindowCloseRequest }
     | null;
 
@@ -119,6 +128,7 @@
   let { api = tauriApi }: { api?: AppApi } = $props();
 
   let snapshot = $state<AppSnapshot | null>(null);
+  let appView = $state<AppView>('connection');
   let editorMode = $state<EditorMode>('view');
   let draft = $state<ProfileInput>(emptyProfileInput());
   let fieldErrors = $state<FieldErrors>({});
@@ -178,10 +188,11 @@
   let dialogPrimaryButton = $state<HTMLButtonElement>();
   let dialogCancelButton = $state<HTMLButtonElement>();
   let dialogElement = $state<HTMLDivElement>();
-  let profileSelect = $state<HTMLSelectElement>();
-  let newProfileButton = $state<HTMLButtonElement>();
+  let serverSummaryButton = $state<HTMLButtonElement>();
+  let addServerButton = $state<HTMLButtonElement>();
   let logElement = $state<HTMLDivElement>();
   let dialogInvoker: HTMLElement | null = null;
+  let editorInvoker: HTMLElement | null = null;
   let mutationIdleResolvers: Array<() => void> = [];
   let settingsQueue = Promise.resolve();
   let scheduledDraftCommits = Promise.resolve();
@@ -431,12 +442,12 @@
       adoptLogSession(event.sessionId);
     }
 
-    if (
-      lifecycleApplied &&
-      dialog?.kind === 'windowClose' &&
-      snapshot?.lifecycle.settingsEditable
-    ) {
-      dismissWindowCloseDialog();
+    if (lifecycleApplied && snapshot?.lifecycle.settingsEditable) {
+      if (dialog?.kind === 'windowClose') {
+        dismissWindowCloseDialog();
+      } else if (dialog?.kind === 'dirtyWindowClose') {
+        dismissWindowCloseDialog();
+      }
     }
   }
 
@@ -717,16 +728,75 @@
     }
   }
 
-  function beginCreate(): void {
-    if (!settingsEditable || mutationBusy) return;
-    if (draftChanged) {
-      openDialog({ kind: 'discardCreate' });
-      return;
-    }
-    startCreate();
+  async function openServerManagement(): Promise<void> {
+    appView = 'servers';
+    editorMode = 'view';
+    fieldErrors = {};
+    message = '';
+    revealKey = false;
+    await tick();
+    window.setTimeout(
+      () => document.querySelector<HTMLButtonElement>('.back-button')?.focus(),
+      0,
+    );
   }
 
-  function startCreate(): void {
+  function requestProfileIntent(intent: ProfileIntent): void {
+    if (mutationBusy) return;
+    const invoker =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    if (draftChanged) {
+      openDialog({ kind: 'discard', intent }, invoker);
+      return;
+    }
+    void runProfileIntent(intent, invoker);
+  }
+
+  async function runProfileIntent(
+    intent: ProfileIntent,
+    invoker: HTMLElement | null = null,
+  ): Promise<void> {
+    if (intent.kind === 'leave') {
+      cancelEdit(false);
+      appView = 'connection';
+      await tick();
+      serverSummaryButton?.focus();
+      return;
+    }
+    if (intent.kind === 'closeEditor') {
+      cancelEdit();
+      return;
+    }
+    if (!settingsEditable || mutationBusy) return;
+    if (intent.kind === 'create') {
+      startCreate(invoker);
+      return;
+    }
+    if (intent.kind === 'delete') {
+      openDialog({ kind: 'delete', profile: intent.profile }, invoker);
+      return;
+    }
+    if (intent.kind === 'select') {
+      if (selectedProfile?.id === intent.profileId) {
+        appView = 'connection';
+        await tick();
+        serverSummaryButton?.focus();
+        return;
+      }
+      await selectProfile(intent.profileId, true);
+      return;
+    }
+    if (selectedProfile?.id !== intent.profileId) {
+      const selected = await selectProfile(intent.profileId, false, false);
+      if (!selected) return;
+    }
+    startEdit(invoker);
+  }
+
+  function startCreate(invoker: HTMLElement | null): void {
+    editorInvoker = invoker ?? addServerButton ?? null;
     editorMode = 'create';
     draft = emptyProfileInput();
     fieldErrors = {};
@@ -735,8 +805,9 @@
     void focusField('name');
   }
 
-  function beginEdit(): void {
-    if (!selectedProfile || !settingsEditable || mutationBusy) return;
+  function startEdit(invoker: HTMLElement | null): void {
+    if (!selectedProfile) return;
+    editorInvoker = invoker;
     editorMode = 'edit';
     draft = profileInput(selectedProfile);
     fieldErrors = {};
@@ -745,7 +816,9 @@
     void focusField('name');
   }
 
-  function cancelEdit(): void {
+  function cancelEdit(restoreFocus = true): void {
+    const returnFocus = editorInvoker;
+    editorInvoker = null;
     editorMode = 'view';
     draft = selectedProfile
       ? profileInput(selectedProfile)
@@ -753,30 +826,34 @@
     fieldErrors = {};
     message = '';
     revealKey = false;
+    if (restoreFocus) void tick().then(() => returnFocus?.focus());
   }
 
-  async function handleProfileSelection(event: Event): Promise<void> {
-    const select = event.currentTarget as HTMLSelectElement;
-    const profileId = select.value;
-    const currentId = selectedProfile?.id ?? '';
-
-    if (!profileId || profileId === currentId) return;
-    select.value = currentId;
-
-    if (draftChanged) {
-      openDialog({ kind: 'discardSelection', profileId });
-      return;
-    }
-    await selectProfile(profileId);
-  }
-
-  async function selectProfile(profileId: ProfileId): Promise<void> {
+  async function selectProfile(
+    profileId: ProfileId,
+    returnToConnection: boolean,
+    resetEditor = true,
+  ): Promise<boolean> {
     saving = true;
     message = '';
     try {
-      applySnapshot(await api.selectProfile(profileId), true);
+      const nextSnapshot = await api.selectProfile(profileId);
+      if (
+        !applySnapshot(nextSnapshot, resetEditor) ||
+        nextSnapshot.selectedProfile?.id !== profileId
+      ) {
+        message = 'The server selection changed before it could be opened.';
+        return false;
+      }
+      if (returnToConnection) {
+        appView = 'connection';
+        await tick();
+        serverSummaryButton?.focus();
+      }
+      return true;
     } catch {
-      message = 'The selected profile could not be opened.';
+      message = 'The selected server could not be opened.';
+      return false;
     } finally {
       saving = false;
       resolveMutationIdle();
@@ -812,12 +889,30 @@
 
     saving = true;
     message = '';
+    const savingMode = editorMode;
+    const existingProfileIds = new Set(
+      snapshot?.profiles.map((profile) => profile.id) ?? [],
+    );
     try {
       const nextSnapshot =
         editorMode === 'create'
           ? await api.createProfile(profileDraft)
           : await api.updateProfile(selectedProfile!.id, profileDraft);
-      applySnapshot(nextSnapshot, true);
+      if (!applySnapshot(nextSnapshot, true)) {
+        message = 'The application state changed before the server was saved.';
+      } else {
+        editorInvoker = null;
+        saving = false;
+        resolveMutationIdle();
+        await tick();
+        const savedProfile =
+          savingMode === 'create'
+            ? nextSnapshot.profiles.find(
+                (profile) => !existingProfileIds.has(profile.id),
+              )
+            : nextSnapshot.selectedProfile;
+        focusServerAction('Edit', savedProfile?.name ?? '');
+      }
     } catch (error) {
       saving = false;
       resolveMutationIdle();
@@ -847,9 +942,9 @@
       'The profile could not be saved. Your entries have been preserved.';
   }
 
-  function requestDelete(): void {
-    if (!selectedProfile || !settingsEditable || mutationBusy) return;
-    openDialog({ kind: 'delete', profile: selectedProfile });
+  function requestDelete(profile: ProfileSummary): void {
+    if (!settingsEditable || mutationBusy) return;
+    requestProfileIntent({ kind: 'delete', profile });
   }
 
   async function confirmDialog(): Promise<void> {
@@ -877,6 +972,22 @@
       }
       return;
     }
+    if (action?.kind === 'dirtyWindowClose') {
+      if (closeDecisionBusy) return;
+      closeDecisionBusy = true;
+      closeDecisionMessage = '';
+      await waitForMutationIdle();
+      try {
+        await api.confirmWindowClose(action.request.requestId);
+      } catch {
+        if (dialog === action) {
+          closeDecisionBusy = false;
+          closeDecisionMessage =
+            'PaqetGUI could not close. Use the window close control to try again.';
+        }
+      }
+      return;
+    }
     dialog = null;
     dialogInvoker = null;
     if (!action) return;
@@ -896,23 +1007,22 @@
       return;
     }
 
+    if (action.kind === 'discard') {
+      await waitForMutationIdle();
+      if (
+        action.intent.kind !== 'closeEditor' &&
+        action.intent.kind !== 'leave'
+      ) {
+        cancelEdit(false);
+      }
+      await runProfileIntent(action.intent, returnFocus);
+      return;
+    }
+
     await waitForMutationIdle();
     if (!settingsEditable) {
       await tick();
       returnFocus?.focus();
-      return;
-    }
-
-    if (action.kind === 'discardSelection') {
-      cancelEdit();
-      await selectProfile(action.profileId);
-      await tick();
-      profileSelect?.focus();
-      return;
-    }
-    if (action.kind === 'discardCreate') {
-      cancelEdit();
-      startCreate();
       return;
     }
 
@@ -927,24 +1037,43 @@
       resolveMutationIdle();
     }
     await tick();
-    (snapshot?.selectedProfile ? profileSelect : newProfileButton)?.focus();
+    if (snapshot?.profiles.length) {
+      document.querySelector<HTMLButtonElement>('.server-card-select')?.focus();
+    } else {
+      addServerButton?.focus();
+    }
   }
 
-  function openDialog(nextDialog: Exclude<DialogState, null>): void {
+  function openDialog(
+    nextDialog: Exclude<DialogState, null>,
+    invoker: HTMLElement | null = null,
+  ): void {
     dialogInvoker =
-      document.activeElement instanceof HTMLElement
+      invoker ??
+      (document.activeElement instanceof HTMLElement
         ? document.activeElement
-        : null;
+        : null);
     dialog = nextDialog;
     void tick().then(() =>
-      nextDialog.kind === 'unsafeBlock' || nextDialog.kind === 'windowClose'
+      nextDialog.kind === 'unsafeBlock' ||
+      nextDialog.kind === 'windowClose' ||
+      nextDialog.kind === 'dirtyWindowClose'
         ? dialogCancelButton?.focus()
         : dialogPrimaryButton?.focus(),
     );
   }
 
+  function focusServerAction(action: string, profileName: string): void {
+    const label = `${action} ${profileName}`;
+    Array.from(document.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.getAttribute('aria-label') === label)
+      ?.focus();
+  }
+
   function closeDialog(): void {
-    if (dialog?.kind === 'windowClose') return;
+    if (dialog?.kind === 'windowClose' || dialog?.kind === 'dirtyWindowClose') {
+      return;
+    }
     const returnFocus = dialogInvoker;
     dialog = null;
     dialogInvoker = null;
@@ -954,7 +1083,10 @@
   function handleDialogKeydown(event: KeyboardEvent): void {
     if (event.key === 'Escape') {
       event.preventDefault();
-      if (dialog?.kind === 'windowClose') {
+      if (
+        dialog?.kind === 'windowClose' ||
+        dialog?.kind === 'dirtyWindowClose'
+      ) {
         void cancelWindowClose();
       } else {
         closeDialog();
@@ -1275,6 +1407,27 @@
   }
 
   function handleWindowCloseRequest(request: WindowCloseRequest): void {
+    if (draftChanged) {
+      if (dialog?.kind === 'dirtyWindowClose') {
+        if (dialog.request.requestId !== request.requestId) {
+          closeDecisionBusy = false;
+          closeDecisionMessage = '';
+        }
+        dialog = { kind: 'dirtyWindowClose', request };
+        return;
+      }
+      openDialog({ kind: 'dirtyWindowClose', request });
+      return;
+    }
+    if (request.lifecycle.settingsEditable) {
+      closeDecisionBusy = true;
+      void api.confirmWindowClose(request.requestId).catch(() => {
+        closeDecisionBusy = false;
+        connectionMessage =
+          'PaqetGUI could not close. Use the window close control to try again.';
+      });
+      return;
+    }
     if (dialog?.kind === 'windowClose') {
       if (dialog.request.requestId !== request.requestId) {
         closeDecisionBusy = false;
@@ -1290,7 +1443,10 @@
 
   async function cancelWindowClose(): Promise<void> {
     const action = dialog;
-    if (action?.kind !== 'windowClose' || closeDecisionBusy) {
+    if (
+      (action?.kind !== 'windowClose' && action?.kind !== 'dirtyWindowClose') ||
+      closeDecisionBusy
+    ) {
       return;
     }
     const requestId = action.request.requestId;
@@ -1299,14 +1455,16 @@
     try {
       await api.cancelWindowClose(requestId);
       if (
-        dialog?.kind === 'windowClose' &&
+        (dialog?.kind === 'windowClose' ||
+          dialog?.kind === 'dirtyWindowClose') &&
         dialog.request.requestId === requestId
       ) {
         dismissWindowCloseDialog();
       }
     } catch {
       if (
-        dialog?.kind !== 'windowClose' ||
+        (dialog?.kind !== 'windowClose' &&
+          dialog?.kind !== 'dirtyWindowClose') ||
         dialog.request.requestId !== requestId
       ) {
         return;
@@ -2305,6 +2463,7 @@
 </svelte:head>
 
 <main
+  class:server-view={appView === 'servers'}
   class="app-shell"
   inert={dialog ? true : undefined}
   aria-hidden={dialog ? 'true' : undefined}
@@ -2328,232 +2487,299 @@
     </p>
   </header>
 
-  <section
-    class="configuration"
-    aria-labelledby="profile-heading"
-    aria-busy={connectionBusy}
-    inert={connectionBusy ? true : undefined}
-  >
-    <div class="section-heading">
-      <div>
-        <p class="eyebrow">Configuration</p>
-        <h2 id="profile-heading">Server profile</h2>
-      </div>
-      <span class="section-count">
-        {snapshot?.profiles.length ?? 0}
-        {(snapshot?.profiles.length ?? 0) === 1 ? 'profile' : 'profiles'}
-      </span>
-    </div>
-
-    {#if loading}
-      <div class="empty-state" role="status">Loading profiles…</div>
-    {:else if !snapshot}
-      <div class="empty-state">
-        <p>Profiles are unavailable.</p>
+  {#if appView === 'servers'}
+    <section
+      class="server-management"
+      aria-labelledby="server-management-heading"
+      aria-busy={saving}
+    >
+      <div class="management-header">
         <button
-          class="secondary-button compact-button"
+          class="icon-button back-button"
           type="button"
-          onclick={loadSnapshot}
+          aria-label="Back to connection"
+          title="Back to connection"
+          onclick={() => requestProfileIntent({ kind: 'leave' })}
         >
-          Try again
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m14.5 5-7 7 7 7"></path>
+          </svg>
         </button>
-      </div>
-    {:else}
-      <div class="profile-toolbar">
-        <label class="sr-only" for="profile-select"
-          >Selected server profile</label
-        >
-        <select
-          id="profile-select"
-          bind:this={profileSelect}
-          value={selectedProfile?.id ?? ''}
-          disabled={!settingsEditable ||
-            mutationBusy ||
-            snapshot.profiles.length === 0}
-          onchange={handleProfileSelection}
-        >
-          {#if snapshot.profiles.length === 0}
-            <option value="">No profiles saved</option>
-          {/if}
-          {#each snapshot.profiles as profile (profile.id)}
-            <option value={profile.id}>{profile.name}</option>
-          {/each}
-        </select>
+        <div>
+          <p class="eyebrow">Configuration</p>
+          <h2 id="server-management-heading">Servers</h2>
+        </div>
         <button
-          class="secondary-button compact-button"
+          class="icon-button add-server-button"
           type="button"
-          bind:this={newProfileButton}
+          bind:this={addServerButton}
+          aria-label="Add server"
+          title="Add server"
           disabled={!settingsEditable || mutationBusy}
-          onclick={beginCreate}
+          onclick={() => requestProfileIntent({ kind: 'create' })}
         >
-          New
-        </button>
-        <button
-          class="secondary-button compact-button"
-          type="button"
-          disabled={!selectedProfile ||
-            !settingsEditable ||
-            mutationBusy ||
-            editorOpen}
-          onclick={beginEdit}
-        >
-          Edit
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14M5 12h14"></path>
+          </svg>
         </button>
       </div>
 
-      {#if !selectedProfile && editorMode === 'view'}
+      {#if !settingsEditable}
+        <p class="management-lock" role="status">
+          Servers are locked while paqet is active. Saved details remain
+          available for inspection.
+        </p>
+      {/if}
+
+      {#if message}
+        <p class="app-message" role="alert">{message}</p>
+      {/if}
+
+      {#if loading}
+        <div class="empty-state" role="status">Loading servers…</div>
+      {:else if !snapshot}
         <div class="empty-state">
-          <p>Add a server profile to begin configuring paqet.</p>
+          <p>Servers are unavailable.</p>
           <button
-            class="secondary-button"
+            class="secondary-button compact-button"
             type="button"
-            disabled={!settingsEditable || mutationBusy}
-            onclick={beginCreate}
+            onclick={loadSnapshot}
           >
-            Add server profile
+            Try again
           </button>
         </div>
       {:else}
-        <form
-          class="profile-form"
-          aria-label="Server profile"
-          onsubmit={saveProfile}
-          novalidate
-        >
-          <div class="field field-name">
-            <label for="profile-name">Profile name</label>
-            <input
-              id="profile-name"
-              bind:this={nameInput}
-              bind:value={draft.name}
-              readonly={!editorOpen || !settingsEditable}
-              disabled={saving}
-              autocomplete="off"
-              required={editorOpen}
-              aria-invalid={fieldErrors.name ? 'true' : undefined}
-              aria-describedby={fieldErrors.name
-                ? 'profile-name-error'
-                : undefined}
-              onblur={() => editorOpen && handleFieldBlur('name')}
-            />
-            {#if fieldErrors.name}
-              <p class="field-error" id="profile-name-error">
-                {fieldErrors.name}
-              </p>
-            {/if}
-          </div>
-
-          <div class="server-row">
-            <div class="field field-host">
-              <label for="server-host">Server IP or host</label>
-              <input
-                id="server-host"
-                bind:this={serverHostInput}
-                bind:value={draft.serverHost}
-                readonly={!editorOpen || !settingsEditable}
-                disabled={saving}
-                autocapitalize="none"
-                autocomplete="off"
-                spellcheck="false"
-                required={editorOpen}
-                aria-invalid={fieldErrors.serverHost ? 'true' : undefined}
-                aria-describedby={fieldErrors.serverHost
-                  ? 'server-host-error'
-                  : undefined}
-                onblur={() => editorOpen && handleFieldBlur('serverHost')}
-              />
-              {#if fieldErrors.serverHost}
-                <p class="field-error" id="server-host-error">
-                  {fieldErrors.serverHost}
-                </p>
-              {/if}
-            </div>
-
-            <div class="field field-port">
-              <label for="server-port">Port</label>
-              <input
-                id="server-port"
-                bind:this={portInput}
-                bind:value={draft.port}
-                readonly={!editorOpen || !settingsEditable}
-                disabled={saving}
-                inputmode="numeric"
-                autocomplete="off"
-                required={editorOpen}
-                aria-invalid={fieldErrors.port ? 'true' : undefined}
-                aria-describedby={fieldErrors.port
-                  ? 'server-port-error'
-                  : undefined}
-                onblur={() => editorOpen && handleFieldBlur('port')}
-              />
-              {#if fieldErrors.port}
-                <p class="field-error" id="server-port-error">
-                  {fieldErrors.port}
-                </p>
-              {/if}
-            </div>
-          </div>
-
-          <div class="field">
-            <label for="encryption-key">Encryption key</label>
-            <div class="secret-control">
-              <input
-                id="encryption-key"
-                bind:this={encryptionKeyInput}
-                bind:value={draft.encryptionKey}
-                type={revealKey ? 'text' : 'password'}
-                readonly={!editorOpen || !settingsEditable}
-                disabled={saving}
-                autocomplete="off"
-                spellcheck="false"
-                required={editorOpen}
-                aria-invalid={fieldErrors.encryptionKey ? 'true' : undefined}
-                aria-describedby={fieldErrors.encryptionKey
-                  ? 'encryption-key-error'
-                  : undefined}
-                onblur={() => editorOpen && handleFieldBlur('encryptionKey')}
-              />
+        <div class="server-list" aria-label="Saved servers">
+          {#each snapshot.profiles as profile (profile.id)}
+            <article
+              class:selected-server={profile.id === selectedProfile?.id}
+              class="server-card"
+            >
               <button
-                class="text-button reveal-button"
+                id={`server-card-${profile.id}`}
+                class="server-card-select"
                 type="button"
-                aria-pressed={revealKey}
-                aria-label={revealKey
-                  ? 'Conceal encryption key'
-                  : 'Reveal encryption key'}
-                disabled={saving || !draft.encryptionKey}
-                onclick={() => (revealKey = !revealKey)}
+                aria-label={`Use ${profile.name}, ${profile.serverHost}:${profile.port}`}
+                aria-current={profile.id === selectedProfile?.id
+                  ? 'true'
+                  : undefined}
+                disabled={!settingsEditable || mutationBusy}
+                onclick={() =>
+                  requestProfileIntent({
+                    kind: 'select',
+                    profileId: profile.id,
+                  })}
               >
-                {revealKey ? 'Hide' : 'Show'}
+                <span class="server-card-copy">
+                  <strong>{profile.name}</strong>
+                  <span>{profile.serverHost}:{profile.port}</span>
+                </span>
+                {#if profile.id === selectedProfile?.id}
+                  <span class="selected-label">Selected</span>
+                {/if}
+              </button>
+              <div
+                class="server-card-actions"
+                aria-label={`${profile.name} actions`}
+              >
+                <button
+                  class="icon-button"
+                  type="button"
+                  aria-label={`Edit ${profile.name}`}
+                  title={`Edit ${profile.name}`}
+                  disabled={!settingsEditable || mutationBusy}
+                  onclick={() =>
+                    requestProfileIntent({
+                      kind: 'edit',
+                      profileId: profile.id,
+                    })}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="m4 16-.8 4.8L8 20l10.6-10.6a2.1 2.1 0 0 0-3-3Z"
+                    ></path>
+                    <path d="m14.5 7.5 2 2"></path>
+                  </svg>
+                </button>
+                <button
+                  class="icon-button delete-icon-button"
+                  type="button"
+                  aria-label={`Delete ${profile.name}`}
+                  title={`Delete ${profile.name}`}
+                  disabled={!settingsEditable || mutationBusy}
+                  onclick={() => requestDelete(profile)}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"
+                    ></path>
+                  </svg>
+                </button>
+              </div>
+            </article>
+          {:else}
+            <div class="empty-state server-empty-state">
+              <strong>No servers yet</strong>
+              <p>Add a server to start configuring paqet.</p>
+              <button
+                class="primary-small"
+                type="button"
+                disabled={!settingsEditable || mutationBusy}
+                onclick={() => requestProfileIntent({ kind: 'create' })}
+              >
+                Add a server
               </button>
             </div>
-            {#if fieldErrors.encryptionKey}
-              <p class="field-error" id="encryption-key-error">
-                {fieldErrors.encryptionKey}
-              </p>
-            {/if}
-          </div>
+          {/each}
+        </div>
 
-          {#if editorOpen}
-            <div class="form-actions">
-              {#if editorMode === 'edit'}
-                <button
-                  class="danger-button"
-                  type="button"
-                  disabled={mutationBusy || !settingsEditable}
-                  onclick={requestDelete}
+        {#if editorOpen}
+          <form
+            class="profile-form server-editor"
+            aria-label={editorMode === 'create' ? 'Add server' : 'Edit server'}
+            onsubmit={saveProfile}
+            novalidate
+          >
+            <div class="editor-heading">
+              <div>
+                <p class="eyebrow">
+                  {editorMode === 'create' ? 'New server' : 'Server details'}
+                </p>
+                <h3>
+                  {editorMode === 'create'
+                    ? 'Add a server'
+                    : `Edit ${selectedProfile?.name ?? 'server'}`}
+                </h3>
+              </div>
+              <button
+                class="icon-button"
+                type="button"
+                aria-label="Close server editor"
+                title="Close server editor"
+                disabled={saving}
+                onclick={() => requestProfileIntent({ kind: 'closeEditor' })}
+              >
+                <svg viewBox="0 0 24 24" aria-hidden="true"
+                  ><path d="m6 6 12 12M18 6 6 18"></path></svg
                 >
-                  Delete profile
-                </button>
-              {/if}
+              </button>
+            </div>
+
+            <div class="field field-name">
+              <label for="profile-name">Profile name</label>
+              <input
+                id="profile-name"
+                bind:this={nameInput}
+                bind:value={draft.name}
+                disabled={saving || !settingsEditable}
+                autocomplete="off"
+                required
+                aria-invalid={fieldErrors.name ? 'true' : undefined}
+                aria-describedby={fieldErrors.name
+                  ? 'profile-name-error'
+                  : undefined}
+                onblur={() => handleFieldBlur('name')}
+              />
+              {#if fieldErrors.name}<p
+                  class="field-error"
+                  id="profile-name-error"
+                >
+                  {fieldErrors.name}
+                </p>{/if}
+            </div>
+            <div class="server-row">
+              <div class="field field-host">
+                <label for="server-host">Server IP or host</label>
+                <input
+                  id="server-host"
+                  bind:this={serverHostInput}
+                  bind:value={draft.serverHost}
+                  disabled={saving || !settingsEditable}
+                  autocapitalize="none"
+                  autocomplete="off"
+                  spellcheck="false"
+                  required
+                  aria-invalid={fieldErrors.serverHost ? 'true' : undefined}
+                  aria-describedby={fieldErrors.serverHost
+                    ? 'server-host-error'
+                    : undefined}
+                  onblur={() => handleFieldBlur('serverHost')}
+                />
+                {#if fieldErrors.serverHost}<p
+                    class="field-error"
+                    id="server-host-error"
+                  >
+                    {fieldErrors.serverHost}
+                  </p>{/if}
+              </div>
+              <div class="field field-port">
+                <label for="server-port">Port</label>
+                <input
+                  id="server-port"
+                  bind:this={portInput}
+                  bind:value={draft.port}
+                  disabled={saving || !settingsEditable}
+                  inputmode="numeric"
+                  autocomplete="off"
+                  required
+                  aria-invalid={fieldErrors.port ? 'true' : undefined}
+                  aria-describedby={fieldErrors.port
+                    ? 'server-port-error'
+                    : undefined}
+                  onblur={() => handleFieldBlur('port')}
+                />
+                {#if fieldErrors.port}<p
+                    class="field-error"
+                    id="server-port-error"
+                  >
+                    {fieldErrors.port}
+                  </p>{/if}
+              </div>
+            </div>
+            <div class="field">
+              <label for="encryption-key">Encryption key</label>
+              <div class="secret-control">
+                <input
+                  id="encryption-key"
+                  bind:this={encryptionKeyInput}
+                  bind:value={draft.encryptionKey}
+                  type={revealKey ? 'text' : 'password'}
+                  disabled={saving || !settingsEditable}
+                  autocomplete="off"
+                  spellcheck="false"
+                  required
+                  aria-invalid={fieldErrors.encryptionKey ? 'true' : undefined}
+                  aria-describedby={fieldErrors.encryptionKey
+                    ? 'encryption-key-error'
+                    : undefined}
+                  onblur={() => handleFieldBlur('encryptionKey')}
+                />
+                <button
+                  class="text-button reveal-button"
+                  type="button"
+                  aria-pressed={revealKey}
+                  aria-label={revealKey
+                    ? 'Conceal encryption key'
+                    : 'Reveal encryption key'}
+                  disabled={saving || !draft.encryptionKey}
+                  onclick={() => (revealKey = !revealKey)}
+                  >{revealKey ? 'Hide' : 'Show'}</button
+                >
+              </div>
+              {#if fieldErrors.encryptionKey}<p
+                  class="field-error"
+                  id="encryption-key-error"
+                >
+                  {fieldErrors.encryptionKey}
+                </p>{/if}
+            </div>
+            <div class="form-actions">
               <span class="action-spacer"></span>
               <button
                 class="text-button"
                 type="button"
                 disabled={saving}
-                onclick={cancelEdit}
+                onclick={() => requestProfileIntent({ kind: 'closeEditor' })}
+                >Cancel</button
               >
-                Cancel
-              </button>
               <button
                 class="primary-small"
                 type="submit"
@@ -2566,753 +2792,829 @@
                     : 'Save changes'}
               </button>
             </div>
-          {/if}
-        </form>
+          </form>
+        {/if}
       {/if}
+    </section>
+  {:else}
+    <section
+      class="configuration"
+      aria-labelledby="profile-heading"
+      aria-busy={connectionBusy}
+      inert={connectionBusy ? true : undefined}
+    >
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Configuration</p>
+          <h2 id="profile-heading">Connection setup</h2>
+        </div>
+      </div>
 
-      <div class="advanced-shell">
+      {#if loading}
+        <div class="empty-state" role="status">Loading profiles…</div>
+      {:else if !snapshot}
+        <div class="empty-state">
+          <p>Profiles are unavailable.</p>
+          <button
+            class="secondary-button compact-button"
+            type="button"
+            onclick={loadSnapshot}
+          >
+            Try again
+          </button>
+        </div>
+      {:else}
         <button
-          class="disclosure-button"
+          class="server-summary"
           type="button"
-          aria-expanded={advancedExpanded}
-          aria-controls="advanced-content"
-          onclick={() => (advancedExpanded = !advancedExpanded)}
+          bind:this={serverSummaryButton}
+          aria-label={selectedProfile
+            ? `Manage servers. Selected ${selectedProfile.name}, ${selectedProfile.serverHost}:${selectedProfile.port}`
+            : 'Add a server'}
+          onclick={openServerManagement}
         >
-          <span>
-            <strong>Advanced</strong>
-            <small>Network interface and paqet overrides</small>
+          <span class="server-summary-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="4" y="4" width="16" height="6" rx="2"></rect>
+              <rect x="4" y="14" width="16" height="6" rx="2"></rect>
+              <path d="M8 7h.01M8 17h.01"></path>
+            </svg>
           </span>
-          <span class="chevron" aria-hidden="true"></span>
+          <span class="server-summary-copy">
+            <small>{selectedProfile ? 'Selected server' : 'Server'}</small>
+            <strong>{selectedProfile?.name ?? 'Add a server'}</strong>
+            {#if selectedProfile}
+              <span>{selectedProfile.serverHost}:{selectedProfile.port}</span>
+            {:else}
+              <span>Choose where PaqetGUI connects</span>
+            {/if}
+          </span>
+          <svg class="summary-chevron" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="m9 5 7 7-7 7"></path>
+          </svg>
         </button>
-        {#if advancedExpanded}
-          <div id="advanced-content" class="advanced-content">
-            <section
-              class="interface-section"
-              aria-labelledby="interface-heading"
-            >
-              <div class="advanced-section-heading">
-                <div>
-                  <h3 id="interface-heading">Network interface</h3>
-                  <p>Used to derive the local paqet connection details.</p>
-                </div>
-                <button
-                  class="text-button refresh-button"
-                  type="button"
-                  disabled={!settingsEditable || mutationBusy}
-                  onclick={refreshInterfaces}
-                >
-                  {interfaceOperation === 'refresh' ? 'Refreshing…' : 'Refresh'}
-                </button>
-              </div>
 
-              <div class="field">
-                <label for="interface-select">Interface</label>
-                <select
-                  id="interface-select"
-                  class="interface-select"
-                  value={snapshot.selectedInterfaceGuid ?? ''}
-                  disabled={!settingsEditable ||
-                    mutationBusy ||
-                    snapshot.interfaces.length === 0}
-                  onchange={handleInterfaceSelection}
-                >
-                  {#if snapshot.interfaces.length === 0}
-                    <option value="">No usable interfaces found</option>
-                  {:else if !snapshot.selectedInterfaceGuid}
-                    <option value="">Select an interface</option>
-                  {/if}
-                  {#each snapshot.interfaces as networkInterface (networkInterface.guid)}
-                    <option value={networkInterface.guid}>
-                      {interfaceOptionLabel(networkInterface)}
-                    </option>
-                  {/each}
-                </select>
-              </div>
-
-              {#if interfaceOperation === 'select'}
-                <p class="interface-progress" role="status" aria-live="polite">
-                  Selecting network interface…
-                </p>
-              {/if}
-
-              {#if interfaceMessage}
-                <p class="inline-message" role="alert">{interfaceMessage}</p>
-              {/if}
-
-              {#if selectedInterface}
-                <dl
-                  class="interface-details"
-                  aria-label="Derived interface details"
-                >
+        <div class="advanced-shell">
+          <button
+            class="disclosure-button"
+            type="button"
+            aria-expanded={advancedExpanded}
+            aria-controls="advanced-content"
+            onclick={() => (advancedExpanded = !advancedExpanded)}
+          >
+            <span>
+              <strong>Advanced</strong>
+              <small>Network interface and paqet overrides</small>
+            </span>
+            <span class="chevron" aria-hidden="true"></span>
+          </button>
+          {#if advancedExpanded}
+            <div id="advanced-content" class="advanced-content">
+              <section
+                class="interface-section"
+                aria-labelledby="interface-heading"
+              >
+                <div class="advanced-section-heading">
                   <div>
-                    <dt>Interface name</dt>
-                    <dd>{selectedInterface.interfaceName}</dd>
+                    <h3 id="interface-heading">Network interface</h3>
+                    <p>Used to derive the local paqet connection details.</p>
                   </div>
-                  <div>
-                    <dt>Npcap device</dt>
-                    <dd>{selectedInterface.guid}</dd>
-                  </div>
-                  <div>
-                    <dt>Local address</dt>
-                    <dd>{selectedInterface.localAddress}</dd>
-                  </div>
-                  <div>
-                    <dt>Gateway address</dt>
-                    <dd>{selectedInterface.gatewayAddress}</dd>
-                  </div>
-                  <div>
-                    <dt>Gateway MAC</dt>
-                    <dd>{selectedInterface.gatewayMac}</dd>
-                  </div>
-                </dl>
-              {:else}
-                <div class="interface-empty" role="status">
-                  <strong>No usable network interface is available.</strong>
-                  <span>Connect Ethernet or Wi-Fi, then refresh the list.</span>
-                </div>
-              {/if}
-            </section>
-
-            <section
-              class="override-section"
-              aria-labelledby="override-heading"
-            >
-              <div class="advanced-section-heading">
-                <div>
-                  <h3 id="override-heading">Common overrides</h3>
-                  <p>
-                    Optional values replace paqet defaults for this session.
-                  </p>
-                </div>
-              </div>
-
-              {#if settingsOperation && isCommonSettingField(settingsOperation)}
-                <p class="settings-progress" role="status" aria-live="polite">
-                  Updating {settingsFieldLabel(settingsOperation)}…
-                </p>
-              {/if}
-              {#if settingsMessage}
-                <p class="inline-message" role="alert">{settingsMessage}</p>
-              {/if}
-
-              <div class="override-list">
-                <div class="override-item">
-                  <label class="override-toggle">
-                    <input
-                      type="checkbox"
-                      checked={snapshot.advancedSettings.logLevel !== null}
-                      disabled={!settingsEditable ||
-                        saving ||
-                        interfaceBusy ||
-                        settingsOperation === 'logLevel'}
-                      onchange={(event) =>
-                        toggleCommonOverride(
-                          'logLevel',
-                          (event.currentTarget as HTMLInputElement).checked,
-                        )}
-                    />
-                    <span>
-                      <strong>Override log level</strong>
-                      <small>Info remains required for connection status.</small
-                      >
-                    </span>
-                  </label>
-                  <div class="override-control">
-                    <label for="log-level">Log level</label>
-                    <select
-                      id="log-level"
-                      value={snapshot.advancedSettings.logLevel ?? 'info'}
-                      disabled={snapshot.advancedSettings.logLevel === null ||
-                        !settingsEditable ||
-                        saving ||
-                        interfaceBusy ||
-                        settingsOperation === 'logLevel'}
-                      onchange={selectLogLevel}
-                    >
-                      <option value="info">Info</option>
-                      <option value="debug">Debug</option>
-                    </select>
-                  </div>
+                  <button
+                    class="text-button refresh-button"
+                    type="button"
+                    disabled={!settingsEditable || mutationBusy}
+                    onclick={refreshInterfaces}
+                  >
+                    {interfaceOperation === 'refresh'
+                      ? 'Refreshing…'
+                      : 'Refresh'}
+                  </button>
                 </div>
 
-                <div class="override-item">
-                  <label class="override-toggle">
-                    <input
-                      type="checkbox"
-                      checked={snapshot.advancedSettings.pcapSocketBuffer !==
-                        null}
-                      disabled={!settingsEditable ||
-                        saving ||
-                        interfaceBusy ||
-                        settingsOperation === 'pcapSocketBuffer'}
-                      onchange={(event) =>
-                        toggleCommonOverride(
-                          'pcapSocketBuffer',
-                          (event.currentTarget as HTMLInputElement).checked,
-                        )}
-                    />
-                    <span>
-                      <strong>Override PCAP socket buffer</strong>
-                      <small>Default 4194304 bytes.</small>
-                    </span>
-                  </label>
-                  <div class="override-control">
-                    <label for="pcap-socket-buffer">PCAP socket buffer</label>
-                    <input
-                      id="pcap-socket-buffer"
-                      bind:this={commonFieldInputs.pcapSocketBuffer}
-                      bind:value={commonDraft.pcapSocketBuffer}
-                      inputmode="numeric"
-                      autocomplete="off"
-                      disabled={snapshot.advancedSettings.pcapSocketBuffer ===
-                        null ||
-                        !settingsEditable ||
-                        saving ||
-                        interfaceBusy}
-                      aria-invalid={commonErrors.pcapSocketBuffer
-                        ? 'true'
-                        : undefined}
-                      aria-describedby="pcap-socket-buffer-hint{commonErrors.pcapSocketBuffer
-                        ? ' pcap-socket-buffer-error'
-                        : ''}"
-                      oninput={() => handleCommonInput('pcapSocketBuffer')}
-                      onblur={() =>
-                        scheduleCommonDraftCommit('pcapSocketBuffer')}
-                      onkeydown={handleCommonKeydown}
-                    />
-                    <p class="field-hint" id="pcap-socket-buffer-hint">
-                      1024–104857600 bytes
-                    </p>
-                    {#if commonErrors.pcapSocketBuffer}
-                      <p class="field-error" id="pcap-socket-buffer-error">
-                        {commonErrors.pcapSocketBuffer}
-                      </p>
+                <div class="field">
+                  <label for="interface-select">Interface</label>
+                  <select
+                    id="interface-select"
+                    class="interface-select"
+                    value={snapshot.selectedInterfaceGuid ?? ''}
+                    disabled={!settingsEditable ||
+                      mutationBusy ||
+                      snapshot.interfaces.length === 0}
+                    onchange={handleInterfaceSelection}
+                  >
+                    {#if snapshot.interfaces.length === 0}
+                      <option value="">No usable interfaces found</option>
+                    {:else if !snapshot.selectedInterfaceGuid}
+                      <option value="">Select an interface</option>
                     {/if}
+                    {#each snapshot.interfaces as networkInterface (networkInterface.guid)}
+                      <option value={networkInterface.guid}>
+                        {interfaceOptionLabel(networkInterface)}
+                      </option>
+                    {/each}
+                  </select>
+                </div>
+
+                {#if interfaceOperation === 'select'}
+                  <p
+                    class="interface-progress"
+                    role="status"
+                    aria-live="polite"
+                  >
+                    Selecting network interface…
+                  </p>
+                {/if}
+
+                {#if interfaceMessage}
+                  <p class="inline-message" role="alert">{interfaceMessage}</p>
+                {/if}
+
+                {#if selectedInterface}
+                  <dl
+                    class="interface-details"
+                    aria-label="Derived interface details"
+                  >
+                    <div>
+                      <dt>Interface name</dt>
+                      <dd>{selectedInterface.interfaceName}</dd>
+                    </div>
+                    <div>
+                      <dt>Npcap device</dt>
+                      <dd>{selectedInterface.guid}</dd>
+                    </div>
+                    <div>
+                      <dt>Local address</dt>
+                      <dd>{selectedInterface.localAddress}</dd>
+                    </div>
+                    <div>
+                      <dt>Gateway address</dt>
+                      <dd>{selectedInterface.gatewayAddress}</dd>
+                    </div>
+                    <div>
+                      <dt>Gateway MAC</dt>
+                      <dd>{selectedInterface.gatewayMac}</dd>
+                    </div>
+                  </dl>
+                {:else}
+                  <div class="interface-empty" role="status">
+                    <strong>No usable network interface is available.</strong>
+                    <span
+                      >Connect Ethernet or Wi-Fi, then refresh the list.</span
+                    >
+                  </div>
+                {/if}
+              </section>
+
+              <section
+                class="override-section"
+                aria-labelledby="override-heading"
+              >
+                <div class="advanced-section-heading">
+                  <div>
+                    <h3 id="override-heading">Common overrides</h3>
+                    <p>
+                      Optional values replace paqet defaults for this session.
+                    </p>
                   </div>
                 </div>
 
-                {#each flagFields as field (field)}
-                  {@const prefix =
-                    field === 'localTcpFlags' ? 'Local' : 'Remote'}
-                  {@const inputId =
-                    field === 'localTcpFlags'
-                      ? 'local-tcp-flags'
-                      : 'remote-tcp-flags'}
+                {#if settingsOperation && isCommonSettingField(settingsOperation)}
+                  <p class="settings-progress" role="status" aria-live="polite">
+                    Updating {settingsFieldLabel(settingsOperation)}…
+                  </p>
+                {/if}
+                {#if settingsMessage}
+                  <p class="inline-message" role="alert">{settingsMessage}</p>
+                {/if}
+
+                <div class="override-list">
                   <div class="override-item">
                     <label class="override-toggle">
                       <input
                         type="checkbox"
-                        checked={snapshot.advancedSettings[field] !== null}
+                        checked={snapshot.advancedSettings.logLevel !== null}
                         disabled={!settingsEditable ||
                           saving ||
                           interfaceBusy ||
-                          settingsOperation === field}
+                          settingsOperation === 'logLevel'}
                         onchange={(event) =>
                           toggleCommonOverride(
-                            field,
+                            'logLevel',
                             (event.currentTarget as HTMLInputElement).checked,
                           )}
                       />
                       <span>
-                        <strong
-                          >Override {prefix.toLowerCase()} TCP flags</strong
+                        <strong>Override log level</strong>
+                        <small
+                          >Info remains required for connection status.</small
                         >
-                        <small>Default PA.</small>
                       </span>
                     </label>
                     <div class="override-control">
-                      <label for={inputId}>{prefix} TCP flags</label>
-                      <input
-                        id={inputId}
-                        bind:this={commonFieldInputs[field]}
-                        bind:value={commonDraft[field]}
-                        autocapitalize="characters"
-                        autocomplete="off"
-                        spellcheck="false"
-                        disabled={snapshot.advancedSettings[field] === null ||
+                      <label for="log-level">Log level</label>
+                      <select
+                        id="log-level"
+                        value={snapshot.advancedSettings.logLevel ?? 'info'}
+                        disabled={snapshot.advancedSettings.logLevel === null ||
                           !settingsEditable ||
                           saving ||
-                          interfaceBusy}
-                        aria-invalid={commonErrors[field] ? 'true' : undefined}
-                        aria-describedby="{inputId}-hint{commonErrors[field]
-                          ? ` ${inputId}-error`
-                          : ''}"
-                        oninput={() => handleCommonInput(field)}
-                        onblur={() => scheduleCommonDraftCommit(field)}
-                        onkeydown={handleCommonKeydown}
-                      />
-                      <p class="field-hint" id="{inputId}-hint">
-                        Comma-separated combinations, for example PA, S.
-                      </p>
-                      {#if commonErrors[field]}
-                        <p class="field-error" id="{inputId}-error">
-                          {commonErrors[field]}
-                        </p>
-                      {/if}
+                          interfaceBusy ||
+                          settingsOperation === 'logLevel'}
+                        onchange={selectLogLevel}
+                      >
+                        <option value="info">Info</option>
+                        <option value="debug">Debug</option>
+                      </select>
                     </div>
                   </div>
-                {/each}
 
-                {#each numericFields as item (item.field)}
-                  {@const inputId = item.field.replace(
-                    /[A-Z]/g,
-                    (letter) => `-${letter.toLowerCase()}`,
-                  )}
                   <div class="override-item">
                     <label class="override-toggle">
                       <input
                         type="checkbox"
-                        checked={snapshot.advancedSettings[item.field] !== null}
+                        checked={snapshot.advancedSettings.pcapSocketBuffer !==
+                          null}
                         disabled={!settingsEditable ||
                           saving ||
                           interfaceBusy ||
-                          settingsOperation === item.field}
+                          settingsOperation === 'pcapSocketBuffer'}
                         onchange={(event) =>
                           toggleCommonOverride(
-                            item.field,
+                            'pcapSocketBuffer',
                             (event.currentTarget as HTMLInputElement).checked,
                           )}
                       />
                       <span>
-                        <strong>Override {item.title}</strong>
-                        <small>Default {item.defaultValue}.</small>
+                        <strong>Override PCAP socket buffer</strong>
+                        <small>Default 4194304 bytes.</small>
                       </span>
                     </label>
                     <div class="override-control">
-                      <label for={inputId}>{item.label}</label>
+                      <label for="pcap-socket-buffer">PCAP socket buffer</label>
                       <input
-                        id={inputId}
-                        bind:this={commonFieldInputs[item.field]}
-                        bind:value={commonDraft[item.field]}
+                        id="pcap-socket-buffer"
+                        bind:this={commonFieldInputs.pcapSocketBuffer}
+                        bind:value={commonDraft.pcapSocketBuffer}
                         inputmode="numeric"
                         autocomplete="off"
-                        disabled={snapshot.advancedSettings[item.field] ===
+                        disabled={snapshot.advancedSettings.pcapSocketBuffer ===
                           null ||
                           !settingsEditable ||
                           saving ||
                           interfaceBusy}
-                        aria-invalid={commonErrors[item.field]
+                        aria-invalid={commonErrors.pcapSocketBuffer
                           ? 'true'
                           : undefined}
-                        aria-describedby="{inputId}-hint{commonErrors[
-                          item.field
-                        ]
-                          ? ` ${inputId}-error`
+                        aria-describedby="pcap-socket-buffer-hint{commonErrors.pcapSocketBuffer
+                          ? ' pcap-socket-buffer-error'
                           : ''}"
-                        oninput={() => handleCommonInput(item.field)}
-                        onblur={() => scheduleCommonDraftCommit(item.field)}
+                        oninput={() => handleCommonInput('pcapSocketBuffer')}
+                        onblur={() =>
+                          scheduleCommonDraftCommit('pcapSocketBuffer')}
                         onkeydown={handleCommonKeydown}
                       />
-                      <p class="field-hint" id="{inputId}-hint">{item.hint}</p>
-                      {#if commonErrors[item.field]}
-                        <p class="field-error" id="{inputId}-error">
-                          {commonErrors[item.field]}
+                      <p class="field-hint" id="pcap-socket-buffer-hint">
+                        1024–104857600 bytes
+                      </p>
+                      {#if commonErrors.pcapSocketBuffer}
+                        <p class="field-error" id="pcap-socket-buffer-error">
+                          {commonErrors.pcapSocketBuffer}
                         </p>
                       {/if}
                     </div>
                   </div>
-                {/each}
-              </div>
-            </section>
 
-            <section
-              class="override-section"
-              aria-labelledby="transport-override-heading"
-            >
-              <div class="advanced-section-heading">
-                <div>
-                  <h3 id="transport-override-heading">
-                    KCP and SMUX overrides
-                  </h3>
-                  <p>Transport tuning must match the remote paqet server.</p>
+                  {#each flagFields as field (field)}
+                    {@const prefix =
+                      field === 'localTcpFlags' ? 'Local' : 'Remote'}
+                    {@const inputId =
+                      field === 'localTcpFlags'
+                        ? 'local-tcp-flags'
+                        : 'remote-tcp-flags'}
+                    <div class="override-item">
+                      <label class="override-toggle">
+                        <input
+                          type="checkbox"
+                          checked={snapshot.advancedSettings[field] !== null}
+                          disabled={!settingsEditable ||
+                            saving ||
+                            interfaceBusy ||
+                            settingsOperation === field}
+                          onchange={(event) =>
+                            toggleCommonOverride(
+                              field,
+                              (event.currentTarget as HTMLInputElement).checked,
+                            )}
+                        />
+                        <span>
+                          <strong
+                            >Override {prefix.toLowerCase()} TCP flags</strong
+                          >
+                          <small>Default PA.</small>
+                        </span>
+                      </label>
+                      <div class="override-control">
+                        <label for={inputId}>{prefix} TCP flags</label>
+                        <input
+                          id={inputId}
+                          bind:this={commonFieldInputs[field]}
+                          bind:value={commonDraft[field]}
+                          autocapitalize="characters"
+                          autocomplete="off"
+                          spellcheck="false"
+                          disabled={snapshot.advancedSettings[field] === null ||
+                            !settingsEditable ||
+                            saving ||
+                            interfaceBusy}
+                          aria-invalid={commonErrors[field]
+                            ? 'true'
+                            : undefined}
+                          aria-describedby="{inputId}-hint{commonErrors[field]
+                            ? ` ${inputId}-error`
+                            : ''}"
+                          oninput={() => handleCommonInput(field)}
+                          onblur={() => scheduleCommonDraftCommit(field)}
+                          onkeydown={handleCommonKeydown}
+                        />
+                        <p class="field-hint" id="{inputId}-hint">
+                          Comma-separated combinations, for example PA, S.
+                        </p>
+                        {#if commonErrors[field]}
+                          <p class="field-error" id="{inputId}-error">
+                            {commonErrors[field]}
+                          </p>
+                        {/if}
+                      </div>
+                    </div>
+                  {/each}
+
+                  {#each numericFields as item (item.field)}
+                    {@const inputId = item.field.replace(
+                      /[A-Z]/g,
+                      (letter) => `-${letter.toLowerCase()}`,
+                    )}
+                    <div class="override-item">
+                      <label class="override-toggle">
+                        <input
+                          type="checkbox"
+                          checked={snapshot.advancedSettings[item.field] !==
+                            null}
+                          disabled={!settingsEditable ||
+                            saving ||
+                            interfaceBusy ||
+                            settingsOperation === item.field}
+                          onchange={(event) =>
+                            toggleCommonOverride(
+                              item.field,
+                              (event.currentTarget as HTMLInputElement).checked,
+                            )}
+                        />
+                        <span>
+                          <strong>Override {item.title}</strong>
+                          <small>Default {item.defaultValue}.</small>
+                        </span>
+                      </label>
+                      <div class="override-control">
+                        <label for={inputId}>{item.label}</label>
+                        <input
+                          id={inputId}
+                          bind:this={commonFieldInputs[item.field]}
+                          bind:value={commonDraft[item.field]}
+                          inputmode="numeric"
+                          autocomplete="off"
+                          disabled={snapshot.advancedSettings[item.field] ===
+                            null ||
+                            !settingsEditable ||
+                            saving ||
+                            interfaceBusy}
+                          aria-invalid={commonErrors[item.field]
+                            ? 'true'
+                            : undefined}
+                          aria-describedby="{inputId}-hint{commonErrors[
+                            item.field
+                          ]
+                            ? ` ${inputId}-error`
+                            : ''}"
+                          oninput={() => handleCommonInput(item.field)}
+                          onblur={() => scheduleCommonDraftCommit(item.field)}
+                          onkeydown={handleCommonKeydown}
+                        />
+                        <p class="field-hint" id="{inputId}-hint">
+                          {item.hint}
+                        </p>
+                        {#if commonErrors[item.field]}
+                          <p class="field-error" id="{inputId}-error">
+                            {commonErrors[item.field]}
+                          </p>
+                        {/if}
+                      </div>
+                    </div>
+                  {/each}
                 </div>
-              </div>
+              </section>
 
-              {#if settingsOperation && isKcpSettingField(settingsOperation)}
-                <p class="settings-progress" role="status" aria-live="polite">
-                  Updating {settingsFieldLabel(settingsOperation)}…
-                </p>
-              {/if}
-              {#if transportMessage}
-                <p class="inline-message" role="alert">
-                  {transportMessage}
-                </p>
-              {/if}
-
-              <div class="override-list">
-                <div class="override-item">
-                  <label class="override-toggle">
-                    <input
-                      type="checkbox"
-                      checked={snapshot.advancedSettings.kcpMode !== null}
-                      disabled={!settingsEditable ||
-                        saving ||
-                        interfaceBusy ||
-                        kcpModeQueued ||
-                        settingsOperation === 'kcpMode'}
-                      onchange={(event) =>
-                        handleKcpOverrideToggle(event, 'kcpMode')}
-                    />
-                    <span>
-                      <strong>Override KCP mode</strong>
-                      <small>Default Fast.</small>
-                    </span>
-                  </label>
-                  <div class="override-control">
-                    <label for="kcp-mode">KCP mode</label>
-                    <select
-                      id="kcp-mode"
-                      value={snapshot.advancedSettings.kcpMode ?? 'fast'}
-                      disabled={snapshot.advancedSettings.kcpMode === null ||
-                        !settingsEditable ||
-                        saving ||
-                        interfaceBusy ||
-                        kcpModeQueued ||
-                        settingsOperation === 'kcpMode'}
-                      onchange={selectKcpMode}
-                    >
-                      <option value="normal">Normal</option>
-                      <option value="fast">Fast</option>
-                      <option value="fast2">Fast 2</option>
-                      <option value="fast3">Fast 3</option>
-                      <option value="manual">Manual</option>
-                    </select>
+              <section
+                class="override-section"
+                aria-labelledby="transport-override-heading"
+              >
+                <div class="advanced-section-heading">
+                  <div>
+                    <h3 id="transport-override-heading">
+                      KCP and SMUX overrides
+                    </h3>
+                    <p>Transport tuning must match the remote paqet server.</p>
                   </div>
+                </div>
 
-                  {#if snapshot.advancedSettings.kcpMode === 'manual'}
-                    <fieldset class="manual-kcp">
-                      <legend>Manual KCP tuning</legend>
-                      <p class="field-hint">
-                        Initialized from the previously effective preset.
-                      </p>
-                      <div class="manual-kcp-grid">
-                        {#each manualKcpFields as item (item.field)}
-                          {@const inputId = item.field.replace(
-                            /[A-Z]/g,
-                            (letter) => `-${letter.toLowerCase()}`,
-                          )}
-                          <div class="field">
-                            <label for={inputId}>{item.label}</label>
+                {#if settingsOperation && isKcpSettingField(settingsOperation)}
+                  <p class="settings-progress" role="status" aria-live="polite">
+                    Updating {settingsFieldLabel(settingsOperation)}…
+                  </p>
+                {/if}
+                {#if transportMessage}
+                  <p class="inline-message" role="alert">
+                    {transportMessage}
+                  </p>
+                {/if}
+
+                <div class="override-list">
+                  <div class="override-item">
+                    <label class="override-toggle">
+                      <input
+                        type="checkbox"
+                        checked={snapshot.advancedSettings.kcpMode !== null}
+                        disabled={!settingsEditable ||
+                          saving ||
+                          interfaceBusy ||
+                          kcpModeQueued ||
+                          settingsOperation === 'kcpMode'}
+                        onchange={(event) =>
+                          handleKcpOverrideToggle(event, 'kcpMode')}
+                      />
+                      <span>
+                        <strong>Override KCP mode</strong>
+                        <small>Default Fast.</small>
+                      </span>
+                    </label>
+                    <div class="override-control">
+                      <label for="kcp-mode">KCP mode</label>
+                      <select
+                        id="kcp-mode"
+                        value={snapshot.advancedSettings.kcpMode ?? 'fast'}
+                        disabled={snapshot.advancedSettings.kcpMode === null ||
+                          !settingsEditable ||
+                          saving ||
+                          interfaceBusy ||
+                          kcpModeQueued ||
+                          settingsOperation === 'kcpMode'}
+                        onchange={selectKcpMode}
+                      >
+                        <option value="normal">Normal</option>
+                        <option value="fast">Fast</option>
+                        <option value="fast2">Fast 2</option>
+                        <option value="fast3">Fast 3</option>
+                        <option value="manual">Manual</option>
+                      </select>
+                    </div>
+
+                    {#if snapshot.advancedSettings.kcpMode === 'manual'}
+                      <fieldset class="manual-kcp">
+                        <legend>Manual KCP tuning</legend>
+                        <p class="field-hint">
+                          Initialized from the previously effective preset.
+                        </p>
+                        <div class="manual-kcp-grid">
+                          {#each manualKcpFields as item (item.field)}
+                            {@const inputId = item.field.replace(
+                              /[A-Z]/g,
+                              (letter) => `-${letter.toLowerCase()}`,
+                            )}
+                            <div class="field">
+                              <label for={inputId}>{item.label}</label>
+                              <input
+                                id={inputId}
+                                bind:this={kcpFieldInputs[item.field]}
+                                bind:value={kcpDraft[item.field]}
+                                inputmode="numeric"
+                                autocomplete="off"
+                                disabled={!settingsEditable ||
+                                  saving ||
+                                  interfaceBusy ||
+                                  kcpModeQueued ||
+                                  settingsOperation === 'kcpMode'}
+                                aria-invalid={kcpErrors[item.field]
+                                  ? 'true'
+                                  : undefined}
+                                aria-describedby="{inputId}-hint{kcpErrors[
+                                  item.field
+                                ]
+                                  ? ` ${inputId}-error`
+                                  : ''}"
+                                oninput={() => handleKcpInput(item.field)}
+                                onblur={() =>
+                                  scheduleKcpDraftCommit(item.field)}
+                                onkeydown={handleCommonKeydown}
+                              />
+                              <p class="field-hint" id="{inputId}-hint">
+                                {item.hint}
+                              </p>
+                              {#if kcpErrors[item.field]}
+                                <p class="field-error" id="{inputId}-error">
+                                  {kcpErrors[item.field]}
+                                </p>
+                              {/if}
+                            </div>
+                          {/each}
+                        </div>
+                        <div class="manual-boolean-list">
+                          <label class="boolean-control">
                             <input
-                              id={inputId}
-                              bind:this={kcpFieldInputs[item.field]}
-                              bind:value={kcpDraft[item.field]}
-                              inputmode="numeric"
-                              autocomplete="off"
+                              type="checkbox"
+                              checked={snapshot.advancedSettings.manualKcp
+                                .writeDelay ?? false}
                               disabled={!settingsEditable ||
                                 saving ||
                                 interfaceBusy ||
                                 kcpModeQueued ||
-                                settingsOperation === 'kcpMode'}
-                              aria-invalid={kcpErrors[item.field]
-                                ? 'true'
-                                : undefined}
-                              aria-describedby="{inputId}-hint{kcpErrors[
-                                item.field
-                              ]
-                                ? ` ${inputId}-error`
-                                : ''}"
-                              oninput={() => handleKcpInput(item.field)}
-                              onblur={() => scheduleKcpDraftCommit(item.field)}
-                              onkeydown={handleCommonKeydown}
+                                settingsOperation === 'kcpMode' ||
+                                settingsOperation === 'kcpWriteDelay'}
+                              onchange={(event) =>
+                                handleManualKcpBoolean(event, 'kcpWriteDelay')}
                             />
-                            <p class="field-hint" id="{inputId}-hint">
-                              {item.hint}
-                            </p>
-                            {#if kcpErrors[item.field]}
-                              <p class="field-error" id="{inputId}-error">
-                                {kcpErrors[item.field]}
-                              </p>
-                            {/if}
-                          </div>
-                        {/each}
-                      </div>
-                      <div class="manual-boolean-list">
-                        <label class="boolean-control">
-                          <input
-                            type="checkbox"
-                            checked={snapshot.advancedSettings.manualKcp
-                              .writeDelay ?? false}
-                            disabled={!settingsEditable ||
-                              saving ||
-                              interfaceBusy ||
-                              kcpModeQueued ||
-                              settingsOperation === 'kcpMode' ||
-                              settingsOperation === 'kcpWriteDelay'}
-                            onchange={(event) =>
-                              handleManualKcpBoolean(event, 'kcpWriteDelay')}
-                          />
-                          KCP write delay
-                        </label>
-                        <label class="boolean-control">
-                          <input
-                            type="checkbox"
-                            checked={snapshot.advancedSettings.manualKcp
-                              .ackNoDelay ?? false}
-                            disabled={!settingsEditable ||
-                              saving ||
-                              interfaceBusy ||
-                              kcpModeQueued ||
-                              settingsOperation === 'kcpMode' ||
-                              settingsOperation === 'kcpAckNoDelay'}
-                            onchange={(event) =>
-                              handleManualKcpBoolean(event, 'kcpAckNoDelay')}
-                          />
-                          KCP ACK nodelay
-                        </label>
-                      </div>
-                    </fieldset>
-                  {/if}
-                </div>
+                            KCP write delay
+                          </label>
+                          <label class="boolean-control">
+                            <input
+                              type="checkbox"
+                              checked={snapshot.advancedSettings.manualKcp
+                                .ackNoDelay ?? false}
+                              disabled={!settingsEditable ||
+                                saving ||
+                                interfaceBusy ||
+                                kcpModeQueued ||
+                                settingsOperation === 'kcpMode' ||
+                                settingsOperation === 'kcpAckNoDelay'}
+                              onchange={(event) =>
+                                handleManualKcpBoolean(event, 'kcpAckNoDelay')}
+                            />
+                            KCP ACK nodelay
+                          </label>
+                        </div>
+                      </fieldset>
+                    {/if}
+                  </div>
 
-                {#each kcpNumericFields as item (item.field)}
-                  {@const inputId = item.field.replace(
-                    /[A-Z]/g,
-                    (letter) => `-${letter.toLowerCase()}`,
-                  )}
+                  {#each kcpNumericFields as item (item.field)}
+                    {@const inputId = item.field.replace(
+                      /[A-Z]/g,
+                      (letter) => `-${letter.toLowerCase()}`,
+                    )}
+                    <div class="override-item">
+                      <label class="override-toggle">
+                        <input
+                          type="checkbox"
+                          checked={snapshot.advancedSettings[item.field] !==
+                            null}
+                          disabled={!settingsEditable ||
+                            saving ||
+                            interfaceBusy ||
+                            settingsOperation === item.field}
+                          onchange={(event) =>
+                            handleKcpOverrideToggle(event, item.field)}
+                        />
+                        <span>
+                          <strong>Override {item.title}</strong>
+                          <small>Default {item.defaultValue}.</small>
+                        </span>
+                      </label>
+                      <div class="override-control">
+                        <label for={inputId}>{item.label}</label>
+                        <input
+                          id={inputId}
+                          bind:this={kcpFieldInputs[item.field]}
+                          bind:value={kcpDraft[item.field]}
+                          inputmode="numeric"
+                          autocomplete="off"
+                          disabled={snapshot.advancedSettings[item.field] ===
+                            null ||
+                            !settingsEditable ||
+                            saving ||
+                            interfaceBusy}
+                          aria-invalid={kcpErrors[item.field]
+                            ? 'true'
+                            : undefined}
+                          aria-describedby="{inputId}-hint{kcpErrors[item.field]
+                            ? ` ${inputId}-error`
+                            : ''}"
+                          oninput={() => handleKcpInput(item.field)}
+                          onblur={() => scheduleKcpDraftCommit(item.field)}
+                          onkeydown={handleCommonKeydown}
+                        />
+                        <p class="field-hint" id="{inputId}-hint">
+                          {item.hint}
+                        </p>
+                        {#if kcpErrors[item.field]}
+                          <p class="field-error" id="{inputId}-error">
+                            {kcpErrors[item.field]}
+                          </p>
+                        {/if}
+                      </div>
+                    </div>
+                  {/each}
+
                   <div class="override-item">
                     <label class="override-toggle">
                       <input
                         type="checkbox"
-                        checked={snapshot.advancedSettings[item.field] !== null}
+                        checked={snapshot.advancedSettings.kcpBlock !== null}
                         disabled={!settingsEditable ||
                           saving ||
                           interfaceBusy ||
-                          settingsOperation === item.field}
+                          settingsOperation === 'kcpBlock'}
                         onchange={(event) =>
-                          handleKcpOverrideToggle(event, item.field)}
+                          handleKcpOverrideToggle(event, 'kcpBlock')}
                       />
                       <span>
-                        <strong>Override {item.title}</strong>
-                        <small>Default {item.defaultValue}.</small>
+                        <strong>Override KCP block</strong>
+                        <small>Default AES; the server must match.</small>
                       </span>
                     </label>
                     <div class="override-control">
-                      <label for={inputId}>{item.label}</label>
-                      <input
-                        id={inputId}
-                        bind:this={kcpFieldInputs[item.field]}
-                        bind:value={kcpDraft[item.field]}
-                        inputmode="numeric"
-                        autocomplete="off"
-                        disabled={snapshot.advancedSettings[item.field] ===
-                          null ||
+                      <label for="kcp-block">KCP block</label>
+                      <select
+                        id="kcp-block"
+                        value={snapshot.advancedSettings.kcpBlock ?? 'aes'}
+                        disabled={snapshot.advancedSettings.kcpBlock === null ||
                           !settingsEditable ||
                           saving ||
-                          interfaceBusy}
-                        aria-invalid={kcpErrors[item.field]
-                          ? 'true'
-                          : undefined}
-                        aria-describedby="{inputId}-hint{kcpErrors[item.field]
-                          ? ` ${inputId}-error`
-                          : ''}"
-                        oninput={() => handleKcpInput(item.field)}
-                        onblur={() => scheduleKcpDraftCommit(item.field)}
-                        onkeydown={handleCommonKeydown}
-                      />
-                      <p class="field-hint" id="{inputId}-hint">
-                        {item.hint}
+                          interfaceBusy ||
+                          settingsOperation === 'kcpBlock'}
+                        onchange={selectKcpBlock}
+                      >
+                        <option value="aes">AES</option>
+                        <option value="aes-128-gcm">AES-128-GCM</option>
+                        <option value="aes-128">AES-128</option>
+                        <option value="aes-192">AES-192</option>
+                        <option value="salsa20">Salsa20</option>
+                        <option value="blowfish">Blowfish</option>
+                        <option value="twofish">Twofish</option>
+                        <option value="cast5">CAST5</option>
+                        <option value="3des">3DES</option>
+                        <option value="tea">TEA</option>
+                        <option value="xtea">XTEA</option>
+                        <option value="xor">XOR</option>
+                        <option value="sm4">SM4</option>
+                        <option value="none">None (insecure)</option>
+                        <option value="null">Null (insecure)</option>
+                      </select>
+                      <p class="field-hint">
+                        None and Null disable encryption and require
+                        confirmation.
                       </p>
-                      {#if kcpErrors[item.field]}
-                        <p class="field-error" id="{inputId}-error">
-                          {kcpErrors[item.field]}
-                        </p>
-                      {/if}
                     </div>
                   </div>
-                {/each}
-
-                <div class="override-item">
-                  <label class="override-toggle">
-                    <input
-                      type="checkbox"
-                      checked={snapshot.advancedSettings.kcpBlock !== null}
-                      disabled={!settingsEditable ||
-                        saving ||
-                        interfaceBusy ||
-                        settingsOperation === 'kcpBlock'}
-                      onchange={(event) =>
-                        handleKcpOverrideToggle(event, 'kcpBlock')}
-                    />
-                    <span>
-                      <strong>Override KCP block</strong>
-                      <small>Default AES; the server must match.</small>
-                    </span>
-                  </label>
-                  <div class="override-control">
-                    <label for="kcp-block">KCP block</label>
-                    <select
-                      id="kcp-block"
-                      value={snapshot.advancedSettings.kcpBlock ?? 'aes'}
-                      disabled={snapshot.advancedSettings.kcpBlock === null ||
-                        !settingsEditable ||
-                        saving ||
-                        interfaceBusy ||
-                        settingsOperation === 'kcpBlock'}
-                      onchange={selectKcpBlock}
-                    >
-                      <option value="aes">AES</option>
-                      <option value="aes-128-gcm">AES-128-GCM</option>
-                      <option value="aes-128">AES-128</option>
-                      <option value="aes-192">AES-192</option>
-                      <option value="salsa20">Salsa20</option>
-                      <option value="blowfish">Blowfish</option>
-                      <option value="twofish">Twofish</option>
-                      <option value="cast5">CAST5</option>
-                      <option value="3des">3DES</option>
-                      <option value="tea">TEA</option>
-                      <option value="xtea">XTEA</option>
-                      <option value="xor">XOR</option>
-                      <option value="sm4">SM4</option>
-                      <option value="none">None (insecure)</option>
-                      <option value="null">Null (insecure)</option>
-                    </select>
-                    <p class="field-hint">
-                      None and Null disable encryption and require confirmation.
-                    </p>
-                  </div>
                 </div>
-              </div>
-            </section>
-          </div>
-        {/if}
-      </div>
-    {/if}
-  </section>
-
-  <section class="connection" aria-labelledby="connection-heading">
-    {#if message}
-      <p class="app-message" role="alert">{message}</p>
-    {/if}
-    {#if connectionMessage}
-      <p class="app-message" role="alert">{connectionMessage}</p>
-    {/if}
-    {#if failureMessage && !connectionMessage}
-      <p class="failure-message" role="status" aria-live="polite">
-        {failureMessage}
-      </p>
-    {/if}
-    <h2 id="connection-heading" class="sr-only">Connection</h2>
-    {#if snapshot}
-      <div class="socks-setting">
-        <div>
-          <label for="socks-port">SOCKS port</label>
-          <p id="socks-port-hint" class="field-hint">Listens on 127.0.0.1</p>
+              </section>
+            </div>
+          {/if}
         </div>
-        <input
-          id="socks-port"
-          class:invalid={socksPortError}
-          bind:this={socksPortInput}
-          bind:value={socksPortDraft}
-          type="text"
-          inputmode="numeric"
-          autocomplete="off"
-          disabled={!settingsEditable || connectionBusy || mutationBusy}
-          aria-invalid={socksPortError ? 'true' : undefined}
-          aria-describedby={socksPortError
-            ? 'socks-port-hint socks-port-error'
-            : 'socks-port-hint'}
-          oninput={handleSocksPortInput}
-          onchange={scheduleSocksPortCommit}
-          onkeydown={handleSocksPortKeydown}
-        />
-      </div>
-      {#if socksPortError}
-        <p id="socks-port-error" class="field-error" role="alert">
-          {socksPortError}
+      {/if}
+    </section>
+
+    <section class="connection" aria-labelledby="connection-heading">
+      {#if message}
+        <p class="app-message" role="alert">{message}</p>
+      {/if}
+      {#if connectionMessage}
+        <p class="app-message" role="alert">{connectionMessage}</p>
+      {/if}
+      {#if failureMessage && !connectionMessage}
+        <p class="failure-message" role="status" aria-live="polite">
+          {failureMessage}
         </p>
       {/if}
-      {#if socksPortMessage}
-        <p class="field-error" role="alert">{socksPortMessage}</p>
+      <h2 id="connection-heading" class="sr-only">Connection</h2>
+      {#if snapshot}
+        <div class="socks-setting">
+          <div>
+            <label for="socks-port">SOCKS port</label>
+            <p id="socks-port-hint" class="field-hint">Listens on 127.0.0.1</p>
+          </div>
+          <input
+            id="socks-port"
+            class:invalid={socksPortError}
+            bind:this={socksPortInput}
+            bind:value={socksPortDraft}
+            type="text"
+            inputmode="numeric"
+            autocomplete="off"
+            disabled={!settingsEditable || connectionBusy || mutationBusy}
+            aria-invalid={socksPortError ? 'true' : undefined}
+            aria-describedby={socksPortError
+              ? 'socks-port-hint socks-port-error'
+              : 'socks-port-hint'}
+            oninput={handleSocksPortInput}
+            onchange={scheduleSocksPortCommit}
+            onkeydown={handleSocksPortKeydown}
+          />
+        </div>
+        {#if socksPortError}
+          <p id="socks-port-error" class="field-error" role="alert">
+            {socksPortError}
+          </p>
+        {/if}
+        {#if socksPortMessage}
+          <p class="field-error" role="alert">{socksPortMessage}</p>
+        {/if}
       {/if}
-    {/if}
-    <button
-      class:disconnect-action={connectionAction.kind === 'disconnect'}
-      class:connection-pending={connectionAction.kind === 'waiting'}
-      class="connect-button"
-      type="button"
-      disabled={connectionDisabled}
-      aria-busy={connectionBusy || connectionAction.kind === 'waiting'}
-      onclick={runConnectionAction}
-    >
-      <span aria-hidden="true"></span>
-      {connectionAction.label}
-    </button>
+      <button
+        class:disconnect-action={connectionAction.kind === 'disconnect'}
+        class:connection-pending={connectionAction.kind === 'waiting'}
+        class="connect-button"
+        type="button"
+        disabled={connectionDisabled}
+        aria-busy={connectionBusy || connectionAction.kind === 'waiting'}
+        onclick={runConnectionAction}
+      >
+        <span aria-hidden="true"></span>
+        {connectionAction.label}
+      </button>
 
-    <div class="log-heading">
-      <div>
-        <p class="eyebrow">Session</p>
-        <h2>Logs</h2>
+      <div class="log-heading">
+        <div>
+          <p class="eyebrow">Session</p>
+          <h2>Logs</h2>
+        </div>
+        <div class="log-actions" aria-label="Log actions">
+          <button
+            class="text-button"
+            type="button"
+            disabled={logEntries.length === 0}
+            onclick={copyLogs}>Copy</button
+          >
+          <button
+            class="text-button"
+            type="button"
+            disabled={logEntries.length === 0}
+            onclick={clearLogs}>Clear</button
+          >
+        </div>
       </div>
-      <div class="log-actions" aria-label="Log actions">
-        <button
-          class="text-button"
-          type="button"
-          disabled={logEntries.length === 0}
-          onclick={copyLogs}>Copy</button
+      {#if copyMessage}
+        <p
+          class:copy-error={copyFailed}
+          class="copy-message"
+          role={copyFailed ? 'alert' : 'status'}
+          aria-live="polite"
         >
-        <button
-          class="text-button"
-          type="button"
-          disabled={logEntries.length === 0}
-          onclick={clearLogs}>Clear</button
+          {copyMessage}
+        </p>
+      {/if}
+      <div class="log-shell">
+        <div
+          class="log"
+          bind:this={logElement}
+          role="log"
+          aria-label="Connection logs"
+          aria-live="polite"
+          aria-relevant="additions text"
+          onscroll={handleLogScroll}
         >
-      </div>
-    </div>
-    {#if copyMessage}
-      <p
-        class:copy-error={copyFailed}
-        class="copy-message"
-        role={copyFailed ? 'alert' : 'status'}
-        aria-live="polite"
-      >
-        {copyMessage}
-      </p>
-    {/if}
-    <div class="log-shell">
-      <div
-        class="log"
-        bind:this={logElement}
-        role="log"
-        aria-label="Connection logs"
-        aria-live="polite"
-        aria-relevant="additions text"
-        onscroll={handleLogScroll}
-      >
-        {#if logEntries.length === 0}
-          <p>Connection output will appear here.</p>
-        {:else}
-          {#each logEntries as entry (logEntryKey(entry))}
-            {#if entry.kind === 'gap'}
-              <p class="log-gap">
-                Output unavailable: sequences {entry.firstMissing}–{(
-                  BigInt(entry.nextAvailable) - 1n
-                ).toString()}.
-              </p>
-            {:else}
-              <p
-                class:log-stderr={entry.record.stream === 'stderr'}
-                class="log-record"
-              >
-                {#if entry.record.stream === 'stderr'}
-                  <span class="stream-marker">stderr</span>
-                {/if}
-                <span>{entry.record.text}</span>
-                {#if entry.record.truncated}
-                  <span class="truncated-marker">record truncated</span>
-                {/if}
-              </p>
-            {/if}
-          {/each}
+          {#if logEntries.length === 0}
+            <p>Connection output will appear here.</p>
+          {:else}
+            {#each logEntries as entry (logEntryKey(entry))}
+              {#if entry.kind === 'gap'}
+                <p class="log-gap">
+                  Output unavailable: sequences {entry.firstMissing}–{(
+                    BigInt(entry.nextAvailable) - 1n
+                  ).toString()}.
+                </p>
+              {:else}
+                <p
+                  class:log-stderr={entry.record.stream === 'stderr'}
+                  class="log-record"
+                >
+                  {#if entry.record.stream === 'stderr'}
+                    <span class="stream-marker">stderr</span>
+                  {/if}
+                  <span>{entry.record.text}</span>
+                  {#if entry.record.truncated}
+                    <span class="truncated-marker">record truncated</span>
+                  {/if}
+                </p>
+              {/if}
+            {/each}
+          {/if}
+        </div>
+        {#if !followingLogs && logEntries.length > 0}
+          <button class="jump-button" type="button" onclick={scrollLogToLatest}>
+            Jump to latest
+          </button>
         {/if}
       </div>
-      {#if !followingLogs && logEntries.length > 0}
-        <button class="jump-button" type="button" onclick={scrollLogToLatest}>
-          Jump to latest
-        </button>
-      {/if}
-    </div>
-  </section>
+    </section>
+  {/if}
 </main>
 
 {#if dialog}
@@ -3357,6 +3659,37 @@
             onclick={confirmDialog}
           >
             {closeDecisionBusy ? 'Closing…' : 'Disconnect and close'}
+          </button>
+        </div>
+      {:else if dialog.kind === 'dirtyWindowClose'}
+        <p class="eyebrow">Unsaved changes</p>
+        <h2 id="dialog-title">Discard changes and close?</h2>
+        <p id="dialog-description">
+          The profile edits you have made will not be saved.
+          {#if !dialog.request.lifecycle.settingsEditable}
+            Closing will also stop the supervised paqet process and wait for its
+            process tree to exit.
+          {/if}
+        </p>
+        {#if closeDecisionMessage}
+          <p class="inline-message" role="alert">{closeDecisionMessage}</p>
+        {/if}
+        <div class="dialog-actions">
+          <button
+            class="text-button"
+            type="button"
+            bind:this={dialogCancelButton}
+            disabled={closeDecisionBusy}
+            onclick={cancelWindowClose}>Keep editing</button
+          >
+          <button
+            class="danger-button"
+            type="button"
+            bind:this={dialogPrimaryButton}
+            disabled={closeDecisionBusy}
+            onclick={confirmDialog}
+          >
+            {closeDecisionBusy ? 'Closing…' : 'Discard and close'}
           </button>
         </div>
       {:else if dialog.kind === 'delete'}
