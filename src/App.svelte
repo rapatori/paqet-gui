@@ -162,6 +162,8 @@
   let dialog = $state<DialogState>(null);
   let runtimeReady = $state(false);
   let closeReady = $state(false);
+  let runtimeUnavailable = $state(false);
+  let closeUnavailable = $state(false);
   let connectionBusy = $state(false);
   let connectionMessage = $state('');
   let logEntries = $state<LogEntry[]>([]);
@@ -221,7 +223,11 @@
         : false,
   );
   const statusLabel = $derived(
-    snapshot ? formatStatus(snapshot.lifecycle.status) : 'Disconnected',
+    snapshot
+      ? formatStatus(snapshot.lifecycle.status)
+      : loading
+        ? 'Loading'
+        : 'Unavailable',
   );
   const failureMessage = $derived(
     snapshot?.lifecycle.failure
@@ -255,6 +261,29 @@
           !selectedProfile ||
           !selectedInterface)),
   );
+  const connectionReadiness = $derived.by(() => {
+    if (connectionAction.kind !== 'connect') return '';
+    if (loading) return 'Loading application state.';
+    if (!snapshot) return 'Connection controls are unavailable.';
+    if (runtimeUnavailable && closeUnavailable) {
+      return 'Live connection state and window-close confirmation are unavailable. Restart PaqetGUI and try again.';
+    }
+    if (runtimeUnavailable) {
+      return 'Live connection state is unavailable. Restart PaqetGUI and try again.';
+    }
+    if (closeUnavailable) {
+      return 'Window-close confirmation is unavailable. Restart PaqetGUI and try again.';
+    }
+    if (!runtimeReady || !closeReady) return 'Preparing connection controls.';
+    const missing: string[] = [];
+    if (!selectedProfile) missing.push('Add or select a server');
+    if (!selectedInterface) {
+      missing.push('select a network interface in Advanced');
+    }
+    if (missing.length === 0) return '';
+    const guidance = missing.join(' and ');
+    return `${guidance[0].toUpperCase()}${guidance.slice(1)} to connect.`;
+  });
 
   onMount(() => {
     void subscribeRuntime();
@@ -401,8 +430,10 @@
     try {
       await api.subscribeRuntimeEvents(handleRuntimeEvent);
       runtimeReady = true;
+      runtimeUnavailable = false;
     } catch {
       runtimeReady = false;
+      runtimeUnavailable = true;
       connectionMessage =
         'Live connection state is unavailable. Restart PaqetGUI and try again.';
     }
@@ -412,8 +443,10 @@
     try {
       await api.onWindowCloseRequested(handleWindowCloseRequest);
       closeReady = true;
+      closeUnavailable = false;
     } catch {
       closeReady = false;
+      closeUnavailable = true;
       connectionMessage =
         'Window-close confirmation is unavailable. Restart PaqetGUI and try again.';
     }
@@ -1290,6 +1323,7 @@
       ) {
         connectionMessage =
           'Correct the invalid Advanced setting before connecting.';
+        await focusFirstAdvancedError();
         return;
       }
       if (action === 'connect') {
@@ -1343,6 +1377,20 @@
 
   function formatConfigField(field: string): string {
     return field.replace(/([A-Z])/g, ' $1').toLowerCase();
+  }
+
+  async function focusFirstAdvancedError(): Promise<void> {
+    advancedExpanded = true;
+    await tick();
+    const commonField = commonTextFields.find((field) => commonErrors[field]);
+    const kcpField = kcpTextFields.find((field) => kcpErrors[field]);
+    const input = commonField
+      ? commonFieldInputs[commonField]
+      : kcpField
+        ? kcpFieldInputs[kcpField]
+        : undefined;
+    input?.focus();
+    input?.scrollIntoView?.({ block: 'center' });
   }
 
   function handleLogScroll(): void {
@@ -2479,10 +2527,11 @@
       class:status-pending={statusLabel === 'Connecting' ||
         statusLabel === 'Disconnecting'}
       class="status"
-      aria-label="Connection status"
+      role="status"
+      aria-label={`Connection status: ${statusLabel}${failureMessage ? `. ${failureMessage}` : ''}`}
       aria-live="polite"
     >
-      <span aria-hidden="true"></span>
+      <span class="status-indicator" aria-hidden="true"></span>
       {statusLabel}
     </p>
   </header>
@@ -3489,9 +3538,7 @@
         <p class="app-message" role="alert">{connectionMessage}</p>
       {/if}
       {#if failureMessage && !connectionMessage}
-        <p class="failure-message" role="status" aria-live="polite">
-          {failureMessage}
-        </p>
+        <p class="failure-message">{failureMessage}</p>
       {/if}
       <h2 id="connection-heading" class="sr-only">Connection</h2>
       {#if snapshot}
@@ -3534,11 +3581,19 @@
         type="button"
         disabled={connectionDisabled}
         aria-busy={connectionBusy || connectionAction.kind === 'waiting'}
+        aria-describedby={connectionReadiness
+          ? 'connection-readiness'
+          : undefined}
         onclick={runConnectionAction}
       >
         <span aria-hidden="true"></span>
         {connectionAction.label}
       </button>
+      {#if connectionReadiness}
+        <p id="connection-readiness" class="connection-readiness">
+          {connectionReadiness}
+        </p>
+      {/if}
 
       <div class="log-heading">
         <div>
@@ -3571,13 +3626,14 @@
         </p>
       {/if}
       <div class="log-shell">
+        <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
         <div
           class="log"
           bind:this={logElement}
           role="log"
           aria-label="Connection logs"
-          aria-live="polite"
-          aria-relevant="additions text"
+          aria-live="off"
+          tabindex="0"
           onscroll={handleLogScroll}
         >
           {#if logEntries.length === 0}

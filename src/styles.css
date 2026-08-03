@@ -90,7 +90,8 @@ input:disabled {
 
 button:focus-visible,
 input:focus-visible,
-select:focus-visible {
+select:focus-visible,
+.log:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -193,7 +194,7 @@ h3 {
   font-weight: 650;
 }
 
-.status span {
+.status-indicator {
   width: 7px;
   height: 7px;
   border: 1px solid var(--text-muted);
@@ -207,7 +208,7 @@ h3 {
   background: var(--connected-soft);
 }
 
-.status-connected span {
+.status-connected .status-indicator {
   border-color: var(--connected);
   background: var(--connected);
 }
@@ -218,7 +219,7 @@ h3 {
   background: var(--danger-soft);
 }
 
-.status-failed span {
+.status-failed .status-indicator {
   border-color: var(--danger);
   background: var(--danger);
 }
@@ -229,7 +230,7 @@ h3 {
   background: var(--accent-soft);
 }
 
-.status-pending span {
+.status-pending .status-indicator {
   border-color: var(--accent);
   border-top-color: transparent;
   animation: spin 800ms linear infinite;
@@ -414,7 +415,7 @@ h3 {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: stretch;
   overflow: hidden;
-  border: 1px solid var(--border-muted);
+  border: 1px solid var(--control-border);
   border-radius: 10px;
   background: var(--field);
 }
@@ -465,13 +466,13 @@ h3 {
   align-items: center;
   gap: 4px;
   padding: 7px;
-  border-left: 1px solid var(--border-muted);
+  border-left: 1px solid var(--control-border);
 }
 
 .server-card-actions .icon-button {
-  width: 42px;
-  min-width: 42px;
-  height: 42px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
   border-color: transparent;
   background: transparent;
 }
@@ -522,7 +523,7 @@ h3 {
 select,
 input {
   min-width: 0;
-  min-height: 42px;
+  min-height: 44px;
   border: 1px solid var(--control-border);
   border-radius: 8px;
   color: var(--text);
@@ -585,9 +586,9 @@ input[aria-invalid='true'] {
 
 .text-button.reveal-button {
   position: absolute;
-  top: 3px;
+  top: 0;
   right: 4px;
-  min-height: 36px;
+  min-height: 44px;
   padding: 0 8px;
 }
 
@@ -626,7 +627,7 @@ input[aria-invalid='true'] {
 }
 
 .compact-button {
-  min-height: 42px;
+  min-height: 44px;
   padding: 0 10px;
   font-size: 12px;
 }
@@ -1026,6 +1027,13 @@ input[aria-invalid='true'] {
   line-height: 1.4;
 }
 
+.connection-readiness {
+  margin-top: 7px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .connect-button {
   display: flex;
   align-items: center;
@@ -1301,7 +1309,7 @@ input[aria-invalid='true'] {
 
   .server-card-actions {
     justify-content: flex-end;
-    border-top: 1px solid var(--border-muted);
+    border-top: 1px solid var(--control-border);
     border-left: 0;
   }
 
@@ -1390,9 +1398,11 @@ input[aria-invalid='true'] {
   }
 
   .wordmark-mark,
-  .status span,
+  .status-indicator,
   .connect-button span {
-    forced-color-adjust: none;
+    border-color: CanvasText;
+    box-shadow: none;
+    background: CanvasText;
   }
 
   .stream-marker,

@@ -2,22 +2,22 @@
 
 [![CI](https://github.com/rapatori/paqet-gui/actions/workflows/ci.yml/badge.svg)](https://github.com/rapatori/paqet-gui/actions/workflows/ci.yml)
 
-PaqetGUI is an independent, unofficial Windows desktop companion for the [`hanselime/paqet`](https://github.com/hanselime/paqet) client. It is intended to provide a small graphical workflow for managing server profiles, selecting a local network interface, generating a compatible client configuration, controlling the local paqet process, and viewing its output.
+PaqetGUI is an independent, unofficial Windows desktop companion for the [`hanselime/paqet`](https://github.com/hanselime/paqet) client. It provides a small graphical workflow for managing server profiles, selecting a local network interface, choosing a persisted loopback SOCKS port, generating a compatible client configuration, controlling the local paqet process, and viewing its output.
 
 This project is not affiliated with or endorsed by the upstream paqet project.
 
 ## Project Status
 
-PaqetGUI has completed its initial Windows 11 x64 implementation and pre-release qualification. The repository contains the functional Tauri/Svelte client: native profile persistence, Windows network discovery, deterministic paqet configuration, supervised process lifecycle and logs, typed IPC, and the accessible one-page interface are implemented and covered by automated actual-WebView workflows.
+The repository contains the functional Windows 11 x64 Tauri/Svelte client: native profile persistence, Windows network discovery, deterministic paqet configuration, supervised process lifecycle and logs, typed IPC, and accessible single-window Connection and Servers views are implemented. The original application and package checkpoint completed pre-release qualification; the current source includes later product updates and is being requalified before a replacement package is built.
 
 The release packaging configuration produces an unsigned Windows 11 x64 NSIS installer. A previously qualified package is retained as historical evidence while accepted product updates are implemented and requalified. There are no published or supported binaries yet.
 
-## Planned V1 Scope
+## V1 Scope
 
 - Windows 11 on x64.
 - One fixed-size desktop window for local paqet client operation.
 - Locally persisted server profiles containing a server address, port, and encryption key.
-- One persisted global SOCKS port, bound only to `127.0.0.1` and defaulting to `1080`.
+- One unauthenticated, persisted global SOCKS5 port, bound only to `127.0.0.1` and defaulting to `1080`; multiple listeners, authentication, and non-loopback binding are not supported.
 - Windows interface discovery and derivation of the interface, Npcap GUID, local address, and gateway MAC required by paqet.
 - Deterministic generation of the supported paqet client configuration.
 - Start, monitor, and stop one bundled paqet child process.
@@ -32,7 +32,7 @@ The current compatibility target is `hanselime/paqet` `v1.0.0-alpha.20` for Wind
 
 The detailed source commit, artifact hashes, supported configuration fields, process-output contract, and upgrade procedure are documented in [the paqet compatibility contract](docs/paqet-compatibility.md).
 
-Running the completed V1 application will require:
+Running PaqetGUI requires:
 
 - Windows 11 x64.
 - [Npcap](https://npcap.com/) installed separately.
@@ -40,6 +40,8 @@ Running the completed V1 application will require:
 - Connection details for a compatible remote paqet server.
 
 The PaqetGUI installer does not embed, download, install, update, or repair WebView2. The application uses the shared Evergreen Runtime serviced by Microsoft; compatibility with every historical runtime version is not guaranteed, and no precise minimum is currently claimed. PaqetGUI also does not install, detect, configure, or troubleshoot Npcap in V1.
+
+V1 uses an IPv4 Windows interface with a usable default route and resolved gateway MAC. Literal IPv6 server addresses are not supported. Hostnames must resolve compatibly with the generated IPv4 client configuration.
 
 ### Server Setup
 
@@ -49,7 +51,9 @@ For users who need to set up their own Linux VPS, we recommend the community-mai
 
 ## Data And Security
 
-The application stores profiles, including paqet encryption keys, as versioned plaintext JSON in the current user's application configuration directory. It stores the global SOCKS port separately in versioned plaintext `settings.json` in the same directory. Generated `config.yaml` is also plaintext and is stored separately in the current user's local application data because paqet requires it. These files rely on the Windows user profile's access controls and are not encrypted by the application.
+The application stores profiles, including paqet encryption keys, as versioned plaintext JSON in the current user's application configuration directory. It stores the global SOCKS port separately in versioned plaintext `settings.json` in the same directory. Recovery backup files can retain the preceding plaintext revision. Generated `config.yaml` is also plaintext and is stored separately in the current user's local application data because paqet requires it. These files rely on the Windows user profile's access controls and are not encrypted by the application.
+
+Server profiles, the selected server, and the global SOCKS port persist across restarts. The selected network interface and Advanced overrides are session-only.
 
 Keys must not be included in logs, diagnostics, issues, or vulnerability reports. See [SECURITY.md](SECURITY.md) for the vulnerability reporting policy.
 
@@ -87,7 +91,7 @@ npm.cmd run package
 
 ## Validation
 
-Run the same checks used by CI from a Windows PowerShell session:
+Run the repository validation baseline from a Windows PowerShell session:
 
 ```powershell
 npm.cmd ci
@@ -105,6 +109,16 @@ cargo test --manifest-path src-tauri/Cargo.toml --locked --release --features pr
 cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --features process-test-support -- -D warnings
 npm.cmd run tauri -- build --debug --no-bundle
 ```
+
+Pre-package qualification also runs the build-coupled actual-WebView workflows:
+
+```powershell
+npm.cmd run test:webview
+npm.cmd run test:webview:accessibility
+npm.cmd run test:webview:sidecar
+```
+
+The separate `npm.cmd run test:webview:clipboard:destructive` workflow intentionally replaces the current clipboard contents and must only be run after accepting that warning.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution expectations and pull request guidance.
 

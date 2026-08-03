@@ -860,10 +860,11 @@ async function verifyKeyboard(client, child) {
     indexes.push(descriptor.index);
   }
   check(
-    focused.length === 3 &&
+    focused.length === 4 &&
       focused[0].includes('.server-summary') &&
       focused[1].includes('.disclosure-button') &&
-      focused[2].includes('#socks-port'),
+      focused[2].includes('#socks-port') &&
+      focused[3].includes('.log'),
     `Unexpected disconnected focus cycle: ${focused.join(' -> ')}`,
   );
   check(
@@ -1450,6 +1451,7 @@ async function verifyAccessibilityShell(client) {
   const nodes = await readAccessibilityTree(client);
   const requiredNodes = [
     ['heading', 'PaqetGUI', true],
+    ['status', 'Connection status: Disconnected', true],
     ['button', 'Manage servers.', false],
     ['button', 'Advanced', false],
     ['textbox', 'SOCKS port', true],
@@ -1494,7 +1496,7 @@ async function verifyEmulatedPreferences(client, child) {
             style: style?.borderTopStyle ?? 'none'
           };
         }),
-        protectedColors: ['.wordmark-mark', '.status span', '.connect-button span'].map((selector) => getComputedStyle(document.querySelector(selector)).forcedColorAdjust)
+        systemIndicators: ['.wordmark-mark', '.status-indicator', '.connect-button span'].map((selector) => getComputedStyle(document.querySelector(selector)).forcedColorAdjust)
       };
     })()`,
     'emulated accessibility preferences',
@@ -1513,8 +1515,8 @@ async function verifyEmulatedPreferences(client, child) {
     'Forced-colors mode removed a required control or surface boundary',
   );
   check(
-    preferences.protectedColors.every((value) => value === 'none'),
-    'Forced-color-adjust protection is not effective',
+    preferences.systemIndicators.every((value) => value !== 'none'),
+    'Forced-color indicators are not adapting to system colors',
   );
 
   await client.evaluate(
@@ -2106,7 +2108,7 @@ async function verifySidecarWorkflows() {
         const button = document.querySelector('.connect-button');
         const message = Array.from(document.querySelectorAll('.connection .app-message')).find((item) => item.textContent.trim() === 'The paqet client could not be started.');
         return Boolean(message) &&
-          document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
+          document.querySelector('.status')?.textContent.trim() === 'Disconnected' &&
           button?.textContent.trim() === 'Connect' && !button.disabled;
       })()`,
       'wrong sidecar identity rejection',
@@ -2152,7 +2154,7 @@ async function verifySidecarWorkflows() {
       client,
       `(() => {
         const log = document.querySelector('[aria-label="Connection logs"]');
-        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connected' &&
+        return document.querySelector('.status')?.textContent.trim() === 'Connected' &&
           document.querySelector('.connect-button')?.textContent.trim() === 'Disconnect' &&
           log?.textContent.includes('Client started:') &&
           document.querySelector('#socks-port')?.value === ${JSON.stringify(String(socksPort))} &&
@@ -2172,7 +2174,7 @@ async function verifySidecarWorkflows() {
       client,
       `(() => {
         const button = document.querySelector('.connect-button');
-        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
+        return document.querySelector('.status')?.textContent.trim() === 'Disconnected' &&
           button?.textContent.trim() === 'Connect' && !button.disabled;
       })()`,
       'requested disconnect completion',
@@ -2195,7 +2197,7 @@ async function verifySidecarWorkflows() {
     );
     await waitForValue(
       client,
-      `document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connected'`,
+      `document.querySelector('.status')?.textContent.trim() === 'Connected'`,
       'connected state before unexpected exit',
     );
     const secondPaqetTree = processTreeIdentities(secondPaqet.pid);
@@ -2207,7 +2209,7 @@ async function verifySidecarWorkflows() {
       `(() => {
         const failure = document.querySelector('.failure-message');
         const button = document.querySelector('.connect-button');
-        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Disconnected' &&
+        return document.querySelector('.status')?.textContent.trim() === 'Disconnected' &&
           failure?.textContent.includes('exited unexpectedly') &&
           button?.textContent.trim() === 'Connect' && !button.disabled;
       })()`,
@@ -2236,7 +2238,7 @@ async function verifySidecarWorkflows() {
     );
     await waitForValue(
       client,
-      `document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connected'`,
+      `document.querySelector('.status')?.textContent.trim() === 'Connected'`,
       'connected state before supervised close',
     );
     await closeActiveApplication(lifecycle, thirdPaqet);
@@ -2768,7 +2770,7 @@ async function verifyDisconnectedWorkflows() {
       client1,
       `(() => {
         const button = document.querySelector('.connect-button');
-        return document.querySelector('[aria-label="Connection status"]')?.textContent.trim() === 'Connecting' &&
+        return document.querySelector('.status')?.textContent.trim() === 'Connecting' &&
           button?.textContent.trim() === 'Connecting…' && button.disabled &&
           document.querySelector('#socks-port')?.disabled && document.querySelector('#socks-port')?.value === ${JSON.stringify(String(socksPort))} &&
           !document.querySelector('.server-summary')?.disabled &&
@@ -2835,7 +2837,7 @@ async function verifyDisconnectedWorkflows() {
       client1,
       `(() => {
         const button = document.querySelector('.connect-button');
-        const status = document.querySelector('[aria-label="Connection status"]');
+        const status = document.querySelector('.status');
         const message = Array.from(document.querySelectorAll('.connection .app-message')).find((item) => item.textContent.trim() === 'The paqet client could not be started.');
         const log = document.querySelector('[aria-label="Connection logs"]');
         return Boolean(message) && status?.textContent.trim() === 'Disconnected' &&
@@ -2926,7 +2928,7 @@ async function verifyDisconnectedWorkflows() {
         const countToggle = countInput?.closest('.override-item')?.querySelector('.override-toggle input');
         const log = document.querySelector('[aria-label="Connection logs"]');
         return {
-          status: document.querySelector('[aria-label="Connection status"]')?.textContent.trim(),
+          status: document.querySelector('.status')?.textContent.trim(),
           connect: document.querySelector('.connect-button')?.textContent.trim(),
           countChecked: countToggle?.checked,
           countDisabled: countInput?.disabled,

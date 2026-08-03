@@ -1,4 +1,5 @@
 import {
+  cleanup,
   fireEvent,
   render,
   screen,
@@ -220,9 +221,9 @@ describe('application shell', () => {
     expect(
       screen.getByRole('heading', { level: 1, name: 'PaqetGUI' }),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText('Connection status')).toHaveTextContent(
-      'Disconnected',
-    );
+    expect(
+      screen.getByRole('status', { name: 'Connection status: Disconnected' }),
+    ).toHaveTextContent('Disconnected');
     expect(screen.getByRole('button', { name: 'Connect' })).toBeEnabled();
     expect(screen.getByRole('textbox', { name: 'SOCKS port' })).toHaveValue(
       '1080',
@@ -231,6 +232,12 @@ describe('application shell', () => {
     expect(
       screen.getByRole('log', { name: 'Connection logs' }),
     ).toHaveTextContent('Connection output will appear here.');
+    expect(
+      screen.getByRole('log', { name: 'Connection logs' }),
+    ).toHaveAttribute('tabindex', '0');
+    expect(
+      screen.getByRole('log', { name: 'Connection logs' }),
+    ).toHaveAttribute('aria-live', 'off');
 
     expect(screen.queryByLabelText('Encryption key')).not.toBeInTheDocument();
     expect(
@@ -273,6 +280,93 @@ describe('application shell', () => {
     expect(screen.getByText('Ethernet · 192.0.2.20')).toBeInTheDocument();
     expect(screen.getByText(ethernetInterface.guid)).toBeInTheDocument();
     expect(screen.getByText('00:11:22:33:44:55')).toBeInTheDocument();
+  });
+
+  it('announces unknown native state without inventing Disconnected', async () => {
+    const api = mockApi();
+    const pending = deferred<AppSnapshot>();
+    vi.mocked(api.getAppSnapshot).mockReturnValueOnce(pending.promise);
+    render(App, { props: { api } });
+
+    expect(
+      screen.getByRole('status', { name: 'Connection status: Loading' }),
+    ).toBeInTheDocument();
+    pending.reject(new Error('unavailable'));
+    expect(
+      await screen.findByRole('status', {
+        name: 'Connection status: Unavailable',
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it('describes each missing prerequisite on the disabled Connect control', async () => {
+    render(App, { props: { api: mockApi(snapshot(null)) } });
+    const serverConnect = await screen.findByRole('button', {
+      name: 'Connect',
+    });
+    expect(serverConnect).toBeDisabled();
+    await waitFor(() =>
+      expect(serverConnect).toHaveAccessibleDescription(
+        'Add or select a server to connect.',
+      ),
+    );
+
+    cleanup();
+    render(App, {
+      props: {
+        api: mockApi(snapshot(primaryProfile, { selectedInterfaceGuid: null })),
+      },
+    });
+    const interfaceConnect = await screen.findByRole('button', {
+      name: 'Connect',
+    });
+    expect(interfaceConnect).toBeDisabled();
+    await waitFor(() =>
+      expect(interfaceConnect).toHaveAccessibleDescription(
+        'Select a network interface in Advanced to connect.',
+      ),
+    );
+
+    cleanup();
+    render(App, {
+      props: { api: mockApi(snapshot(null, { selectedInterfaceGuid: null })) },
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Connect' }),
+      ).toHaveAccessibleDescription(
+        'Add or select a server and select a network interface in Advanced to connect.',
+      ),
+    );
+  });
+
+  it('describes failed connection subscriptions as unavailable, not pending', async () => {
+    const runtimeApi = mockApi();
+    vi.mocked(runtimeApi.subscribeRuntimeEvents).mockRejectedValue(
+      new Error('unavailable'),
+    );
+    render(App, { props: { api: runtimeApi } });
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Connect' }),
+      ).toHaveAccessibleDescription(
+        'Live connection state is unavailable. Restart PaqetGUI and try again.',
+      ),
+    );
+
+    cleanup();
+    const closeApi = mockApi();
+    vi.mocked(closeApi.onWindowCloseRequested).mockRejectedValue(
+      new Error('unavailable'),
+    );
+    render(App, { props: { api: closeApi } });
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Connect' }),
+      ).toHaveAccessibleDescription(
+        'Window-close confirmation is unavailable. Restart PaqetGUI and try again.',
+      ),
+    );
   });
 
   it('validates and commits the global SOCKS port on blur and Enter', async () => {
@@ -407,9 +501,9 @@ describe('application shell', () => {
       await screen.findByRole('button', { name: 'Connecting…' }),
     ).toBeDisabled();
     await waitFor(() =>
-      expect(screen.getByLabelText('Connection status')).toHaveTextContent(
-        'Connecting',
-      ),
+      expect(
+        screen.getByRole('status', { name: 'Connection status: Connecting' }),
+      ).toHaveTextContent('Connecting'),
     );
 
     runtimeCallback(api)({
@@ -470,9 +564,11 @@ describe('application shell', () => {
     });
 
     await waitFor(() =>
-      expect(screen.getByLabelText('Connection status')).toHaveTextContent(
-        'Failed',
-      ),
+      expect(
+        screen.getByRole('status', {
+          name: /Connection status: Failed\. The paqet client reported/,
+        }),
+      ).toHaveTextContent('Failed'),
     );
     expect(
       screen.getByText(
@@ -841,9 +937,9 @@ describe('application shell', () => {
       ).toBeInTheDocument(),
     );
     await waitFor(() =>
-      expect(screen.getByLabelText('Connection status')).toHaveTextContent(
-        'Connected',
-      ),
+      expect(
+        screen.getByLabelText('Connection status: Connected'),
+      ).toHaveTextContent('Connected'),
     );
   });
 
@@ -1450,9 +1546,9 @@ describe('application shell', () => {
       wifiInterface.guid,
     );
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
-      'Selecting network interface…',
-    );
+    expect(
+      await screen.findByText('Selecting network interface…'),
+    ).toHaveAttribute('role', 'status');
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
     expect(screen.getByRole('combobox', { name: 'Interface' })).toBeDisabled();
     expect(
@@ -1704,6 +1800,7 @@ describe('application shell', () => {
       ),
     ).toBeInTheDocument();
     expect(api.connect).not.toHaveBeenCalled();
+    await waitFor(() => expect(count).toHaveFocus());
   });
 
   it('keeps invalid TCP flags local and commits ordered comma-separated combinations', async () => {
@@ -1794,9 +1891,9 @@ describe('application shell', () => {
       screen.getByRole('checkbox', { name: /Override connection count/ }),
     );
 
-    expect(await screen.findByRole('status')).toHaveTextContent(
-      'Updating connection count…',
-    );
+    expect(
+      await screen.findByText('Updating connection count…'),
+    ).toHaveAttribute('role', 'status');
     expect(screen.getByRole('button', { name: 'Refresh' })).toBeDisabled();
     expect(
       screen.getByRole('button', { name: /Manage servers/ }),
@@ -2719,7 +2816,7 @@ describe('fixed-window responsive and preference contracts', () => {
     expect(styles).toContain('grid-template-columns: minmax(0, 1fr) auto');
     expect(styles).toContain('.server-card-actions');
     expect(styles).toMatch(
-      /@media \(max-width: 280px\)\s*{.*\.server-card\s*{\s*grid-template-columns: minmax\(0, 1fr\);.*\.server-card-actions\s*{[^}]*border-top: 1px solid var\(--border-muted\);[^}]*border-left: 0;/s,
+      /@media \(max-width: 280px\)\s*{.*\.server-card\s*{\s*grid-template-columns: minmax\(0, 1fr\);.*\.server-card-actions\s*{[^}]*border-top: 1px solid var\(--control-border\);[^}]*border-left: 0;/s,
     );
     expect(styles).toContain('grid-template-columns: minmax(0, 1fr)');
     expect(styles).toContain('overflow-wrap: anywhere');
